@@ -1,6 +1,7 @@
 ### Acknowledgements
 
 This project is designed to integrate with and operate alongside existing community tools and hardware, including:
+
 AFC Klipper Plugin with the BTT Vivid
 
 We appreciate the broader open-source community and the ecosystems that make advanced integrations like this possible.
