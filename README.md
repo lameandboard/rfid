@@ -1,9 +1,7 @@
 ### Acknowledgements
 
 This project is designed to integrate with and operate alongside existing community tools and hardware, including:
-
-- [ArmoredTurtle AFC Klipper Add-On](https://github.com/ArmoredTurtle/AFC-Klipper-Add-On) (Automated Filament Changer)
-- [BIGTREETECH VIVID](https://github.com/bigtreetech/BIGTREETECH-VIVID)
+AFC Klipper Plugin with the BTT Vivid
 
 We appreciate the broader open-source community and the ecosystems that make advanced integrations like this possible.
 
