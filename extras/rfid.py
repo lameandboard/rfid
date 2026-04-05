@@ -1,0 +1,2845 @@
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+#
+# Copyright (c) 2026 ikwidtech
+
+"""
+RFID integration for Klipper/AFC.
+
+Features:
+- one or more [rfid <name>] sections
+- each reader may serve one or more lanes
+- event-driven scan begin / commit hooks
+- manual scan commands
+- rotating timestamped log
+- all application-level output always written to rotating log file at ~/printer_data/logs/rfid.log
+- hardware/driver debug output (e.g. MFRC522/PN532 low-level traces) is only logged when debug=True
+- console output: user-facing messages when messages=True; debug trace when debug=True
+
+Happy Hare (MMU) slot support:
+- Configure lanes= in the [rfid <name>] section; the same values cover both AFC and Happy Hare.
+- All scan commands (RFID_SCAN, RFID_SCAN_BEGIN, RFID_SCAN_COMMIT) accept both LANE= and SLOT=.
+  RFID_SLOT_SCAN / RFID_SLOT_SCAN_BEGIN / RFID_SLOT_SCAN_COMMIT are convenience aliases.
+- Slots are 0-based (slot0 = gate 0); lanes are 1-based (lane1 = gate 0, lane2 = gate 1, …).
+- On commit (Happy Hare path), calls MMU_GATE_MAP GATE=<n> SPOOLID=<id> (local gate assignment)
+  then MMU_SPOOLMAN UPDATE=1 SPOOLID=<id> GATE=<n> (Spoolman database sync).
+
+Config parameters (per [rfid <name>] section):
+- scan_window: total time (seconds) a scan timer runs before giving up (default 10.0)
+- rfid_fast_mode: when True (default), commit on the very first valid read; when False, require
+  two consecutive reads of the same UID (with a fallback that commits a single-read candidate
+  the moment the tag is no longer detected — useful for fast-moving spools even in safe mode)
+- candidate_ttl: (fast_mode=False only) how long (seconds) a scan candidate survives without
+  re-sighting before it ages out (default 0.5, min 0.1)
+- max_uids: maximum number of RFID tags (UIDs) that can be associated with a single
+  spool in Spoolman.  Each UID is stored in a separate extra field (rfid_uid_1 …
+  rfid_uid_N).  Default 8, min 2.
+- max_pages: number of NTAG/Ultralight pages to read starting at page 4 (default 135, min 4).
+  The low-level drivers iterate pages in range(4, 4 + max_pages). Reads stop early as soon as
+  a valid spool_id is parsed, so a higher ceiling has no speed cost in the normal case.
+  NTAG page counts for reference (total / user pages, where user pages start at 4):
+    NTAG213: 45 total pages (41 user pages) — use max_pages=41 to cover the full user area.
+    NTAG215: 135 total pages (131 user pages) — the default max_pages=135 safely covers these.
+    NTAG216: 231 total pages (227 user pages) — use max_pages>=227 (e.g. 231) to cover all user pages.
+
+Spoolman UID extra-field integration:
+- If spoolman_url is configured (and extras/spoolman_client.py is importable), the RFID UID
+  is stored in the spool's numbered extra fields (rfid_uid_1 … rfid_uid_N).  Each UID
+  occupies one slot; max_uids controls the maximum number of slots per spool.
+- rfid_uid_N extra fields must be created manually in Spoolman (Settings → Extra Fields)
+  or via ``POST /api/v1/field/spool``.  A one-time warning is emitted when first
+  PATCH attempt returns HTTP 400 "Unknown extra field".
+- All HTTP calls run in background threads so they never block the Klipper reactor
+  event loop (which would cause an MCU "timer too close" shutdown).
+- If auto_create_spool=True and a scanned tag carries OpenSpool JSON (identified by
+  protocol "openspool", with the "type" field describing the material) but no spoolman_id,
+  a new vendor/filament/spool is created in Spoolman automatically.
+Config parameters for Spoolman integration (per [rfid <name>] section):
+- spoolman_url: base URL of your Spoolman instance (e.g. http://localhost:7912); required to
+  enable any Spoolman HTTP integration
+- spoolman_api_key: optional Bearer token for Spoolman authentication
+- spoolman_timeout: HTTP request timeout in seconds (default 5.0)
+- auto_create_spool: when True, auto-create a Spoolman spool from an OpenSpool NDEF tag that
+  carries no spoolman_id (default False)
+- auto_write: when True, write the resolved spool_id back to the RFID tag NDEF payload after
+  a successful Spoolman UID lookup or auto-create; best-effort only — silently skipped if the
+  tag has moved (default False)
+
+UID → spoolman_id cache:
+- _UID_SPOOL_CACHE is a module-level dict shared across all Rfid instances in the process.
+- It is updated every time a uid_hex + spoolman_id pair is resolved (full read or cache hit);
+  a _UID_CACHE_DIRTY flag is set so that actual disk writes are deferred and never happen
+  inside a reactor timer callback.
+- It is consulted in _scan_once when uid_hex is known but spoolman_id could not be parsed,
+  making reads reliable even when the tag only passes the reader long enough for UID anticoll.
+- Use RFID_CACHE_CLEAR to wipe the cache; RFID_CACHE_LIST to inspect it.
+- The cache is persisted to _CACHE_PATH (~/RFID/cache/rfid_uid_cache.json) as JSON and
+  survives Klipper restarts.  On the first Rfid instance init (after logger setup),
+  _ensure_uid_cache_loaded() populates _UID_SPOOL_CACHE from that file;
+  _flush_uid_cache_if_dirty() writes it atomically when a lane finishes loading, when a
+  scan is committed via GCode, when Klipper disconnects or shuts down, or when the cache
+  is explicitly cleared.
+
+Klipper reactor-safety rules implemented here:
+- Event handlers (register_event_handler) must never call reactor.pause() or
+  perform any blocking operation.  They schedule work via register_timer().
+- Timer callbacks perform one scan attempt per call and re-schedule themselves
+  for the next retry by returning (event_time + delay).  No reactor.pause()
+  is used inside them.  Timer callbacks only consult _UID_SPOOL_CACHE — they
+  never make Spoolman HTTP calls.
+- GCode command handlers run in a Klipper "completion" greenlet and MAY call
+  reactor.pause().  _run_scan_window_sync() and _event_scan_begin() are therefore
+  reserved exclusively for the GCode command path.  GCode-triggered scans now use
+  the same timer-based scan engine as AFC events, including fast_mode / safe-mode
+  two-read confirmation, candidate_ttl aging, _scan_blocked_uids window, and
+  scan_window deadline enforcement.
+- All Spoolman HTTP operations must run off the reactor thread so blocking network
+  I/O never stalls the reactor.  All Spoolman network access is performed via
+  SpoolmanClient methods (find_spool_by_uid, add_uid_to_spool, auto_create_spool,
+  etc.), dispatched via _spoolman_run_async() or from GCode/completion contexts,
+  never from timer/event callbacks on the reactor thread.
+"""
+
+from __future__ import annotations
+
+import configparser
+import concurrent.futures
+import json
+import logging
+import logging.handlers
+import os
+import re
+import time
+from typing import Optional
+
+from extras import bus
+from extras.mfrc522 import MFRC522Handler, MFRC522Device
+try:
+    from extras.pn532 import PN532Handler
+except ImportError:
+    PN532Handler = None
+    logging.getLogger(__name__).info(
+        "PN532 support not available: extras/pn532.py could not be imported"
+    )
+try:
+    from extras import rfid_tag_parser as _tag_parser
+    _parse_tag = _tag_parser.parse_tag
+except Exception:
+    _tag_parser = None
+    _parse_tag = None
+    logging.getLogger(__name__).warning(
+        "rfid_tag_parser not available: extras/rfid_tag_parser.py could not be imported"
+        " — auto_create_spool will be disabled",
+        exc_info=True,
+    )
+try:
+    from extras.spoolman_client import SpoolmanClient
+except ImportError:
+    SpoolmanClient = None  # type: ignore[assignment,misc]
+    logging.getLogger(__name__).info(
+        "SpoolmanClient not available: extras/spoolman_client.py could not be imported"
+    )
+
+_LOGGERS = {}
+_GLOBAL_CMDS_ATTR = "_rfid_global_registered"
+_LOG_PATH = os.path.expanduser("~/printer_data/logs/rfid.log")
+_CACHE_PATH = os.path.expanduser("~/RFID/cache/rfid_uid_cache.json")
+
+# Minimum inter-attempt delay for async (timer-based) scans.
+# Even when scan_delay=0.0 is configured, we must yield the reactor
+# between timer callbacks to avoid starving the event loop.
+_ASYNC_MIN_DELAY = 0.010  # 10 ms
+
+# UID → spoolman_id cache: populated on every successful full read so that
+# a subsequent pass that only yields a UID (no NDEF payload) can still
+# resolve the spool ID.  Shared across all Rfid instances in this process.
+# Thread-safety note: Klipper's reactor runs all timer callbacks sequentially
+# in a single thread, so dict access here is safe without a lock.
+
+
+def _load_uid_cache() -> dict:
+    """Load the persisted UID→spoolman_id cache from disk. Returns {} on any error."""
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        clean = {}
+        for k, v in data.items():
+            if not isinstance(k, str):
+                continue
+            if isinstance(v, int):
+                clean[k] = v
+            elif isinstance(v, dict) and isinstance(v.get("sid"), int):
+                # Backward-compat: old fingerprinted entry {"sid": <int>, ...}
+                # Extract just the int spool ID; fingerprinting is no longer used.
+                clean[k] = v["sid"]
+            else:
+                try:
+                    clean[k] = int(v)
+                except Exception:
+                    pass
+        return clean
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logging.getLogger("rfid").warning(
+            "rfid: failed to load UID cache from %s, starting empty",
+            _CACHE_PATH,
+            exc_info=True,
+        )
+        return {}
+
+
+def _save_uid_cache(cache: dict) -> None:
+    """Persist the UID→spoolman_id cache to disk. Best-effort; logs on failure."""
+    try:
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+        tmp = _CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, _CACHE_PATH)
+    except Exception:
+        logging.getLogger("rfid").warning(
+            "rfid: failed to save UID cache to %s", _CACHE_PATH, exc_info=True
+        )
+
+
+_UID_SPOOL_CACHE: dict = {}  # uid_hex -> int (spoolman_id); local write-through speed layer
+# True whenever an in-memory entry was added since the last flush to disk.
+_UID_CACHE_DIRTY: bool = False
+# Populated lazily on first Rfid.__init__ so disk I/O occurs after logger setup.
+_UID_CACHE_LOADED: bool = False
+
+def _ensure_uid_cache_loaded() -> None:
+    """Lazily populate _UID_SPOOL_CACHE from disk on the first Rfid instance init.
+
+    Called once from Rfid.__init__() after _setup_logger so that any load
+    warnings reach the rfid log file rather than the root logger.
+    Subsequent calls are no-ops.
+    """
+    global _UID_CACHE_LOADED
+    if _UID_CACHE_LOADED:
+        return
+    _UID_CACHE_LOADED = True
+    _UID_SPOOL_CACHE.update(_load_uid_cache())
+
+
+def _mark_uid_cache_dirty() -> None:
+    """Mark the cache as needing a flush.  Called from scan timer callbacks."""
+    global _UID_CACHE_DIRTY
+    _UID_CACHE_DIRTY = True
+
+
+def _flush_uid_cache_if_dirty() -> None:
+    """Write the cache to disk if it has changed since the last flush.
+
+    Safe to call from any context where blocking I/O is acceptable
+    (e.g. GCode completion greenlets, lane-loaded event handlers).
+    Clears the dirty flag on success.
+    """
+    global _UID_CACHE_DIRTY
+    if _UID_CACHE_DIRTY:
+        _save_uid_cache(_UID_SPOOL_CACHE)
+        _UID_CACHE_DIRTY = False
+
+
+def _cache_entry_sid(entry) -> Optional[int]:
+    """Extract the spoolman_id from a cache entry (always a plain int now)."""
+    if isinstance(entry, int):
+        return entry
+    return None
+
+
+def _parse_lane_list(cfg_value) -> list[str]:
+    if cfg_value is None:
+        return []
+    text = str(cfg_value).strip()
+    if not text:
+        return []
+    parts = re.split(r"[,\s]+", text)
+    lanes = []
+    seen = set()
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        low = part.lower()
+        if low.isdigit():
+            low = f"lane{low}"
+        if low not in seen:
+            seen.add(low)
+            lanes.append(low)
+    return lanes
+
+
+def _parse_slot_list(cfg_value) -> list[str]:
+    if cfg_value is None:
+        return []
+    text = str(cfg_value).strip()
+    if not text:
+        return []
+    parts = re.split(r"[,\s]+", text)
+    slots = []
+    seen = set()
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        low = part.lower()
+        if low.isdigit():
+            low = f"slot{low}"
+        if low not in seen:
+            seen.add(low)
+            slots.append(low)
+    return slots
+
+
+def _setup_logger(name: str) -> logging.Logger:
+    logger_name = f"rfid.{name}"
+    if logger_name in _LOGGERS:
+        return _LOGGERS[logger_name]
+
+    # Attach the RotatingFileHandler once to the shared parent 'rfid' logger so
+    # that multiple [rfid <name>] sections all share one file handler, preventing
+    # duplicate output and unsafe concurrent rotation of the same file.
+    if "rfid" not in _LOGGERS:
+        os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+        parent = logging.getLogger("rfid")
+        parent.setLevel(logging.INFO)
+        fh = logging.handlers.RotatingFileHandler(
+            _LOG_PATH,
+            maxBytes=1_000_000,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(name)s] %(message)s",
+                "%Y-%m-%d %H:%M:%S",
+            )
+        )
+        parent.addHandler(fh)
+        _LOGGERS["rfid"] = parent
+
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = True  # propagate to 'rfid' parent which owns the file handler
+
+    _LOGGERS[logger_name] = logger
+    return logger
+
+
+class Rfid:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.name = config.get_name().split()[-1]
+        self.gcode = self.printer.lookup_object("gcode")
+        self._log = _setup_logger(self.name)
+        _ensure_uid_cache_loaded()
+
+        self.spi_speed = int(config.getint("spi_speed", 100000, minval=10000))
+        self.messages = config.getboolean("messages", True)
+        self.debug_en = config.getboolean("debug", False)
+        self.event_timeout = float(config.getfloat("event_timeout", 60.0, minval=1.0))
+        self.scan_delay = float(config.getfloat("scan_delay", 0.05, minval=0.0))
+        self.max_pages = int(config.getint("max_pages", 135, minval=4))
+        self.max_uids = int(config.getint("max_uids", 8, minval=2))
+        self.scan_window = float(config.getfloat("scan_window", 10.0, minval=1.0))
+        self.fast_mode = config.getboolean("rfid_fast_mode", True)
+        self.candidate_ttl = float(config.getfloat("candidate_ttl", 0.5, minval=0.1))
+        self.auto_create_spool = config.getboolean("auto_create_spool", False)
+        self.auto_write = config.getboolean("auto_write", False)
+        self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
+        self._spoolman_api_key = config.get("spoolman_api_key", None)
+        self._spoolman_timeout = config.getfloat("spoolman_timeout", 5.0, minval=1.0)
+
+        lanes_cfg = config.get("lanes", None)
+        if lanes_cfg is None:
+            lanes_cfg = config.get("lane", None)
+        self.lanes = _parse_lane_list(lanes_cfg)
+        if not self.lanes:
+            self.lanes = ["lane1", "lane2"]
+        self.lane = self.lanes[0]
+
+        # Happy Hare slot mapping: only mirror lanes into slots when all lane
+        # values are numeric or "lane{n}"-shaped (i.e. valid gate indices).
+        # Otherwise default to [] so HH commands are inactive unless slots= is
+        # explicitly configured.
+        slots_cfg = config.get("slots", None)
+        if slots_cfg is None:
+            slots_cfg = config.get("slot", None)
+        if slots_cfg is not None:
+            self.slots = _parse_slot_list(slots_cfg)
+        else:
+            lanes_are_gate_like = all(
+                isinstance(l, str) and (l.isdigit() or re.fullmatch(r"lane\d+", l))
+                for l in self.lanes
+            )
+            self.slots = list(self.lanes) if lanes_are_gate_like else []
+
+        self.driver_cfg = config.get("driver", "auto").strip().lower()
+
+        self.spi = bus.MCU_SPI_from_config(config, mode=0, default_speed=self.spi_speed)
+        self._detected_driver: bool = False
+        if self.driver_cfg == "auto":
+            # Use MFRC522Handler as a safe placeholder until klippy:connect fires
+            # and SPI commands are live.  The real probe in _handle_klippy_connect
+            # will replace self.reader with the correct handler.
+            self.reader = MFRC522Handler(self.spi)
+        else:
+            self.reader = self._init_driver(self.driver_cfg)
+            self._wire_reader(self.reader)
+
+        self._pending: dict[str, dict] = {}
+        self._scan_timers: dict[str, object] = {}    # lane -> active timer handle
+        self._scan_deadlines: dict[str, float] = {}  # lane -> monotonic deadline
+        self._scan_candidates: dict[str, dict] = {}  # lane -> {uid_hex, spoolman_id, count, last_ts}
+        self._scan_blocked_uids: dict[str, set] = {} # lane -> set of UIDs suppressed for current window
+        self._scan_seen_uids: dict[str, set] = {}    # lane -> all uid_hex strings seen this window
+        self._sync_scan_lanes: set = set()            # lanes currently polled by _run_scan_window_sync
+
+        self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
+
+        # Spoolman integration (async HTTP via bounded ThreadPoolExecutor)
+        self._spoolman: Optional[SpoolmanClient] = None
+        self._spoolman_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        if self.spoolman_url and SpoolmanClient is not None:
+            self._spoolman = SpoolmanClient(
+                self.spoolman_url,
+                api_key=self._spoolman_api_key,
+                timeout=self._spoolman_timeout,
+            )
+            self._spoolman_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="rfid_spoolman"
+            )
+
+        self.printer.register_event_handler("klippy:connect", self._handle_klippy_connect)
+        self.printer.register_event_handler("afc:lane_prep_start", self._handle_lane_prep_start)
+        self.printer.register_event_handler("afc:lane_loaded", self._handle_lane_loaded)
+        self.printer.register_event_handler("klippy:disconnect", self._handle_klippy_flush)
+        self.printer.register_event_handler("klippy:shutdown", self._handle_klippy_flush)
+
+        self.gcode.register_mux_command(
+            "RFID_TAG",
+            "NAME",
+            self.name,
+            self.cmd_RFID_TAG,
+            desc="Read tag on this reader and report UID + spoolman_id if found.",
+        )
+
+        if not hasattr(self.printer, _GLOBAL_CMDS_ATTR):
+            setattr(self.printer, _GLOBAL_CMDS_ATTR, True)
+            self.gcode.register_command(
+                "RFID_LANES",
+                self.cmd_RFID_LANES,
+                desc="Show which lanes/slots are mapped to each reader.",
+            )
+            self.gcode.register_command(
+                "RFID_PENDING",
+                self.cmd_RFID_PENDING,
+                desc="Show pending RFID scan assignments.",
+            )
+            self.gcode.register_command(
+                "RFID_SCAN",
+                self.cmd_RFID_SCAN,
+                desc="Scan and immediately assign spool to AFC lane or Happy Hare gate (LANE= or SLOT=).",
+            )
+            self.gcode.register_command(
+                "RFID_SCAN_BEGIN",
+                self.cmd_RFID_SCAN_BEGIN,
+                desc="Scan and store pending result for AFC lane or Happy Hare gate (LANE= or SLOT=).",
+            )
+            self.gcode.register_command(
+                "RFID_SCAN_COMMIT",
+                self.cmd_RFID_SCAN_COMMIT,
+                desc="Commit pending scan to AFC lane or Happy Hare gate (LANE= or SLOT=).",
+            )
+            self.gcode.register_command(
+                "RFID_BEGIN_LOAD",
+                self.cmd_RFID_SCAN_BEGIN,
+                desc="Alias of RFID_SCAN_BEGIN.",
+            )
+            self.gcode.register_command(
+                "RFID_COMMIT_LOAD",
+                self.cmd_RFID_SCAN_COMMIT,
+                desc="Alias of RFID_SCAN_COMMIT.",
+            )
+            self.gcode.register_command(
+                "RFID_CACHE_CLEAR",
+                self.cmd_RFID_CACHE_CLEAR,
+                desc="Clear the UID→spoolman_id scan cache.",
+            )
+            self.gcode.register_command(
+                "RFID_CACHE_LIST",
+                self.cmd_RFID_CACHE_LIST,
+                desc="List all entries in the UID→spoolman_id scan cache.",
+            )
+            # Slot-named aliases kept for backward compatibility.
+            self.gcode.register_command(
+                "RFID_SLOTS",
+                self.cmd_RFID_LANES,
+                desc="Alias of RFID_LANES.",
+            )
+            self.gcode.register_command(
+                "RFID_SLOT_SCAN",
+                self.cmd_RFID_SCAN,
+                desc="Alias of RFID_SCAN.",
+            )
+            self.gcode.register_command(
+                "RFID_SLOT_SCAN_BEGIN",
+                self.cmd_RFID_SCAN_BEGIN,
+                desc="Alias of RFID_SCAN_BEGIN.",
+            )
+            self.gcode.register_command(
+                "RFID_SLOT_SCAN_COMMIT",
+                self.cmd_RFID_SCAN_COMMIT,
+                desc="Alias of RFID_SCAN_COMMIT.",
+            )
+            self.gcode.register_command(
+                "RFID_CHECK_TAG",
+                self.cmd_RFID_CHECK_TAG,
+                desc=(
+                    "Scan a single tag, parse filament metadata, and optionally "
+                    "create a Spoolman spool. "
+                    "Params: LANE=|SLOT= CREATE=0|1 WRITE=0|1"
+                ),
+            )
+            self.gcode.register_command(
+                "RFID_WRITE",
+                self.cmd_RFID_WRITE,
+                desc=(
+                    "Fetch spool info from Spoolman by ID and write it to the tag "
+                    "in OpenSpool format. Params: LANE=<n>|SLOT=<n> SPOOLID=<id>"
+                ),
+            )
+            self.gcode.register_command(
+                "RFID_ERASE",
+                self.cmd_RFID_ERASE,
+                desc=(
+                    "Erase the NDEF payload on the tag at LANE=<n> and remove it from the UID cache. "
+                    "Params: LANE=<n>|SLOT=<n>"
+                ),
+            )
+
+        self._log.info(
+            "module loaded: reader=%s lanes=%s spi_speed=%s debug=%s messages=%s",
+            self.name,
+            self.lanes,
+            self.spi_speed,
+            self.debug_en,
+            self.messages,
+        )
+
+    # ---------- logging ----------
+    def _emit_console(self, msg: str) -> None:
+        """Emit to Klipper console when messages=True."""
+        if self.messages:
+            self.gcode.respond_info(msg)
+
+    def _respond(self, msg: str) -> None:
+        """User-facing message: always logged; printed to console when messages=True."""
+        self._log.info(msg)
+        self._emit_console(msg)
+
+    def _debug(self, msg: str) -> None:
+        """Debug message: always written to log file; printed to console only when debug=True (bypasses messages gate)."""
+        self._log.info(msg)
+        if self.debug_en:
+            self.gcode.respond_info(msg)
+
+    def _debug_verbose(self, msg: str) -> None:
+        """Verbose trace: always written to log file; NEVER printed to console.
+        Use for high-frequency per-tick/per-tag hardware trace messages."""
+        self._log.info(msg)
+
+    # ---------- driver init ----------
+    def _wire_reader(self, reader) -> None:
+        """Attach reactor and debug-log callbacks to a freshly created reader handler."""
+        if hasattr(reader, "set_reactor"):
+            reader.set_reactor(self.reactor)
+        if hasattr(reader, "set_debug_log"):
+            reader.set_debug_log(self._debug if self.debug_en else None)
+        if hasattr(reader, "dev") and hasattr(reader.dev, "set_debug_log"):
+            reader.dev.set_debug_log(self._debug if self.debug_en else None)
+
+    def _init_driver(self, driver_cfg: str):
+        """Instantiate the correct reader backend.
+
+        driver_cfg values:
+          "mfrc522" – always use MFRC522Handler
+          "pn532"   – always use PN532Handler
+          "auto"    – probe MFRC522 first; fall back to PN532 if version check fails
+        """
+        if driver_cfg == "pn532":
+            self._log.info("rfid[%s]: driver=pn532 (configured)", self.name)
+            return PN532Handler(self.spi)
+
+        if driver_cfg == "mfrc522":
+            self._log.info("rfid[%s]: driver=mfrc522 (configured)", self.name)
+            return MFRC522Handler(self.spi)
+
+        # auto-detect
+        try:
+            candidate = MFRC522Handler(self.spi)
+            if hasattr(candidate, "set_reactor"):
+                candidate.set_reactor(self.reactor)
+            ver = candidate.read_version()
+            if ver in MFRC522Device.VALID_VERSION_VALUES:
+                self._log.info(
+                    "rfid[%s]: driver=mfrc522 (auto-detected, version=0x%02X)", self.name, ver
+                )
+                return candidate
+            self._log.info(
+                "rfid[%s]: MFRC522 version 0x%02X not recognized, trying PN532", self.name, ver
+            )
+        except Exception:
+            self._log.info(
+                "rfid[%s]: MFRC522 probe failed, trying PN532", self.name, exc_info=True
+            )
+
+        try:
+            candidate = PN532Handler(self.spi)
+            if hasattr(candidate, "set_reactor"):
+                candidate.set_reactor(self.reactor)
+            fw = candidate.dev.get_firmware_version()
+            self._log.info(
+                "rfid[%s]: driver=pn532 (auto-detected, fw=%d.%d)",
+                self.name,
+                fw["ver"],
+                fw["rev"],
+            )
+            return candidate
+        except Exception:
+            self._log.info(
+                "rfid[%s]: PN532 probe also failed; defaulting to mfrc522",
+                self.name,
+                exc_info=True,
+            )
+
+        return MFRC522Handler(self.spi)
+
+    # ---------- helpers ----------
+    def _normalize_lane(self, lane) -> str:
+        lane = str(lane).strip().lower()
+        if lane.startswith("lane"):
+            return lane
+        if lane.isdigit():
+            return f"lane{lane}"
+        return lane
+
+    def _all_readers(self):
+        readers = []
+        pobj = getattr(self.printer, "objects", None)
+        if isinstance(pobj, dict):
+            for objname, obj in pobj.items():
+                if objname.startswith("rfid "):
+                    readers.append(obj)
+        if not readers:
+            for name in (
+                "mfrc522_0", "mfrc522_1", "mfrc522_2", "mfrc522_3",
+                "pn532_0", "pn532_1", "pn532_2", "pn532_3",
+                "lane1", "lane2", "lane3", "lane4",
+            ):
+                try:
+                    readers.append(self.printer.lookup_object(f"rfid {name}"))
+                except Exception:
+                    pass
+        return readers
+
+    def _is_spool_assigned_elsewhere(self, lane: str, spoolman_id: int) -> bool:
+        """Return True if spoolman_id is already claimed by a lane other than *lane*.
+
+        Checks two sources:
+        1. In-flight _pending entries across all readers.
+        2. Live AFC_lane objects via printer.lookup_object().
+
+        All lookups are wrapped in broad except guards so that missing AFC
+        objects simply cause the check to return False.
+        """
+        lane = self._normalize_lane(lane)
+        # 1. Check in-flight pending scans across every reader.
+        try:
+            for reader in self._all_readers():
+                pending = getattr(reader, "_pending", {})
+                for pending_lane, entry in pending.items():
+                    if self._normalize_lane(pending_lane) == lane:
+                        continue
+                    if entry.get("spoolman_id") == spoolman_id:
+                        self._debug_verbose(
+                            f"rfid[{self.name}]: DBG _is_spool_assigned_elsewhere:"
+                            f" spoolman_id={spoolman_id} blocked by in-flight pending"
+                            f" on lane={pending_lane} reader={getattr(reader, 'name', '?')}"
+                        )
+                        return True
+        except Exception:
+            pass
+        # 2. Check live AFC lane objects.
+        try:
+            for reader in self._all_readers():
+                for mapped_lane in getattr(reader, "lanes", []):
+                    other = self._normalize_lane(mapped_lane)
+                    if other == lane:
+                        continue
+                    try:
+                        lane_obj = self.printer.lookup_object(f"AFC_lane {other}")
+                        for attr in ("spool_id", "tool_spool_id"):
+                            val = getattr(lane_obj, attr, None)
+                            if val is not None:
+                                try:
+                                    if int(val) == spoolman_id:
+                                        self._debug_verbose(
+                                            f"rfid[{self.name}]: DBG _is_spool_assigned_elsewhere:"
+                                            f" spoolman_id={spoolman_id} blocked by AFC_lane {other}"
+                                            f" attr={attr} val={val}"
+                                        )
+                                        return True
+                                except (ValueError, TypeError):
+                                    pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False
+
+    def _find_reader_for_lane(self, lane: str):
+        lane = self._normalize_lane(lane)
+        for reader in self._all_readers():
+            for mapped in getattr(reader, "lanes", []):
+                if self._normalize_lane(mapped) == lane:
+                    return reader, lane
+        return None, lane
+
+    def _lane_name_from_event(self, lane_obj) -> Optional[str]:
+        lane_name = getattr(lane_obj, "name", lane_obj)
+        if lane_name is None:
+            return None
+        return self._normalize_lane(lane_name)
+
+    def _extract_spoolman_id(self, text: Optional[str]) -> Optional[int]:
+        if not text:
+            return None
+        text = str(text).strip()
+        if not text:
+            return None
+
+        try:
+            payload = json.loads(text)
+            for key in ("spoolman_id", "spool_id", "spoolId", "id"):
+                value = payload.get(key)
+                if value is not None and str(value).strip() != "":
+                    return int(str(value).strip())
+        except Exception:
+            pass
+
+        patterns = [
+            r"(?:^|[?&;,\s])spoolman_id=(\d+)(?:$|[&;,\s])",
+            r"(?:^|[?&;,\s])spool_id=(\d+)(?:$|[&;,\s])",
+            r'"spoolman_id"\s*:\s*"?(\d+)"?',
+            r'"spool_id"\s*:\s*"?(\d+)"?',
+            r"\bspoolman[_ -]?id\b\s*[:=]\s*(\d+)",
+            r"\bspool[_ -]?id\b\s*[:=]\s*(\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+
+        if re.fullmatch(r"\d+", text):
+            return int(text)
+        return None
+
+    def _read_tag_text(self, max_pages: int) -> Optional[str]:
+        for method_name in (
+            "read_ntag_ndef_text",
+            "read_ntag_text",
+            "read_ndef_text",
+            "read_text",
+        ):
+            method = getattr(self.reader, method_name, None)
+            if method is None:
+                continue
+            try:
+                return method(max_pages=max_pages)
+            except TypeError:
+                try:
+                    return method(max_pages)
+                except Exception:
+                    self._log.exception("reader method %s failed", method_name)
+            except Exception:
+                self._log.exception("reader method %s failed", method_name)
+        return None
+
+    def _read_uid_hex(self) -> Optional[str]:
+        for method_name in ("read_uid_hex", "get_uid_hex", "uid_hex", "read_uid"):
+            method = getattr(self.reader, method_name, None)
+            if method is None:
+                continue
+            try:
+                uid = method()
+                if uid is None:
+                    return None
+                if isinstance(uid, (list, tuple, bytes, bytearray)):
+                    return "".join("%02X" % b for b in uid)
+                return str(uid)
+            except Exception:
+                self._log.exception("reader method %s failed", method_name)
+        return None
+
+    def _try_bambu_read(self, uid_hex: str) -> Optional[dict]:
+        """Attempt a Bambu Lab MIFARE Classic authenticated read.
+
+        Derives the 16 sector keys from the UID via HKDF (pycryptodome required),
+        then authenticates and reads all sectors via the reader driver.
+
+        Returns a dict ``{"uid_bytes": ..., "blocks": {...}}`` suitable for
+        ``parse_tag()``, or None on failure.
+        """
+        if _tag_parser is None:
+            return None
+        try:
+            uid_bytes = bytes.fromhex(uid_hex)
+        except Exception:
+            return None
+        try:
+            key_list = _tag_parser._bambu_derive_keys(uid_bytes)
+        except ImportError:
+            self._log.info(
+                "rfid[%s]: pycryptodome not available — Bambu key derivation skipped. "
+                "Install with: pip3 install pycryptodome", self.name
+            )
+            return None
+        except Exception:
+            self._log.debug(
+                "rfid[%s]: Bambu key derivation failed for uid=%s", self.name, uid_hex
+            )
+            return None
+        read_method = getattr(self.reader, "read_mifare_classic_tag", None)
+        if read_method is None:
+            return None
+        try:
+            return read_method(key_list)
+        except Exception:
+            self._log.debug(
+                "rfid[%s]: Bambu MIFARE read failed for uid=%s", self.name, uid_hex
+            )
+            return None
+
+    def _apply_tag_parser(
+        self,
+        uid_hex: Optional[str],
+        raw_bytes,
+        tag_text: Optional[str] = None,  # noqa: ARG002 – reserved for future use
+    ) -> Optional[dict]:
+        """Run rfid_tag_parser.parse_tag() and return filament info dict or None."""
+        if _tag_parser is None:
+            return None
+        try:
+            return _tag_parser.parse_tag(raw_bytes, uid_hex)
+        except Exception:
+            self._log.debug(
+                "rfid[%s]: rfid_tag_parser.parse_tag failed for uid=%s", self.name, uid_hex
+            )
+            return None
+
+    def _write_spoolman_id_to_tag(self, spoolman_id: int, uid_hex: str, is_bambu: bool = False) -> bool:
+        """Merge ``{"spoolman_id": N}`` into the tag's NDEF JSON payload and write it back.
+
+        Skipped for Bambu tags (RSA-signed, read-only).
+        Returns True on success, False otherwise.
+        """
+        if is_bambu:
+            self._log.debug(
+                "rfid[%s]: skipping write-back for Bambu tag uid=%s (read-only)", self.name, uid_hex
+            )
+            return False
+        read_method = getattr(self.reader, "read_ndef_text", None)
+        write_method = getattr(self.reader, "write_ndef_text", None)
+        if write_method is None:
+            return False
+
+        # Start from existing JSON payload if possible, otherwise an empty object.
+        payload_obj = {}
+        if read_method is not None:
+            try:
+                existing = read_method()
+                if isinstance(existing, (bytes, bytearray)):
+                    existing = existing.decode("utf-8", errors="ignore")
+                if isinstance(existing, str) and existing.strip():
+                    loaded = json.loads(existing)
+                    if isinstance(loaded, dict):
+                        payload_obj = loaded
+            except Exception:
+                # On any read/parse error, fall back to a fresh object.
+                payload_obj = {}
+
+        # Merge/overwrite the spoolman_id field.
+        payload_obj["spoolman_id"] = spoolman_id
+
+        try:
+            write_method(json.dumps(payload_obj))
+            self._log.info(
+                "rfid[%s]: wrote spoolman_id=%s to tag uid=%s", self.name, spoolman_id, uid_hex
+            )
+            return True
+        except Exception:
+            self._log.debug(
+                "rfid[%s]: write_ndef_text failed for uid=%s", self.name, uid_hex
+            )
+            return False
+
+    def _scan_once(self, lane: str, max_pages: int) -> dict:
+        self._debug_verbose(
+            f"rfid[{self.name}]: DBG _scan_once enter lane={lane} max_pages={max_pages}"
+        )
+
+        # Try multi-tag enumeration path first so adjacent tags can be skipped.
+        if hasattr(self.reader, "read_all_tags"):
+            self._debug_verbose(f"rfid[{self.name}]: DBG _scan_once path=read_all_tags")
+            try:
+                tags = self.reader.read_all_tags(
+                    max_pages=max_pages,
+                    rewake_after=not self.fast_mode,
+                )
+            except Exception:
+                self._log.exception("reader method read_all_tags failed")
+                tags = []
+            # Deduplicate by UID: the MFRC522 anti-collision loop can return the
+            # same physical tag multiple times in a single inventory sweep.
+            if tags:
+                seen_uids: dict[str, dict] = {}
+                for t in tags:
+                    u = t.get("uid_hex")
+                    if u is not None and u not in seen_uids:
+                        seen_uids[u] = t
+                    elif u is None:
+                        seen_uids[f"_no_uid_{id(t)}"] = t
+                before = len(tags)
+                tags = list(seen_uids.values())
+                if len(tags) != before:
+                    self._debug_verbose(
+                        f"rfid[{self.name}]: DBG _scan_once deduped {before} -> {len(tags)} tag(s)"
+                    )
+            self._debug_verbose(
+                f"rfid[{self.name}]: DBG _scan_once read_all_tags returned {len(tags)} tag(s)"
+            )
+            if tags:
+                for i, tag in enumerate(tags):
+                    self._debug_verbose(
+                        f"rfid[{self.name}]: DBG _scan_once tag[{i}]"
+                        f" uid={tag.get('uid_hex')} sid={tag.get('spoolman_id')}"
+                        f" raw_len={tag.get('raw_len', 0)}"
+                        f" tag_text={tag.get('tag_text', '')!r}"
+                    )
+                first_tag = tags[0]
+                for tag in tags:
+                    uid_hex = tag.get("uid_hex")
+                    sid = tag.get("spoolman_id")
+                    # Cache lookup: plain UID → sid mapping.
+                    if sid is None and uid_hex is not None:
+                        cached = _UID_SPOOL_CACHE.get(uid_hex)
+                        if cached is not None:
+                            sid = _cache_entry_sid(cached)
+                            self._debug_verbose(
+                                f"rfid[{self.name}]: DBG _scan_once cache_hit uid={uid_hex} sid={sid}"
+                            )
+                    # Cache update: store plain int sid.
+                    if uid_hex and sid is not None:
+                        existing = _UID_SPOOL_CACHE.get(uid_hex)
+                        if existing != sid:
+                            _UID_SPOOL_CACHE[uid_hex] = sid
+                            _mark_uid_cache_dirty()
+                    assigned = (sid is not None) and self._is_spool_assigned_elsewhere(lane, sid)
+                    self._debug_verbose(
+                        f"rfid[{self.name}]: DBG _scan_once evaluating"
+                        f" uid={uid_hex} sid={sid} assigned_elsewhere={assigned}"
+                    )
+                    if sid is None or not assigned:
+                        self._debug_verbose(
+                            f"rfid[{self.name}]: DBG _scan_once selected"
+                            f" uid={uid_hex} sid={sid}"
+                        )
+                        return {
+                            "lane": lane,
+                            "uid_hex": uid_hex,
+                            "tag_text": tag.get("tag_text", ""),
+                            "raw_len": tag.get("raw_len", 0),
+                            "raw_bytes": tag.get("raw_bytes") or b"",
+                            "spoolman_id": sid,
+                            "ts": time.time(),
+                        }
+                # No unassigned tag found — return first tag so caller can log it,
+                # but do not expose its spoolman_id as a valid hit.
+                first_uid = first_tag.get("uid_hex")
+                self._debug(
+                    f"rfid[{self.name}]: DBG _scan_once all {len(tags)} tag(s) blocked,"
+                    f" returning first with sid=None blocked_sid={first_tag.get('spoolman_id')}"
+                )
+                return {
+                    "lane": lane,
+                    "uid_hex": first_uid,
+                    "tag_text": first_tag.get("tag_text", ""),
+                    "raw_len": first_tag.get("raw_len", 0),
+                    "raw_bytes": first_tag.get("raw_bytes") or b"",
+                    "spoolman_id": None,
+                    "blocked_spoolman_id": first_tag.get("spoolman_id"),
+                    "ts": time.time(),
+                }
+            # No tags at all
+            self._debug(f"rfid[{self.name}]: DBG _scan_once no tags detected")
+            # Minimal RF recovery: clear MFCrypto1On so the next scan attempt
+            # starts with a clean transceiver state.
+            if hasattr(self.reader, "_clear_mask") and hasattr(self.reader, "Status2Reg"):
+                try:
+                    self.reader._clear_mask(self.reader.Status2Reg, 0x08)
+                except Exception:
+                    # RF recovery is best-effort; log and continue returning an empty result.
+                    self._log.exception(
+                        f"rfid[{self.name}]: _clear_mask RF recovery failed in _scan_once"
+                    )
+            return {
+                "lane": lane,
+                "uid_hex": None,
+                "tag_text": None,
+                "raw_len": 0,
+                "raw_bytes": b"",
+                "spoolman_id": None,
+                "ts": time.time(),
+            }
+
+        # Single-tag fallback: prefer a single-pass tag read so UID, raw bytes,
+        # and text come from the same physical scan attempt.
+        info = None
+        if hasattr(self.reader, "read_tag_info"):
+            self._debug_verbose(f"rfid[{self.name}]: DBG _scan_once path=read_tag_info")
+            try:
+                info = self.reader.read_tag_info(max_pages=max_pages)
+            except TypeError:
+                info = self.reader.read_tag_info(max_pages)
+            except Exception:
+                self._log.exception("reader method read_tag_info failed")
+                info = None
+            self._debug_verbose(
+                f"rfid[{self.name}]: DBG _scan_once read_tag_info returned"
+                f" uid={info.get('uid_hex') if info else None}"
+                f" sid={info.get('spoolman_id') if info else None}"
+                f" raw_len={info.get('raw_len') if info else None}"
+                f" tag_text={info.get('tag_text', '') if info else None!r}"
+            )
+        if info:
+            uid_hex = info.get("uid_hex")
+            tag_text = info.get("tag_text") or ""
+            spoolman_id = info.get("spoolman_id")
+            if spoolman_id is None and tag_text:
+                spoolman_id = self._extract_spoolman_id(tag_text)
+                self._debug_verbose(
+                    f"rfid[{self.name}]: DBG _scan_once extracted spoolman_id={spoolman_id}"
+                    f" from tag_text={tag_text!r}"
+                )
+            # Cache lookup: plain UID → sid mapping.
+            if spoolman_id is None and uid_hex is not None:
+                cached = _UID_SPOOL_CACHE.get(uid_hex)
+                if cached is not None:
+                    spoolman_id = _cache_entry_sid(cached)
+                    self._debug_verbose(
+                        f"rfid[{self.name}]: DBG _scan_once cache_hit uid={uid_hex} sid={spoolman_id}"
+                    )
+            raw_len = info.get("raw_len")
+            if raw_len is None:
+                raw_len = len(tag_text.encode("utf-8")) if tag_text else 0
+            # Cache update: store plain int sid.
+            if uid_hex and spoolman_id is not None:
+                existing = _UID_SPOOL_CACHE.get(uid_hex)
+                if existing != spoolman_id:
+                    _UID_SPOOL_CACHE[uid_hex] = spoolman_id
+                    _mark_uid_cache_dirty()
+            if spoolman_id is not None and self._is_spool_assigned_elsewhere(lane, spoolman_id):
+                self._debug_verbose(
+                    f"rfid[{self.name}]: DBG _scan_once suppressing spoolman_id={spoolman_id}"
+                    f" for lane={lane} (assigned elsewhere)"
+                )
+                spoolman_id = None
+            self._debug_verbose(
+                f"rfid[{self.name}]: DBG _scan_once result path=read_tag_info"
+                f" uid={uid_hex} sid={spoolman_id} raw_len={raw_len}"
+            )
+            return {
+                "lane": lane,
+                "uid_hex": uid_hex,
+                "tag_text": tag_text,
+                "raw_len": raw_len,
+                "raw_bytes": info.get("raw_bytes") or b"",
+                "spoolman_id": spoolman_id,
+                "ts": time.time(),
+            }
+
+        # Fallback for older readers.
+        self._debug_verbose(f"rfid[{self.name}]: DBG _scan_once path=legacy (read_uid_hex + read_tag_text)")
+        uid_hex = self._read_uid_hex()
+        self._debug_verbose(f"rfid[{self.name}]: DBG _scan_once legacy uid_hex={uid_hex}")
+        tag_text = self._read_tag_text(max_pages=max_pages) if uid_hex else None
+        self._debug_verbose(f"rfid[{self.name}]: DBG _scan_once legacy tag_text={tag_text!r}")
+        raw_len = len(tag_text.encode("utf-8")) if tag_text else 0
+        spoolman_id = self._extract_spoolman_id(tag_text)
+        self._debug_verbose(
+            f"rfid[{self.name}]: DBG _scan_once legacy extracted spoolman_id={spoolman_id}"
+        )
+        # Cache lookup: plain UID → sid mapping.
+        if spoolman_id is None and uid_hex is not None:
+            cached = _UID_SPOOL_CACHE.get(uid_hex)
+            if cached is not None:
+                spoolman_id = _cache_entry_sid(cached)
+                self._debug_verbose(
+                    f"rfid[{self.name}]: DBG _scan_once cache_hit uid={uid_hex} sid={spoolman_id}"
+                )
+        # Cache update: store plain int sid.
+        if uid_hex and spoolman_id is not None:
+            existing = _UID_SPOOL_CACHE.get(uid_hex)
+            if existing != spoolman_id:
+                _UID_SPOOL_CACHE[uid_hex] = spoolman_id
+                _mark_uid_cache_dirty()
+        if spoolman_id is not None and self._is_spool_assigned_elsewhere(lane, spoolman_id):
+            self._debug_verbose(
+                f"rfid[{self.name}]: DBG _scan_once legacy suppressing spoolman_id={spoolman_id}"
+                f" for lane={lane} (assigned elsewhere)"
+            )
+            spoolman_id = None
+        self._debug_verbose(
+            f"rfid[{self.name}]: DBG _scan_once result path=legacy"
+            f" uid={uid_hex} sid={spoolman_id} raw_len={raw_len}"
+        )
+        return {
+            "lane": lane,
+            "uid_hex": uid_hex,
+            "tag_text": tag_text,
+            "raw_len": raw_len,
+            "raw_bytes": tag_text.encode("utf-8") if tag_text else b"",
+            "spoolman_id": spoolman_id,
+            "ts": time.time(),
+        }
+
+    def _normalize_port(self, value) -> str:
+        """Normalize lane=, slot=, or bare number to canonical lane{n} key.
+
+        Indexing convention:
+          - AFC lanes are 1-based  (lane1, lane2, …)
+          - Happy Hare slots/gates are 0-based (slot0, slot1, …)
+          - slot{n}  →  lane{n+1}  (e.g. slot0 = lane1 = gate0)
+        """
+        value = str(value).strip().lower()
+        if value.startswith("slot"):
+            n = value[4:]
+            if n.isdigit():
+                return f"lane{int(n) + 1}"
+            return value
+        if value.startswith("lane"):
+            return value
+        if value.isdigit():
+            return f"lane{value}"
+        return value
+
+    def _find_reader_for_port(self, value: str):
+        """Find the reader serving lane/slot *value*; returns (reader, port_key)."""
+        port = self._normalize_port(value)
+        for reader in self._all_readers():
+            for mapped in getattr(reader, "lanes", []):
+                if self._normalize_port(mapped) == port:
+                    return reader, port
+            for mapped in getattr(reader, "slots", []):
+                if self._normalize_port(mapped) == port:
+                    return reader, port
+        return None, port
+
+    def _assign_spool_to_gate(self, lane_n: int, spoolman_id: int) -> None:
+        """Issue the right GCode for the detected MMU system.
+
+        *lane_n* is the 1-based AFC lane number (lane1 → 1, lane2 → 2, …).
+        Happy Hare gates are 0-based, so gate = lane_n - 1.
+        """
+        sid = int(spoolman_id)
+        if self._mmu_system == "hh":
+            gate = lane_n - 1
+            self._debug(f"rfid[{self.name}]: HH assigning spoolman_id={sid} to gate {gate} (lane {lane_n})")
+            for script in (
+                f"MMU_GATE_MAP GATE={gate} SPOOLID={sid}",
+                f"MMU_SPOOLMAN SPOOLID={sid} GATE={gate} UPDATE=1",
+            ):
+                self.reactor.register_async_callback(
+                    lambda e, s=script: self.gcode.run_script_from_command(s)
+                )
+        else:
+            self._debug(f"rfid[{self.name}]: AFC assigning spool_id={sid} to lane {lane_n}")
+            script = f"SET_SPOOL_ID LANE=lane{lane_n} SPOOL_ID={sid}"
+            self.reactor.register_async_callback(
+                lambda e, s=script: self.gcode.run_script_from_command(s)
+            )
+
+    # ---------- Spoolman integration ----------
+    def _spoolman_run_async(self, fn) -> None:
+        """Submit fn() to the bounded Spoolman thread-pool executor.
+
+        All Spoolman HTTP operations are dispatched this way so that blocking
+        network I/O never stalls the Klipper reactor event loop (which would
+        starve MCU timer callbacks and trigger a "timer too close" shutdown).
+        A ThreadPoolExecutor with max_workers=2 bounds the number of concurrent
+        Spoolman requests so that a burst of scans cannot spawn unlimited threads.
+        """
+        if self._spoolman is None:
+            self._log.warning(
+                "rfid[%s]: Spoolman async skipped: self._spoolman is None",
+                self.name,
+            )
+            return
+        if self._spoolman_executor is None:
+            self._log.warning(
+                "rfid[%s]: Spoolman async skipped: executor is None (client=%s)",
+                self.name,
+                self._spoolman is not None,
+            )
+            return
+        try:
+            self._log.debug("rfid[%s]: submitting Spoolman async task", self.name)
+            self._spoolman_executor.submit(fn)
+        except RuntimeError as exc:
+            self._log.warning(
+                "rfid[%s]: Spoolman async submit failed: %s",
+                self.name, exc,
+            )
+
+    def _do_auto_create_spool(self, lane: str, uid_hex: str, tag_data: dict) -> None:
+        """Background-thread worker: create a Spoolman spool from OpenSpool tag data.
+
+        Runs entirely in a background thread.  Uses reactor.register_async_callback
+        (which is thread-safe) to update reactor-side state (_pending, cache) and
+        issue RFID_SCAN_COMMIT when creation succeeds.
+        """
+        client = self._spoolman
+        if client is None:
+            return
+
+        brand = str(tag_data.get("brand") or "Unknown").strip() or "Unknown"
+        # OpenSpool payload uses "type" for material; prefer explicit "material" if present.
+        raw_material = tag_data.get("material") or tag_data.get("type") or "Unknown"
+        material = str(raw_material).strip() or "Unknown"
+        density = tag_data.get("density")
+        color_hex = tag_data.get("color_hex")
+        # OpenSpool payload uses "weight" for remaining weight; prefer "spool_weight" if present.
+        spool_weight = tag_data.get("spool_weight") or tag_data.get("weight")
+
+        try:
+            vendor_id = client.find_or_create_vendor(brand)
+        except Exception as exc:
+            self._log.warning(
+                "rfid: auto_create_spool: vendor find/create failed lane=%s uid=%s: %s",
+                lane, uid_hex, exc,
+            )
+            return
+
+        filament_name = f"{brand} {material}"
+        try:
+            filament_id = client.find_or_create_filament(
+                filament_name, vendor_id, material,
+                density=density, color_hex=color_hex,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "rfid: auto_create_spool: filament find/create failed lane=%s uid=%s: %s",
+                lane, uid_hex, exc,
+            )
+            return
+
+        try:
+            spool = client.create_spool(filament_id, initial_weight=spool_weight)
+            spool_id = int(spool["id"])
+            self._log.info(
+                "rfid: auto_create_spool: created spool id=%s lane=%s uid=%s",
+                spool_id, lane, uid_hex,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "rfid: auto_create_spool: spool creation failed lane=%s uid=%s: %s",
+                lane, uid_hex, exc,
+            )
+            return
+
+        # Register UID association via SpoolmanClient UID helpers.
+        # All global cache mutations are deferred to _on_created, which runs on the
+        # reactor thread, to avoid data-race on _UID_SPOOL_CACHE/_UID_CACHE_DIRTY.
+        try:
+            old_sid = client.find_spool_by_uid(uid_hex, self.max_uids)
+            if old_sid is not None and old_sid != spool_id:
+                client.remove_uid_from_spool(old_sid, uid_hex, self.max_uids)
+            client.add_uid_to_spool(spool_id, uid_hex, self.max_uids)
+        except Exception as exc:
+            self._log.warning(
+                "rfid: auto_create_spool: uid association failed"
+                " spool=%s uid=%s: %s",
+                spool_id, uid_hex, exc,
+            )
+
+        # Hand results back to the reactor (register_async_callback is thread-safe).
+        _lane = lane
+        _uid = uid_hex
+        _sid = spool_id
+        _timeout = self.event_timeout
+
+        def _on_created(event_time):
+            # Stop the scan timer — the spool has been created and is ready to commit.
+            existing = self._scan_timers.pop(_lane, None)
+            if existing is not None:
+                self.reactor.unregister_timer(existing)
+            self._scan_deadlines.pop(_lane, None)
+            self._scan_candidates.pop(_lane, None)
+            self._scan_blocked_uids.pop(_lane, None)
+            self._scan_seen_uids.pop(_lane, None)
+            _UID_SPOOL_CACHE[_uid] = _sid
+            _mark_uid_cache_dirty()
+            self._pending[_lane] = {
+                "lane": _lane,
+                "spoolman_id": _sid,
+                "uid_hex": _uid,
+                "tag_text": None,
+                "ts": time.time(),
+                "timeout": _timeout,
+            }
+            self._respond(
+                f"rfid: auto_create_spool: spool {_sid} created for"
+                f" uid={_uid} on lane {_lane}"
+            )
+            if self.auto_write:
+                try:
+                    current_uid = None
+                    current_scan = self._scan_once(_lane)
+                    if isinstance(current_scan, dict):
+                        current_uid = current_scan.get("uid_hex") or current_scan.get("uid")
+                    elif isinstance(current_scan, (tuple, list)) and current_scan:
+                        current_uid = current_scan[0]
+                    if current_uid == _uid:
+                        self._write_spoolman_id_to_tag(_sid, _uid)
+                except Exception:
+                    pass
+            self.gcode.run_script_from_command(f"RFID_SCAN_COMMIT LANE={_lane}")
+
+        self.reactor.register_async_callback(_on_created)
+
+    def _dispatch_uid_resolution(self, lane: str, uid_hex: str, tag_text: str) -> None:
+        """Schedule a background Spoolman UID lookup for a tag with NDEF data but no spool_id.
+
+        Dispatches to the thread-pool executor so blocking HTTP I/O never stalls the
+        reactor.  On a successful UID lookup (Step 2), updates _pending and the UID cache
+        via reactor.register_async_callback and issues RFID_SCAN_COMMIT.  If the UID is
+        not found in Spoolman and auto_create_spool=True (Step 3), delegates to
+        _do_auto_create_spool.  If neither applies, logs and stops cleanly.
+
+        If auto_write=True, a best-effort write of spool_id back to the tag NDEF is
+        attempted from the reactor thread after a successful lookup or auto-create.
+        """
+        if self._spoolman is None:
+            return
+
+        _lane = lane
+        _uid = uid_hex
+        _text = tag_text
+        _timeout = self.event_timeout
+
+        def _work():
+            # Search Spoolman for a spool associated with this UID.
+            found_sid: Optional[int] = None
+            try:
+                found_sid = self._spoolman_find_spool_by_uid(_uid)
+            except Exception as exc:
+                self._debug(
+                    f"rfid: _dispatch_uid_resolution uid={_uid}: find_by_uid failed: {exc}"
+                )
+
+            if found_sid is not None:
+                # UID found in Spoolman: stop the scan, cache and commit via reactor callback.
+                _sid = found_sid
+
+                def _on_found(event_time):
+                    # Stop the scan timer — we have our answer.
+                    existing = self._scan_timers.pop(_lane, None)
+                    if existing is not None:
+                        self.reactor.unregister_timer(existing)
+                    self._scan_deadlines.pop(_lane, None)
+                    self._scan_candidates.pop(_lane, None)
+                    self._scan_blocked_uids.pop(_lane, None)
+                    self._scan_seen_uids.pop(_lane, None)
+                    _UID_SPOOL_CACHE[_uid] = _sid
+                    _mark_uid_cache_dirty()
+                    self._pending[_lane] = {
+                        "lane": _lane,
+                        "spoolman_id": _sid,
+                        "uid_hex": _uid,
+                        "tag_text": _text,
+                        "ts": time.time(),
+                        "timeout": _timeout,
+                    }
+                    self._respond(
+                        f"RFID: tag uid={_uid} matched spool {_sid} in Spoolman"
+                        f" on lane {_lane}"
+                    )
+                    if self.auto_write:
+                        try:
+                            current_uid = None
+                            current_scan = self._scan_once(_lane)
+                            if isinstance(current_scan, dict):
+                                current_uid = current_scan.get("uid_hex") or current_scan.get("uid")
+                            elif isinstance(current_scan, (tuple, list)) and current_scan:
+                                current_uid = current_scan[0]
+                            if current_uid == _uid:
+                                self._write_spoolman_id_to_tag(_sid, _uid)
+                        except Exception:
+                            pass
+                    self.gcode.run_script_from_command(f"RFID_SCAN_COMMIT LANE={_lane}")
+
+                self.reactor.register_async_callback(_on_found)
+                return
+
+            # 3. Not found in Spoolman — try auto-create if enabled and tag is OpenSpool.
+            if self.auto_create_spool and _text:
+                try:
+                    tag_data = json.loads(_text)
+                    if isinstance(tag_data, dict) and tag_data.get("protocol") == "openspool":
+                        self._do_auto_create_spool(_lane, _uid, dict(tag_data))
+                        return
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
+
+            # 4. No match and no auto-create path succeeded — report the UID resolution result.
+            _no_create = not self.auto_create_spool
+            def _on_not_found(event_time):
+                suffix = " and auto_create_spool=False" if _no_create else " (no matching OpenSpool data)"
+                self._respond(
+                    f"RFID: tag uid={_uid} not found in Spoolman{suffix} — UID resolution complete; scan will continue for other tags until the scan window ends"
+                )
+
+            self.reactor.register_async_callback(_on_not_found)
+
+        if self._spoolman_executor is not None:
+            self._spoolman_run_async(_work)
+        else:
+            self._log.warning(
+                "rfid[%s]: not scheduling Spoolman UID resolution for uid=%s lane=%s"
+                " (executor=%s)",
+                self.name, uid_hex, lane,
+                self._spoolman_executor is not None,
+            )
+
+    def _ensure_uid_in_spool_extra(self, uid_hex: str, spool_id: int) -> None:
+        """Background: add uid_hex to spool's rfid_uid_N extra fields if not already present.
+
+        Failures are logged at warning level so they are visible without debug=True.
+        Call only from the thread-pool executor (never the reactor thread).
+        """
+        self._log.info(
+            "rfid: ensuring uid=%s is registered on spool sid=%d", uid_hex, spool_id
+        )
+        try:
+            client = self._spoolman
+            if client is not None:
+                ok = client.add_uid_to_spool(spool_id, uid_hex, self.max_uids)
+            else:
+                ok = self._spoolman_add_uid_to_spool(spool_id, uid_hex)
+            if ok:
+                self._log.info(
+                    "rfid: uid=%s successfully registered on spool sid=%d",
+                    uid_hex, spool_id,
+                )
+            else:
+                self._log.warning(
+                    "rfid: uid=%s could not be registered on spool sid=%d"
+                    " — all rfid_uid_N slots occupied, fields missing/uncreatable,"
+                    " or PATCH failed."
+                    " Check Spoolman extra fields (Settings → Extra Fields)"
+                    " or set max_uids higher.",
+                    uid_hex, spool_id,
+                )
+        except Exception as exc:
+            self._log.warning(
+                "rfid: failed to register uid=%s on spool sid=%d: %s",
+                uid_hex, spool_id, exc,
+            )
+
+    # ---------- event handlers ----------
+    def _start_scan_timer(self, lane: str) -> None:
+        """Start a reactor timer that keeps scanning until a spoolman_id is found
+        or scan_window seconds have elapsed.  Safe to call from an event handler
+        because it only registers a timer — no reactor.pause() is used.
+        """
+        # Cancel any existing timer for this lane before starting a new one.
+        existing = self._scan_timers.pop(lane, None)
+        if existing is not None:
+            self.reactor.unregister_timer(existing)
+        # Clear any pending spool assignment from a previous scan window.
+        self._pending.pop(lane, None)
+        self._scan_deadlines[lane] = self.reactor.monotonic() + self.scan_window
+        # Reset candidate state for a fresh scan window.
+        self._scan_candidates.pop(lane, None)
+        self._scan_blocked_uids[lane] = set()
+        self._scan_seen_uids[lane] = set()
+
+        handle = self.reactor.register_timer(
+            lambda event_time, _lane=lane: self._scan_timer_callback(_lane, event_time),
+            self.reactor.monotonic() + _ASYNC_MIN_DELAY,
+        )
+        self._scan_timers[lane] = handle
+        self._respond(
+            f"rfid[{self.name}]: scan timer started for lane {lane}"
+            f" window={self.scan_window:.1f}s"
+        )
+
+    def _run_scan_window_sync(self, lane: str) -> Optional[dict]:
+        """Start the timer-based scan engine and block (via reactor.pause) until a
+        result is stored in self._pending[lane] or the scan window expires.
+
+        ONLY call from GCode command handlers (Klipper completion greenlet).
+        Do NOT call from event handlers or reactor timer callbacks.
+        """
+        self._sync_scan_lanes.add(lane)
+        self._start_scan_timer(lane)
+        poll_interval = max(_ASYNC_MIN_DELAY, self.scan_delay)
+        deadline = self._scan_deadlines.get(lane, self.reactor.monotonic() + self.scan_window)
+        try:
+            while True:
+                self.reactor.pause(self.reactor.monotonic() + poll_interval)
+                if lane in self._pending:
+                    return self._pending[lane]
+                # Timer finished naturally (window expired) — no timer handle left.
+                if lane not in self._scan_timers:
+                    return self._pending.get(lane)
+                if self.reactor.monotonic() > deadline + 0.5:
+                    # Safety margin exceeded — cancel the stale timer and give up.
+                    existing = self._scan_timers.pop(lane, None)
+                    if existing is not None:
+                        self.reactor.unregister_timer(existing)
+                    self._scan_deadlines.pop(lane, None)
+                    self._scan_candidates.pop(lane, None)
+                    self._scan_blocked_uids.pop(lane, None)
+                    self._scan_seen_uids.pop(lane, None)
+                    return self._pending.get(lane)
+        finally:
+            self._sync_scan_lanes.discard(lane)
+
+    def _scan_timer_callback(self, lane: str, event_time: float) -> float:
+        """Reactor timer callback: attempt one scan and reschedule or stop.
+
+        Must NOT call reactor.pause().  Returns next wake time or
+        self.reactor.NEVER to stop the timer.
+
+        Two commit strategies, selected by self.fast_mode:
+
+        fast_mode=True (default):
+          Any tick that returns a valid spoolman_id for a UID that is not
+          blocked for this window is immediately committed.  No second
+          confirmation read is required.
+
+        fast_mode=False (safe/two-read mode):
+          - Tick 1 (observe): a valid tag is seen → stored as candidate (count=1).
+          - Tick 2+ (confirm): the same uid is seen again → count incremented.
+          - When count >= 2: commit to _pending and stop.
+          - Fallback: if the current tick returns NO tag at all (uid_hex is None)
+            and a count==1 candidate exists that has not yet expired, commit it
+            immediately — the tag passed the reader once and is now gone.
+          - No-tag / blocked ticks: leave current candidate alive; only evict it
+            once it has not been re-seen for longer than candidate_ttl seconds.
+
+        In both modes _scan_blocked_uids prevents the same UID from being
+        re-committed within the same scan window.
+        """
+        try:
+            now = self.reactor.monotonic()
+            remaining = self._scan_deadlines.get(lane, 0.0) - now
+            self._debug_verbose(
+                f"rfid[{self.name}]: DBG timer_tick lane={lane} remaining={remaining:.2f}s"
+                f" fast_mode={self.fast_mode}"
+            )
+            result = self._scan_once(lane, max_pages=self.max_pages)
+            uid_hex = result.get("uid_hex")
+            spoolman_id = result.get("spoolman_id")
+            blocked_sid = result.get("blocked_spoolman_id")
+            tag_text = result.get("tag_text") or ""
+            raw_len = result.get("raw_len", 0)
+            self._debug_verbose(
+                f"rfid[{self.name}]: DBG timer_result lane={lane}"
+                f" uid={uid_hex} raw_len={raw_len} spoolman_id={spoolman_id}"
+                f" blocked_sid={blocked_sid}"
+                + (f" tag_text={tag_text!r}" if tag_text else "")
+            )
+
+            # Track every uid_hex seen this scan window for cache-recovery at lane_loaded.
+            if uid_hex is not None:
+                self._scan_seen_uids.setdefault(lane, set()).add(uid_hex)
+
+            # UID known but spoolman_id not yet resolved — dispatch a Spoolman lookup.
+            # This covers two cases:
+            #   • Full NDEF read (raw_len > 0): tag text present, auto-create path may apply.
+            #   • UID-only read (raw_len == 0): anticollision succeeded but NDEF memory was
+            #     not returned (tag passed too quickly, partial read, etc.).  The auto-create
+            #     OpenSpool path is skipped in this case because there is no NDEF payload;
+            #     only the Spoolman rfid_uid_N server lookup runs.
+            # Dispatch async Spoolman UID lookup (Step 2/3) when Spoolman is configured,
+            # while the scan timer keeps running to look for other tags with spool_ids.
+            # blocked_uids must be initialised here (before the spoolman_id branch) so
+            # we can mark the uid as dispatched and prevent re-dispatching every tick.
+            blocked_uids = self._scan_blocked_uids.setdefault(lane, set())
+
+            if (
+                uid_hex is not None
+                and spoolman_id is None
+                and not result.get("blocked_spoolman_id")
+                and uid_hex not in blocked_uids
+            ):
+                if self._spoolman is not None:
+                    # Spoolman configured: check for "good find" early-commit first.
+                    # Only applies to AFC event-driven timer scans (not GCode sync scans
+                    # whose lane is in _sync_scan_lanes — those must let _run_scan_window_sync
+                    # drive the result via _pending so the GCode caller gets a return value).
+                    if self.auto_create_spool and lane not in self._sync_scan_lanes:
+                        try:
+                            _td = json.loads(tag_text) if tag_text else None
+                            if isinstance(_td, dict) and _td.get("protocol") == "openspool":
+                                blocked_uids.add(uid_hex)
+                                self._scan_timers.pop(lane, None)
+                                self._scan_deadlines.pop(lane, None)
+                                self._scan_candidates.pop(lane, None)
+                                self._scan_blocked_uids.pop(lane, None)
+                                self._scan_seen_uids.pop(lane, None)
+                                self._debug(
+                                    f"rfid[{self.name}]: DBG good_find_early_commit"
+                                    f" lane={lane} uid={uid_hex}"
+                                    f" — OpenSpool tag, dispatching auto-create"
+                                )
+                                _lane, _uid, _data = lane, uid_hex, dict(_td)
+                                if self._spoolman_executor is not None:
+                                    self._spoolman_run_async(
+                                        lambda l=_lane, u=_uid, d=_data:
+                                            self._do_auto_create_spool(l, u, d)
+                                    )
+                                else:
+                                    self._log.warning(
+                                        "rfid[%s]: not scheduling Spoolman auto-create for uid=%s lane=%s"
+                                        " (client=%s executor=%s)",
+                                        self.name, uid_hex, lane,
+                                        self._spoolman is not None,
+                                        self._spoolman_executor is not None,
+                                    )
+                                return self.reactor.NEVER
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    # No early-commit: fire off background UID lookup and keep scanning.
+                    self._debug(
+                        f"rfid[{self.name}]: DBG uid_resolution_dispatch lane={lane} uid={uid_hex}"
+                    )
+                    blocked_uids.add(uid_hex)  # prevent re-dispatch this window
+                    self._dispatch_uid_resolution(lane, uid_hex, tag_text)
+                    # Fall through — scan timer continues looking for other spool_id tags.
+                elif not self.auto_create_spool:
+                    # No Spoolman and no auto-create: nothing more to do.
+                    self._respond(
+                        f"RFID: lane {lane} tag uid={uid_hex} read"
+                        f" (no spoolman_id, auto_create_spool=False — scan complete)"
+                    )
+                    self._scan_timers.pop(lane, None)
+                    self._scan_deadlines.pop(lane, None)
+                    self._scan_candidates.pop(lane, None)
+                    self._scan_blocked_uids.pop(lane, None)
+                    self._scan_seen_uids.pop(lane, None)
+                    return self.reactor.NEVER
+
+            if spoolman_id is not None:
+                # Valid tag seen.
+                if uid_hex in blocked_uids:
+                    self._debug_verbose(
+                        f"rfid[{self.name}]: DBG candidate_skip lane={lane}"
+                        f" uid={uid_hex} reason=blocked_this_window"
+                    )
+                    if not self.fast_mode:
+                        # Apply candidate_ttl aging while a blocked tag is present.
+                        candidate = self._scan_candidates.get(lane)
+                        if candidate is not None:
+                            age = now - candidate["last_ts"]
+                            if age > self.candidate_ttl:
+                                self._debug(
+                                    f"rfid[{self.name}]: DBG candidate_ttl_expire lane={lane}"
+                                    f" uid={candidate['uid_hex']} age={age:.2f}s"
+                                )
+                                self._scan_candidates.pop(lane, None)
+                elif self.fast_mode:
+                    # Fast mode: single valid read is enough — commit immediately.
+                    blocked_uids.add(uid_hex)
+                    self._pending[lane] = {
+                        "lane": lane,
+                        "spoolman_id": int(spoolman_id),
+                        "uid_hex": uid_hex,
+                        "tag_text": result.get("tag_text"),
+                        "ts": time.time(),
+                        "timeout": self.event_timeout,
+                    }
+                    self._scan_timers.pop(lane, None)
+                    self._scan_deadlines.pop(lane, None)
+                    self._scan_blocked_uids.pop(lane, None)
+                    self._scan_seen_uids.pop(lane, None)
+                    self._debug(
+                        f"rfid[{self.name}]: DBG single_read_commit lane={lane}"
+                        f" uid={uid_hex} sid={spoolman_id}"
+                    )
+                    self._respond(
+                        f"RFID: tag found on lane {lane}, spoolman_id={spoolman_id}"
+                    )
+                    # Step 4: async ensure the UID is recorded in the spool's extra fields.
+                    if uid_hex is not None and self._spoolman is not None and self._spoolman_executor is not None:
+                        _eu, _es = uid_hex, int(spoolman_id)
+                        self._spoolman_run_async(
+                            lambda u=_eu, s=_es: self._ensure_uid_in_spool_extra(u, s)
+                        )
+                    elif uid_hex is not None and self._spoolman is not None:
+                        self._log.warning(
+                            "rfid[%s]: not scheduling Spoolman UID write for uid=%s sid=%s"
+                            " because executor is unavailable",
+                            self.name, uid_hex, spoolman_id,
+                        )
+                    else:
+                        self._debug(
+                            f"rfid[{self.name}]: DBG skipping Spoolman UID write"
+                            f" uid={uid_hex} sid={spoolman_id}"
+                            f" client={self._spoolman is not None}"
+                            f" executor={self._spoolman_executor is not None}"
+                        )
+                    return self.reactor.NEVER
+                else:
+                    # Safe mode: two-read confirmation.
+                    candidate = self._scan_candidates.get(lane)
+                    if candidate is not None and candidate["uid_hex"] == uid_hex:
+                        candidate["count"] += 1
+                        candidate["last_ts"] = now
+                        self._debug_verbose(
+                            f"rfid[{self.name}]: DBG candidate_observe lane={lane}"
+                            f" uid={uid_hex} sid={spoolman_id} count={candidate['count']}"
+                        )
+                    else:
+                        self._scan_candidates[lane] = {
+                            "uid_hex": uid_hex,
+                            "spoolman_id": spoolman_id,
+                            "count": 1,
+                            "last_ts": now,
+                        }
+                        candidate = self._scan_candidates[lane]
+                        self._debug(
+                            f"rfid[{self.name}]: DBG candidate_new lane={lane}"
+                            f" uid={uid_hex} sid={spoolman_id}"
+                        )
+
+                    if candidate["count"] >= 2:
+                        # Confirmed — re-check assigned-elsewhere as a safety net.
+                        blocked_at_confirm = self._is_spool_assigned_elsewhere(lane, spoolman_id)
+                        if blocked_at_confirm:
+                            self._debug(
+                                f"rfid[{self.name}]: DBG candidate_blocked lane={lane}"
+                                f" uid={uid_hex} sid={spoolman_id}"
+                                f" reason=assigned_elsewhere_at_confirm"
+                            )
+                            blocked_uids.add(uid_hex)
+                            self._scan_candidates.pop(lane, None)
+                        else:
+                            blocked_uids.add(uid_hex)
+                            self._pending[lane] = {
+                                "lane": lane,
+                                "spoolman_id": int(spoolman_id),
+                                "uid_hex": uid_hex,
+                                "tag_text": result.get("tag_text"),
+                                "ts": time.time(),
+                                "timeout": self.event_timeout,
+                            }
+                            self._scan_timers.pop(lane, None)
+                            self._scan_deadlines.pop(lane, None)
+                            self._scan_candidates.pop(lane, None)
+                            self._scan_blocked_uids.pop(lane, None)
+                            self._scan_seen_uids.pop(lane, None)
+                            self._debug(
+                                f"rfid[{self.name}]: DBG candidate_confirm lane={lane}"
+                                f" uid={uid_hex} sid={spoolman_id}"
+                            )
+                            self._respond(
+                                f"RFID: tag found on lane {lane}, spoolman_id={spoolman_id}"
+                            )
+                            # Step 4: async ensure the UID is recorded in the spool's extra fields.
+                            if uid_hex is not None and self._spoolman is not None and self._spoolman_executor is not None:
+                                _eu, _es = uid_hex, int(spoolman_id)
+                                self._spoolman_run_async(
+                                    lambda u=_eu, s=_es: self._ensure_uid_in_spool_extra(u, s)
+                                )
+                            elif uid_hex is not None and self._spoolman is not None:
+                                self._log.warning(
+                                    "rfid[%s]: not scheduling Spoolman UID write for uid=%s sid=%s"
+                                    " because executor is unavailable",
+                                    self.name, uid_hex, spoolman_id,
+                                )
+                            else:
+                                self._debug(
+                                    f"rfid[{self.name}]: DBG skipping Spoolman UID write"
+                                    f" uid={uid_hex} sid={spoolman_id}"
+                                    f" client={self._spoolman is not None}"
+                                    f" executor={self._spoolman_executor is not None}"
+                                )
+                            return self.reactor.NEVER
+            else:
+                # No valid tag this tick (spoolman_id is None).
+                #
+                # Auto-create path: if the tag carries OpenSpool JSON but has no
+                # spoolman_id, and auto_create_spool is enabled, launch a background
+                # thread to create the spool in Spoolman.  The background thread uses
+                # reactor.register_async_callback (thread-safe) to hand the result
+                # back and issue RFID_SCAN_COMMIT — no blocking I/O on the reactor.
+                if (uid_hex is not None
+                        and self.auto_create_spool
+                        and self._spoolman is not None
+                        and uid_hex not in blocked_uids):
+                    try:
+                        tag_data = json.loads(tag_text) if tag_text else None
+                        if isinstance(tag_data, dict) and tag_data.get("protocol") == "openspool":
+                            blocked_uids.add(uid_hex)
+                            self._scan_timers.pop(lane, None)
+                            self._scan_deadlines.pop(lane, None)
+                            self._scan_candidates.pop(lane, None)
+                            self._scan_blocked_uids.pop(lane, None)
+                            self._scan_seen_uids.pop(lane, None)
+                            self._debug(
+                                f"rfid[{self.name}]: DBG auto_create_defer"
+                                f" lane={lane} uid={uid_hex}"
+                            )
+                            _lane, _uid, _data = lane, uid_hex, dict(tag_data)
+                            if self._spoolman_executor is not None:
+                                self._spoolman_run_async(
+                                    lambda l=_lane, u=_uid, d=_data:
+                                        self._do_auto_create_spool(l, u, d)
+                                )
+                            else:
+                                self._log.warning(
+                                    "rfid[%s]: not scheduling Spoolman auto-create for uid=%s lane=%s"
+                                    " (client=%s executor=%s)",
+                                    self.name, uid_hex, lane,
+                                    self._spoolman is not None,
+                                    self._spoolman_executor is not None,
+                                )
+                            return self.reactor.NEVER
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+                if not self.fast_mode:
+                    candidate = self._scan_candidates.get(lane)
+                    if candidate is not None:
+                        age = now - candidate["last_ts"]
+                        # Fallback commit condition: no tag detected at all (uid_hex is None,
+                        # not just a failed NDEF parse), only one sighting so far, and the
+                        # candidate is still fresh (within candidate_ttl).  This handles the
+                        # case where the spool passed through too quickly for a second read.
+                        if uid_hex is None and candidate["count"] == 1 and age <= self.candidate_ttl:
+                            # Fallback: tag was seen once and is now gone — commit it.
+                            cand_uid = candidate["uid_hex"]
+                            cand_sid = candidate["spoolman_id"]
+                            if cand_uid not in blocked_uids:
+                                blocked_uids.add(cand_uid)
+                                self._pending[lane] = {
+                                    "lane": lane,
+                                    "spoolman_id": int(cand_sid),
+                                    "uid_hex": cand_uid,
+                                    "tag_text": None,
+                                    "ts": time.time(),
+                                    "timeout": self.event_timeout,
+                                }
+                                self._scan_timers.pop(lane, None)
+                                self._scan_deadlines.pop(lane, None)
+                                self._scan_candidates.pop(lane, None)
+                                self._scan_blocked_uids.pop(lane, None)
+                                self._scan_seen_uids.pop(lane, None)
+                                self._debug(
+                                    f"rfid[{self.name}]: DBG single_sighting_fallback lane={lane}"
+                                    f" uid={cand_uid} sid={cand_sid}"
+                                )
+                                self._respond(
+                                    f"RFID: tag found on lane {lane}, spoolman_id={cand_sid}"
+                                )
+                                # Step 4: async ensure the UID is recorded in the spool's extra fields.
+                                if cand_uid is not None and self._spoolman is not None and self._spoolman_executor is not None:
+                                    _eu, _es = cand_uid, int(cand_sid)
+                                    self._spoolman_run_async(
+                                        lambda u=_eu, s=_es: self._ensure_uid_in_spool_extra(u, s)
+                                    )
+                                elif cand_uid is not None and self._spoolman is not None:
+                                    self._log.warning(
+                                        "rfid[%s]: not scheduling Spoolman UID write for uid=%s sid=%s"
+                                        " because executor is unavailable",
+                                        self.name, cand_uid, cand_sid,
+                                    )
+                                else:
+                                    self._debug(
+                                        f"rfid[{self.name}]: DBG skipping Spoolman UID write"
+                                        f" uid={cand_uid} sid={cand_sid}"
+                                        f" client={self._spoolman is not None}"
+                                        f" executor={self._spoolman_executor is not None}"
+                                    )
+                                return self.reactor.NEVER
+                        elif age > self.candidate_ttl:
+                            self._debug(
+                                f"rfid[{self.name}]: DBG candidate_ttl_expire lane={lane}"
+                                f" uid={candidate['uid_hex']} age={age:.2f}s"
+                            )
+                            self._scan_candidates.pop(lane, None)
+
+            if now >= self._scan_deadlines.get(lane, 0.0):
+                self._scan_timers.pop(lane, None)
+                self._scan_deadlines.pop(lane, None)
+                self._scan_candidates.pop(lane, None)
+                self._scan_blocked_uids.pop(lane, None)
+                self._scan_seen_uids.pop(lane, None)
+                self._respond(
+                    f"RFID: scan window expired for lane {lane}, no tag found"
+                )
+                return self.reactor.NEVER
+
+            return event_time + max(_ASYNC_MIN_DELAY, self.scan_delay)
+        except Exception:
+            self._log.exception(
+                "rfid[%s]: scan timer callback failed for lane %s", self.name, lane
+            )
+            self._scan_timers.pop(lane, None)
+            self._scan_deadlines.pop(lane, None)
+            self._scan_candidates.pop(lane, None)
+            self._scan_blocked_uids.pop(lane, None)
+            self._scan_seen_uids.pop(lane, None)
+            return self.reactor.NEVER
+
+    def _handle_klippy_flush(self) -> None:
+        """Flush the UID cache to disk on Klipper disconnect or shutdown."""
+        _flush_uid_cache_if_dirty()
+        if self._spoolman_executor is not None:
+            self._spoolman_executor.shutdown(wait=False)
+            self._spoolman_executor = None
+
+    def _handle_klippy_connect(self) -> None:
+        """Detect which MMU system is active so the right GCode is issued at commit.
+
+        Also performs deferred driver auto-detection for ``driver=auto`` configs:
+        the SPI version probe is intentionally skipped during ``__init__`` (before
+        the MCU connects) and runs here, once SPI commands are live.
+
+        Additionally, if SpoolmanClient was not yet initialised (because
+        ``spoolman_url`` was not set in the rfid config), resolve the URL from
+        moonraker.conf now and create the client/executor so that auto-create
+        and UID-write paths work for users who only configure Spoolman in
+        moonraker.conf.  Creating the SpoolmanClient object here is non-blocking;
+        any HTTP calls are deferred to GCode command handlers.
+        """
+        if self.printer.lookup_object("mmu", None) is not None:
+            self._mmu_system = "hh"
+        else:
+            self._mmu_system = "afc"
+        self._debug(f"rfid[{self.name}]: detected MMU system: {self._mmu_system}")
+        if self.driver_cfg == "auto" and not self._detected_driver:
+            self.reader = self._init_driver("auto")
+            self._wire_reader(self.reader)
+            self._detected_driver = True
+        # Lazy SpoolmanClient init: if the explicit spoolman_url was not provided
+        # in the rfid config the client was not created in __init__.  Try to
+        # resolve the URL from moonraker.conf now and, if found, create the
+        # client and executor so auto-create and UID-write paths are available.
+        # Also recreates the executor after a klippy:disconnect/reconnect cycle
+        # (flush clears the executor so async tasks don't silently become no-ops).
+        if SpoolmanClient is not None and (self._spoolman is None or self._spoolman_executor is None):
+            url = self._get_spoolman_url()
+            if url:
+                if self._spoolman is None:
+                    # Cache the resolved URL so _get_spoolman_url() doesn't re-read
+                    # moonraker.conf from disk on every subsequent call.
+                    self.spoolman_url = url
+                    self._spoolman = SpoolmanClient(
+                        url,
+                        api_key=self._spoolman_api_key,
+                        timeout=self._spoolman_timeout,
+                    )
+                    self._debug(
+                        f"rfid[{self.name}]: SpoolmanClient initialised from moonraker.conf url={url}"
+                    )
+                if self._spoolman_executor is None:
+                    self._spoolman_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="rfid_spoolman"
+                    )
+
+    def _handle_lane_prep_start(self, lane_obj) -> None:
+        self._debug(
+            "rfid[%s]: EVENT afc:lane_prep_start raw=%r name=%r"
+            % (self.name, lane_obj, getattr(lane_obj, "name", None))
+        )
+        try:
+            lane = self._lane_name_from_event(lane_obj)
+            self._debug(
+                "rfid[%s]: EVENT normalized prep_start lane=%s reader_lanes=%s"
+                % (self.name, lane, self.lanes)
+            )
+            if not lane:
+                return
+            reader, lane = self._find_reader_for_lane(lane)
+            self._debug(
+                "rfid[%s]: EVENT prep_start matched reader=%s lane=%s"
+                % (self.name, getattr(reader, "name", None), lane)
+            )
+            if reader is not self:
+                self._debug(f"rfid[{self.name}]: EVENT prep_start not for this reader")
+                return
+            # Start the continuous scan timer so the reader keeps scanning
+            # throughout the spool-spinning window instead of only once.
+            self._start_scan_timer(lane)
+        except Exception:
+            self._log.exception("rfid[%s]: EVENT prep_start handler failed", self.name)
+
+    def _handle_lane_loaded(self, lane_obj) -> None:
+        self._debug(
+            "rfid[%s]: EVENT afc:lane_loaded raw=%r name=%r"
+            % (self.name, lane_obj, getattr(lane_obj, "name", None))
+        )
+        try:
+            lane = self._lane_name_from_event(lane_obj)
+            self._debug(
+                "rfid[%s]: EVENT normalized lane_loaded lane=%s reader_lanes=%s"
+                % (self.name, lane, self.lanes)
+            )
+            if not lane:
+                return
+            reader, lane = self._find_reader_for_lane(lane)
+            self._debug(
+                "rfid[%s]: EVENT lane_loaded matched reader=%s lane=%s"
+                % (self.name, getattr(reader, "name", None), lane)
+            )
+            if reader is not self:
+                self._debug(f"rfid[{self.name}]: EVENT lane_loaded not for this reader")
+                return
+            # Cancel any in-progress scan timer for this lane — the spool has
+            # finished loading and we no longer need to keep scanning.
+            existing = self._scan_timers.pop(lane, None)
+            if existing is not None:
+                self.reactor.unregister_timer(existing)
+            self._scan_deadlines.pop(lane, None)
+            self._scan_candidates.pop(lane, None)
+            self._scan_blocked_uids.pop(lane, None)
+
+            # --- Pending-entry cache-fill: uid_hex present but spoolman_id=None ---
+            pending = self._pending.get(lane)
+            if pending is not None and pending.get("spoolman_id") is None:
+                uid_hex = pending.get("uid_hex")
+                if uid_hex:
+                    _entry = _UID_SPOOL_CACHE.get(uid_hex)
+                    if _entry is not None:
+                        sid = _cache_entry_sid(_entry)
+                        if sid is not None and not self._is_spool_assigned_elsewhere(lane, sid):
+                            self._debug(
+                                f"rfid[{self.name}]: cache fill: lane={lane} uid={uid_hex}"
+                                f" sid={sid} (pending had uid but no spoolman_id)"
+                            )
+                            pending["spoolman_id"] = sid
+
+            # --- Cache recovery: UID seen during scan window but SID not resolved in time ---
+            # If _pending has no entry (or has an entry with spoolman_id=None after the
+            # cache-fill above), check _scan_seen_uids against _UID_SPOOL_CACHE.
+            if lane not in self._pending or self._pending[lane].get("spoolman_id") is None:
+                seen = self._scan_seen_uids.get(lane, set())
+                # Iterate in a deterministic order to avoid non-deterministic spool assignment
+                for uid_hex in sorted(seen):
+                    _entry = _UID_SPOOL_CACHE.get(uid_hex)
+                    if _entry is None:
+                        continue
+                    sid = _cache_entry_sid(_entry)
+                    if sid is None:
+                        continue
+                    if self._is_spool_assigned_elsewhere(lane, sid):
+                        self._debug(
+                            f"rfid[{self.name}]: cache recovery blocked: lane={lane}"
+                            f" uid={uid_hex} sid={sid} already assigned elsewhere"
+                        )
+                        continue
+                    self._debug(
+                        f"rfid[{self.name}]: cache recovery: lane={lane} uid={uid_hex}"
+                        f" sid={sid} (from _UID_SPOOL_CACHE, seen during scan window)"
+                    )
+                    self._pending[lane] = {
+                        "lane": lane,
+                        "spoolman_id": sid,
+                        "uid_hex": uid_hex,
+                        "raw_bytes": None,
+                        "tag_text": None,
+                        "filament_info": None,
+                        "ts": time.time(),
+                        "timeout": self.event_timeout,
+                    }
+                    break
+
+            # Clean up seen-UIDs set — no longer needed after lane_loaded.
+            self._scan_seen_uids.pop(lane, None)
+
+            if lane not in self._pending or self._pending[lane].get("spoolman_id") is None:
+                self._debug(f"rfid[{self.name}]: lane_loaded but no pending scan for {lane}, skipping commit")
+                return
+            # Flush any new UID→spoolman_id mappings learned during this scan window.
+            _flush_uid_cache_if_dirty()
+            self.reactor.register_async_callback(
+                lambda e, ln=lane: self.gcode.run_script_from_command("RFID_SCAN_COMMIT LANE=" + ln)
+            )
+        except Exception:
+            self._log.exception("rfid[%s]: EVENT lane_loaded handler failed", self.name)
+
+    # ---------- Spoolman UID extra-field helpers ----------
+
+    def _spoolman_find_spool_by_uid(self, uid_hex: str) -> Optional[int]:
+        """Query Spoolman for a spool whose ``rfid_uid_N`` extra field equals ``uid_hex``.
+
+        Delegates to SpoolmanClient.find_spool_by_uid which handles field existence
+        checks, exact-match queries, verification, and fallback scanning.
+
+        Returns the spool ID (int) if found, None otherwise.
+        Only call from GCode command handlers / thread-pool workers — never from
+        reactor timer callbacks (blocking urllib calls).
+        """
+        if self._spoolman is None:
+            return None
+        try:
+            sid = self._spoolman.find_spool_by_uid(uid_hex, self.max_uids)
+            if sid is not None:
+                self._debug(
+                    f"rfid: _spoolman_find_spool_by_uid: found spool {sid} for uid={uid_hex}"
+                )
+            return sid
+        except Exception as exc:
+            self._debug(f"rfid: _spoolman_find_spool_by_uid uid={uid_hex} failed: {exc}")
+            return None
+
+    def _spoolman_add_uid_to_spool(self, spool_id: int, uid_hex: str) -> bool:
+        """Write ``uid_hex`` into the first empty ``rfid_uid_N`` slot on ``spool_id``.
+
+        Delegates to SpoolmanClient.add_uid_to_spool which handles field existence,
+        slot discovery, PATCH, and field auto-creation on HTTP 400.
+
+        Returns True when ``uid_hex`` is now registered on the spool (was already
+        there, or successfully written to a free slot).  Returns False on HTTP
+        failure or when all slots are full.
+        """
+        if self._spoolman is None:
+            return False
+        try:
+            return self._spoolman.add_uid_to_spool(spool_id, uid_hex, self.max_uids)
+        except Exception as exc:
+            self._debug(
+                f"rfid: _spoolman_add_uid_to_spool spool_id={spool_id} uid={uid_hex} failed: {exc}"
+            )
+            return False
+
+    def _spoolman_remove_uid_from_spool(self, spool_id: int, uid_hex: str) -> bool:
+        """Clear the ``rfid_uid_N`` slot that contains ``uid_hex`` on ``spool_id``.
+
+        Delegates to SpoolmanClient.remove_uid_from_spool which handles the safe
+        read-modify-write: fetches current slots first, then clears only the matching
+        slot.
+
+        Returns True when ``uid_hex`` is no longer registered (was already absent,
+        or successfully removed).  Returns False on HTTP failure.
+        """
+        if self._spoolman is None:
+            return False
+        try:
+            return self._spoolman.remove_uid_from_spool(spool_id, uid_hex, self.max_uids)
+        except Exception as exc:
+            self._debug(
+                f"rfid: _spoolman_remove_uid_from_spool spool_id={spool_id} uid={uid_hex} failed: {exc}"
+            )
+            return False
+
+    def _reassign_uid_to_spool(self, uid_hex: str, new_sid: int) -> None:
+        """Atomically move ``uid_hex`` from whatever spool currently owns it to ``new_sid``.
+
+        Steps:
+        1. Find any existing spool that already owns this UID.
+        2. If found and it is a different spool, remove the UID from that old spool.
+        3. Write the UID to the first empty slot on ``new_sid``.  Up to ``max_uids``
+           UIDs are supported; all existing UIDs on the spool are always preserved.
+        4. Update the local ``_UID_SPOOL_CACHE`` only when all Spoolman updates succeed.
+
+        Only call from GCode command handlers — never from reactor timer callbacks
+        (blocking urllib calls).
+        """
+        self._debug(
+            f"rfid: _reassign_uid_to_spool enter uid={uid_hex} new_sid={new_sid}"
+        )
+
+        old_sid = self._spoolman_find_spool_by_uid(uid_hex)
+        success = True
+
+        # UID is already on the correct spool — no Spoolman changes needed.
+        if old_sid is not None and old_sid == new_sid:
+            self._debug(
+                f"rfid: _reassign_uid_to_spool uid={uid_hex} already on correct"
+                f" spool sid={new_sid} — skipping remove/add"
+            )
+            _UID_SPOOL_CACHE[uid_hex] = new_sid
+            _mark_uid_cache_dirty()
+            return
+
+        # Remove from old spool if it is different from the new one.
+        if old_sid is not None and old_sid != new_sid:
+            if not self._spoolman_remove_uid_from_spool(old_sid, uid_hex):
+                success = False
+                self._debug(
+                    f"rfid: ERROR: failed to remove uid={uid_hex} from old spool sid={old_sid}"
+                )
+
+        # Add to new spool only if the removal step succeeded.
+        if success:
+            if not self._spoolman_add_uid_to_spool(new_sid, uid_hex):
+                success = False
+                self._debug(
+                    f"rfid: ERROR: failed to add uid={uid_hex} to spool sid={new_sid}"
+                )
+
+        # Update local cache only when all Spoolman updates succeeded.
+        if success:
+            _UID_SPOOL_CACHE[uid_hex] = new_sid
+            _mark_uid_cache_dirty()
+
+    def _spoolman_remove_uid(self, uid_hex: str) -> None:
+        """Remove ``uid_hex`` from whichever Spoolman spool currently owns it.
+
+        Also evicts the UID from the local ``_UID_SPOOL_CACHE``.
+        Used by ``RFID_ERASE`` and any reassignment cleanup path.
+
+        Only call from GCode command handlers — never from reactor timer callbacks.
+        """
+        old_sid = self._spoolman_find_spool_by_uid(uid_hex)
+        if old_sid is not None:
+            self._spoolman_remove_uid_from_spool(old_sid, uid_hex)
+        _UID_SPOOL_CACHE.pop(uid_hex, None)
+        _mark_uid_cache_dirty()
+    # ---------- Spoolman auto-create helpers ----------
+
+    def _get_spoolman_url(self) -> Optional[str]:
+        """Return the Spoolman server URL, or None if unavailable.
+
+        Resolution order:
+        1. ``spoolman_url`` config option (if non-empty).
+        2. ``server`` key in the ``[spoolman]`` section of moonraker.conf.
+        """
+        if self.spoolman_url:
+            return self.spoolman_url.rstrip("/")
+        # Try reading from Moonraker config
+        moonraker_conf = os.path.expanduser("~/printer_data/config/moonraker.conf")
+        if os.path.isfile(moonraker_conf):
+            cfg = configparser.ConfigParser()
+            try:
+                cfg.read(moonraker_conf)
+                server = cfg.get("spoolman", "server", fallback=None)
+                if server:
+                    return server.strip().rstrip("/")
+            except Exception as exc:
+                self._debug(f"rfid: could not read spoolman URL from moonraker.conf: {exc}")
+        return None
+
+    def _auto_create_spool(self, filament_info: dict) -> Optional[int]:
+        """Delegate to SpoolmanClient.auto_create_spool."""
+        if self._spoolman is None:
+            return None
+        return self._spoolman.auto_create_spool(filament_info)
+
+    def _fetch_spoolman_spool(self, spool_id: int) -> Optional[dict]:
+        """Delegate to SpoolmanClient.get_spool."""
+        if self._spoolman is None:
+            self._debug("rfid: _fetch_spoolman_spool: no Spoolman client configured")
+            return None
+        try:
+            return self._spoolman.get_spool(int(spool_id))
+        except Exception as exc:
+            self._debug("rfid: _fetch_spoolman_spool id=%d failed: %s" % (spool_id, exc))
+            return None
+
+    def _build_openspool_payload(self, spool_data: dict) -> Optional[str]:
+        """Delegate to SpoolmanClient.build_openspool_payload."""
+        if SpoolmanClient is None:
+            return None
+        return SpoolmanClient.build_openspool_payload(spool_data)
+
+    # ---------- internal scan / commit ----------
+    def _event_scan_begin(
+        self,
+        port: str,
+        timeout: Optional[float] = None,
+        max_pages: Optional[int] = None,
+    ) -> bool:
+        """Scan using the timer-based engine and store the result as a pending entry.
+
+        Uses the same fast_mode / safe-mode, candidate_ttl, _scan_blocked_uids, and
+        scan_window logic as the AFC event-driven path.
+
+        CAUTION: Uses reactor.pause() for polling.
+        ONLY call from GCode command handlers (Klipper completion greenlet).
+        For event handlers dispatch RFID_SCAN/RFID_SCAN_COMMIT GCode commands instead.
+        """
+        port = self._normalize_port(port)
+        effective_window = self.scan_window if timeout is None else float(timeout)
+        self._debug(f"rfid[{self.name}]: begin port={port} timeout={effective_window:.1f}")
+        saved_window = self.scan_window
+        saved_pages = self.max_pages
+        if timeout is not None:
+            self.scan_window = float(timeout)
+        if max_pages is not None:
+            self.max_pages = max(4, int(max_pages))
+        try:
+            result = self._run_scan_window_sync(port)
+        finally:
+            self.scan_window = saved_window
+            self.max_pages = saved_pages
+        if result is None:
+            self._pending.pop(port, None)
+            self._respond(f"RFID: no tag found for {port}")
+            return False
+        if result.get("spoolman_id") is None:
+            uid = result.get("uid_hex", "unknown")
+            # Cache miss path: before attempting auto_create, check whether this UID
+            # is already registered in Spoolman's rfid_uid_N extra fields.  This handles
+            # UIDs added manually in the Spoolman UI, cache evictions after restart,
+            # and any case where the local cache doesn't yet know about the mapping.
+            if uid != "unknown":
+                self._debug(
+                    f"rfid[{self.name}]: cache miss uid={uid} — querying Spoolman"
+                    " for existing rfid_uid_N association"
+                )
+                found_sid = self._spoolman_find_spool_by_uid(uid)
+                if found_sid is not None:
+                    self._debug(
+                        f"rfid[{self.name}]: spoolman_find_spool_by_uid: uid={uid}"
+                        f" → spool_id={found_sid} (cache miss, Spoolman hit)"
+                    )
+                    # Sync local cache and set as the pending result.
+                    _UID_SPOOL_CACHE[uid] = found_sid
+                    _mark_uid_cache_dirty()
+                    self._pending[port] = {
+                        "lane": port,
+                        "spoolman_id": found_sid,
+                        "uid_hex": uid,
+                        "tag_text": result.get("tag_text"),
+                        "ts": time.time(),
+                        "timeout": self.event_timeout,
+                    }
+                    self._debug(f"rfid[{self.name}]: pending stored for {port}")
+                    return True
+            if self.auto_create_spool and uid != "unknown" and _tag_parser is not None:
+                raw_bytes = result.get("raw_bytes") or b""
+                filament_info = self._apply_tag_parser(uid, raw_bytes, result.get("tag_text"))
+                # If raw bytes didn't yield a result and we have a UID, try Bambu authenticated read.
+                if filament_info is None and uid != "unknown":
+                    bambu_blocks = self._try_bambu_read(uid)
+                    if bambu_blocks is not None:
+                        filament_info = self._apply_tag_parser(uid, bambu_blocks)
+                if filament_info:
+                    self._debug(
+                        f"rfid[{self.name}]: auto_create_spool: parsed tag"
+                        f" uid={uid} format={filament_info.get('tag_format')}"
+                        f" material={filament_info.get('material')}"
+                    )
+                    new_sid = self._auto_create_spool(filament_info)
+                    if new_sid is not None:
+                        self._debug(
+                            f"rfid[{self.name}]: auto_create_spool lane={port} → spoolman_id={new_sid}"
+                        )
+                        self._respond(
+                            f"RFID: auto-created spool id={new_sid}"
+                            f" for uid={uid} ({filament_info.get('material', '?')})"
+                        )
+                        if uid != "unknown":
+                            # Register UID in Spoolman extra field and update local cache.
+                            self._reassign_uid_to_spool(uid, new_sid)
+                        self._pending[port] = {
+                            "lane": port,
+                            "spoolman_id": new_sid,
+                            "uid_hex": uid,
+                            "tag_text": result.get("tag_text"),
+                            "ts": time.time(),
+                            "timeout": self.event_timeout,
+                        }
+                        self._debug(f"rfid[{self.name}]: pending stored for {port}")
+                        return True
+                    self._debug(
+                        f"rfid[{self.name}]: auto_create_spool lane={port} → failed for uid={uid}"
+                    )
+                else:
+                    self._debug(
+                        f"rfid[{self.name}]: auto_create_spool: unrecognised tag format"
+                        f" uid={uid} raw_len={len(raw_bytes)}"
+                    )
+            self._pending.pop(port, None)
+            self._respond(
+                f"RFID: tag found (uid={uid}) but no spoolman_id for {port}"
+            )
+            return False
+        # spoolman_id resolved from tag NDEF payload — register UID in Spoolman.
+        uid = result.get("uid_hex", "unknown")
+        sid = result.get("spoolman_id")
+        if uid != "unknown" and sid is not None:
+            self._reassign_uid_to_spool(uid, int(sid))
+        self._debug(f"rfid[{self.name}]: pending stored for {port}")
+        return True
+
+    def _event_scan_commit(self, port: str) -> bool:
+        """Commit a pending scan; dispatches AFC or HH GCode based on detected system."""
+        port = self._normalize_port(port)
+        pending = self._pending.get(port)
+        if not pending:
+            self._debug(f"rfid[{self.name}]: no pending scan to commit for {port}")
+            return False
+
+        age = time.time() - float(pending.get("ts", 0.0))
+        timeout = float(pending.get("timeout", self.event_timeout))
+        if age > timeout:
+            self._pending.pop(port, None)
+            self._respond(f"RFID: pending scan expired for {port}")
+            return False
+
+        spoolman_id = pending.get("spoolman_id")
+        if spoolman_id is None:
+            self._pending.pop(port, None)
+            self._respond(f"RFID: pending scan missing spoolman_id for {port}")
+            return False
+
+        self._respond(
+            f"RFID: scan committed for {port}, spoolman_id={spoolman_id}"
+        )
+        gate_str = port[len("lane"):] if port.startswith("lane") else port
+        if gate_str.isdigit():
+            self._assign_spool_to_gate(int(gate_str), int(spoolman_id))
+        elif self._mmu_system == "hh":
+            # Happy Hare requires a numeric gate index; named ports are not
+            # supported.  Emit a clear error rather than running a command
+            # (SET_SPOOL_ID) that does not exist on HH-only setups.
+            self._respond(
+                f"RFID: cannot commit port '{port}' on Happy Hare — "
+                "HH commits require a numeric lane/gate index (use LANE=<n> or SLOT=<n>)"
+            )
+            return False
+        else:
+            # Non-numeric port name on AFC: fall back to direct AFC command.
+            script = f"SET_SPOOL_ID LANE={port} SPOOL_ID={int(spoolman_id)}"
+            self.reactor.register_async_callback(
+                lambda e, s=script: self.gcode.run_script_from_command(s)
+            )
+        self._pending.pop(port, None)
+        _flush_uid_cache_if_dirty()
+        self._debug(f"rfid[{self.name}]: commit complete for {port}")
+        return True
+
+    # ---------- gcode commands ----------
+    def _resolve_port_param(self, gcmd, cmd_name: str) -> str:
+        """Read LANE= or SLOT= from a GCode command.
+
+        Bare numbers are prefixed before normalisation so _normalize_port can
+        apply the correct offset:
+          LANE=1  (or LANE=lane1)  →  "lane1"  (1-based)
+          SLOT=0  (or SLOT=slot0)  →  "slot0"  (0-based, → lane1 after normalise)
+        """
+        lane_raw = gcmd.get("LANE", None)
+        slot_raw = gcmd.get("SLOT", None)
+        if lane_raw is not None:
+            raw = str(lane_raw).strip()
+            return f"lane{raw}" if raw.isdigit() else raw
+        if slot_raw is not None:
+            raw = str(slot_raw).strip()
+            return f"slot{raw}" if raw.isdigit() else raw
+        raise gcmd.error(f"{cmd_name} requires LANE= or SLOT=")
+
+    def _slot_display(self, val: str) -> str:
+        """Convert a stored lane/slot value to canonical slot display notation.
+
+        lane{n}  →  slot{n-1}  (e.g. lane1 → slot0)
+        slot{n}  →  slot{n}    (already slot-based, shown as-is)
+        """
+        v = str(val).strip().lower()
+        m = re.fullmatch(r"lane(\d+)", v)
+        if m:
+            return f"slot{int(m.group(1)) - 1}"
+        return v
+
+    def cmd_RFID_TAG(self, gcmd):
+        info = self._scan_once(self.lane, max_pages=self.max_pages)
+        if not info or not info.get("uid_hex"):
+            gcmd.respond_info(f"rfid[{self.name}]: no tag")
+            return
+        gcmd.respond_info(
+            "rfid[%s]: uid=%s raw_len=%s spoolman_id=%s"
+            % (
+                self.name,
+                info.get("uid_hex"),
+                info.get("raw_len", 0),
+                info.get("spoolman_id"),
+            )
+        )
+        if info.get("tag_text"):
+            gcmd.respond_info("rfid[%s]: tag_text=%s" % (self.name, info["tag_text"]))
+
+    def cmd_RFID_LANES(self, gcmd):
+        for reader in self._all_readers():
+            slot_display = [self._slot_display(s) for s in reader.slots]
+            self._respond(f"rfid[{reader.name}]: lanes={reader.lanes} slots={slot_display}")
+
+    def cmd_RFID_PENDING(self, gcmd):
+        shown = False
+        for reader in self._all_readers():
+            for port, pending in sorted(reader._pending.items()):
+                shown = True
+                age = time.time() - float(pending.get("ts", 0.0))
+                self._respond(
+                    "rfid: pending port=%s spoolman_id=%s age=%.1fs reader=%s"
+                    % (port, pending.get("spoolman_id"), age, reader.name)
+                )
+        if not shown:
+            self._respond("rfid: no pending scans")
+
+    def cmd_RFID_SCAN(self, gcmd):
+        raw = self._resolve_port_param(gcmd, "RFID_SCAN")
+        reader, port = self._find_reader_for_port(raw)
+        if reader is None:
+            raise gcmd.error(f"No rfid reader is mapped to {port}")
+        if not reader._event_scan_begin(port):
+            raise gcmd.error(f"No spoolman_id found for {port}")
+        if not reader._event_scan_commit(port):
+            raise gcmd.error(f"Unable to commit scan for {port}")
+
+    def cmd_RFID_SCAN_BEGIN(self, gcmd):
+        raw = self._resolve_port_param(gcmd, "RFID_SCAN_BEGIN")
+        timeout = float(gcmd.get_float("TIMEOUT", self.event_timeout))
+        max_pages = int(gcmd.get_int("MAX_PAGES", self.max_pages))
+        reader, port = self._find_reader_for_port(raw)
+        if reader is None:
+            raise gcmd.error(f"No rfid reader is mapped to {port}")
+        if not reader._event_scan_begin(port, timeout=timeout, max_pages=max_pages):
+            gcmd.respond_info(f"RFID: no spoolman_id found for {port}, skipping")
+            return
+
+    def cmd_RFID_SCAN_COMMIT(self, gcmd):
+        raw = self._resolve_port_param(gcmd, "RFID_SCAN_COMMIT")
+        reader, port = self._find_reader_for_port(raw)
+        if reader is None:
+            raise gcmd.error(f"No rfid reader is mapped to {port}")
+        if not reader._event_scan_commit(port):
+            gcmd.respond_info(f"RFID: no pending or valid scan to commit for {port}, skipping")
+            return
+
+    def cmd_RFID_CACHE_CLEAR(self, gcmd):
+        global _UID_CACHE_DIRTY
+        count = len(_UID_SPOOL_CACHE)
+        _UID_SPOOL_CACHE.clear()
+        _save_uid_cache(_UID_SPOOL_CACHE)
+        _UID_CACHE_DIRTY = False
+        self._respond(f"rfid: cache cleared ({count} entries removed)")
+
+    def cmd_RFID_CACHE_LIST(self, gcmd):
+        if not _UID_SPOOL_CACHE:
+            self._respond("rfid: cache is empty")
+            return
+        for uid_hex, entry in sorted(_UID_SPOOL_CACHE.items()):
+            sid = _cache_entry_sid(entry)
+            self._respond(f"rfid: cache uid={uid_hex} spoolman_id={sid}")
+
+    def cmd_RFID_CHECK_TAG(self, gcmd):
+        """RFID_CHECK_TAG [LANE=<n>|SLOT=<n>] [CREATE=0|1] [WRITE=0|1]
+
+        Performs a single synchronous scan, parses filament metadata, and reports:
+          - UID
+          - Source: cache / tag / created
+          - All parsed filament fields (material, color, brand, temps, weight, etc.)
+          - Spoolman spool creation result (if CREATE=1)
+          - Write-back result (if WRITE=1; skipped for Bambu tags)
+        """
+        raw = self._resolve_port_param(gcmd, "RFID_CHECK_TAG")
+        reader, port = self._find_reader_for_port(raw)
+        if reader is None:
+            raise gcmd.error(f"RFID_CHECK_TAG: no rfid reader is mapped to {port}")
+        create = gcmd.get_int("CREATE", reader.auto_create_spool)
+        write = gcmd.get_int("WRITE", 0)
+
+        reader._debug(f"rfid[{reader.name}]: RFID_CHECK_TAG port={port} create={create} write={write}")
+
+        scan_result = reader._run_scan_window_sync(port)
+
+        if scan_result is None:
+            gcmd.respond_info("RFID_CHECK_TAG: no tag detected")
+            return
+
+        uid_hex = scan_result.get("uid_hex") or "unknown"
+        raw_bytes = scan_result.get("raw_bytes") or b""
+        tag_text = scan_result.get("tag_text") or ""
+        spoolman_id = scan_result.get("spoolman_id")
+        source = "scan"
+
+        gcmd.respond_info(f"RFID_CHECK_TAG: uid={uid_hex}")
+
+        # Check local cache for a known UID → spool mapping.
+        if spoolman_id is None and uid_hex != "unknown":
+            _entry = _UID_SPOOL_CACHE.get(uid_hex)
+            if _entry is not None:
+                spoolman_id = _cache_entry_sid(_entry)
+                source = "cache"
+
+        if spoolman_id is not None:
+            gcmd.respond_info(
+                f"RFID_CHECK_TAG: uid={uid_hex} spoolman_id={spoolman_id} (from {source})"
+            )
+            return
+
+        # Try to parse filament info from raw bytes, then try Bambu auth read.
+        filament_info = None
+        fmt = "?"
+        if _tag_parser is not None:
+            filament_info = reader._apply_tag_parser(uid_hex, raw_bytes, tag_text)
+            if filament_info is None and uid_hex != "unknown":
+                bambu_blocks = reader._try_bambu_read(uid_hex)
+                if bambu_blocks is not None:
+                    filament_info = reader._apply_tag_parser(uid_hex, bambu_blocks)
+
+        if filament_info:
+            fmt = filament_info.get("tag_format", "?")
+            mat = filament_info.get("material", "?")
+            color = filament_info.get("color_hex", "?")
+            brand = filament_info.get("brand", "?")
+            gcmd.respond_info(
+                f"RFID_CHECK_TAG: format={fmt} material={mat}"
+                f" color=#{color} brand={brand}"
+            )
+            for key in ("min_temp", "max_temp", "bed_temp", "diameter_mm", "weight_g"):
+                val = filament_info.get(key)
+                if val is not None:
+                    gcmd.respond_info(f"RFID_CHECK_TAG:   {key}={val}")
+
+            spoolman_id_from_tag = filament_info.get("spoolman_id")
+            if spoolman_id_from_tag is not None:
+                spoolman_id = spoolman_id_from_tag
+                source = "tag"
+                if uid_hex != "unknown":
+                    # Register UID in Spoolman extra field and update local cache.
+                    reader._reassign_uid_to_spool(uid_hex, int(spoolman_id))
+                gcmd.respond_info(
+                    f"RFID_CHECK_TAG: uid={uid_hex} spoolman_id={spoolman_id} (from tag payload)"
+                )
+                return
+
+            if create:
+                spoolman_url = reader._get_spoolman_url()
+                if not spoolman_url:
+                    gcmd.respond_info(
+                        "RFID_CHECK_TAG: auto-create requested but spoolman_url not configured"
+                    )
+                else:
+                    new_sid = reader._auto_create_spool(filament_info)
+                    if new_sid is not None:
+                        spoolman_id = new_sid
+                        if uid_hex != "unknown":
+                            # Register UID in Spoolman extra field and update local cache.
+                            reader._reassign_uid_to_spool(uid_hex, int(spoolman_id))
+                        gcmd.respond_info(
+                            f"RFID_CHECK_TAG: created spoolman spool id={spoolman_id}"
+                            f" for uid={uid_hex}"
+                        )
+                        is_bambu = fmt == "bambu"
+                        if write:
+                            if is_bambu:
+                                gcmd.respond_info(
+                                    f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
+                                    "spoolman_id cached (cannot write to Bambu tag)"
+                                )
+                            else:
+                                ok = reader._write_spoolman_id_to_tag(
+                                    spoolman_id, uid_hex, is_bambu=is_bambu
+                                )
+                                if ok:
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: wrote spoolman_id={spoolman_id}"
+                                        f" to tag uid={uid_hex}"
+                                    )
+                                else:
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: write-back skipped or failed"
+                                        f" for uid={uid_hex}"
+                                    )
+                    else:
+                        gcmd.respond_info(
+                            f"RFID_CHECK_TAG: spool creation failed for uid={uid_hex}"
+                        )
+        else:
+            gcmd.respond_info(f"RFID_CHECK_TAG: uid={uid_hex} — no filament data parsed")
+
+    def cmd_RFID_WRITE(self, gcmd):
+        """RFID_WRITE LANE=<n>|SLOT=<n> SPOOLID=<id>
+
+        Fetch spool info from Spoolman by ID, build an OpenSpool JSON payload,
+        and write it to the tag on the specified lane's reader.
+
+        UID guard: if the tag currently on the reader is the active spool on a
+        *different* lane, the write is refused to prevent accidentally overwriting
+        another lane's tag.
+        """
+        raw = self._resolve_port_param(gcmd, "RFID_WRITE")
+        reader, port = self._find_reader_for_port(raw)
+        if reader is None:
+            raise gcmd.error(f"RFID_WRITE: no rfid reader is mapped to {port}")
+        spool_id = gcmd.get_int("SPOOLID", None)
+        if spool_id is None:
+            raise gcmd.error("RFID_WRITE requires SPOOLID=<id>")
+
+        reader._debug(f"rfid[{reader.name}]: RFID_WRITE port={port} spool_id={spool_id}")
+
+        # 1. Scan the lane once to detect the tag and get its UID.
+        # Use _scan_once directly — we only need the UID, not a full spoolman_id
+        # parse, and we want to avoid the timer-based scan window (and its latency)
+        # as well as any _pending / auto_create_trigger side effects on blank/unknown tags.
+        scan_result = reader._scan_once(port, max_pages=4)
+        if scan_result is None or not scan_result.get("uid_hex"):
+            gcmd.respond_info(f"RFID_WRITE: no tag detected on {port}")
+            return
+
+        uid_hex = scan_result.get("uid_hex") or "unknown"
+        gcmd.respond_info(f"RFID_WRITE: detected tag uid={uid_hex} on {port}")
+
+        # 2. UID conflict check: refuse only if this UID is the active spool on a
+        #    *different* lane.  A new (uncached) UID, or a stale cache entry that is
+        #    no longer assigned to any lane, are both allowed to proceed.
+        if uid_hex != "unknown":
+            _entry = _UID_SPOOL_CACHE.get(uid_hex)
+            cached_sid = _cache_entry_sid(_entry) if _entry is not None else None
+            if cached_sid is not None and int(cached_sid) != int(spool_id):
+                if reader._is_spool_assigned_elsewhere(port, int(cached_sid)):
+                    gcmd.respond_info(
+                        f"RFID_WRITE: REFUSED — tag uid={uid_hex} is the active spool "
+                        f"(spoolman_id={cached_sid}) on another lane. "
+                        "Remove the wrong spool from the reader first."
+                    )
+                    return
+
+        # 3. Fetch spool data from Spoolman.
+        gcmd.respond_info(f"RFID_WRITE: fetching spool id={spool_id} from Spoolman ...")
+        spool_data = reader._fetch_spoolman_spool(spool_id)
+        if spool_data is None:
+            gcmd.respond_info(
+                f"RFID_WRITE: could not fetch spool id={spool_id} from Spoolman"
+            )
+            return
+
+        # 4. Build the OpenSpool JSON payload.
+        payload_text = reader._build_openspool_payload(spool_data)
+        if payload_text is None:
+            gcmd.respond_info(
+                f"RFID_WRITE: spool id={spool_id} has no filament/material data"
+            )
+            return
+
+        reader._debug(f"rfid[{reader.name}]: RFID_WRITE payload={payload_text!r}")
+
+        # 5. Write to the tag — prefer write_tag (auto-detects NTAG vs MIFARE Classic),
+        #    fall back to write_ndef_text for older driver versions.
+        write_method = getattr(reader.reader, "write_tag", None) or getattr(
+            reader.reader, "write_ndef_text", None
+        )
+        if write_method is None:
+            gcmd.respond_info("RFID_WRITE: this reader does not support tag writing")
+            return
+
+        gcmd.respond_info("RFID_WRITE: writing OpenSpool payload to tag ...")
+        try:
+            ok = write_method(payload_text)
+        except Exception as exc:
+            gcmd.respond_info(f"RFID_WRITE: write error — {exc}")
+            return
+
+        if ok:
+            # Register UID → spoolman_id in Spoolman extra field and update local cache.
+            # This also cleans up any old spool that previously owned this UID.
+            if uid_hex != "unknown":
+                reader._reassign_uid_to_spool(uid_hex, int(spool_id))
+            gcmd.respond_info(
+                f"RFID_WRITE: success — wrote spool id={spool_id} "
+                f"(OpenSpool) to tag uid={uid_hex}"
+            )
+        else:
+            gcmd.respond_info(
+                f"RFID_WRITE: write failed for tag uid={uid_hex} "
+                "— check that the tag is writable and within range"
+            )
+
+
+    def cmd_RFID_ERASE(self, gcmd):
+        """Erase the NDEF payload on the tag currently at LANE=<n> and evict its UID from cache."""
+        raw = self._resolve_port_param(gcmd, "RFID_ERASE")
+        reader, lane = self._find_reader_for_port(raw)
+        if reader is None:
+            raise gcmd.error(f"RFID_ERASE: no rfid reader is mapped to {lane}")
+
+        # Busy-lane guard: refuse if lane is currently scanning.
+        for r in self._all_readers():
+            if lane in getattr(r, "_scan_timers", {}):
+                raise gcmd.error(f"RFID_ERASE: lane {lane} is currently scanning; cannot erase")
+            if lane in getattr(r, "_scan_candidates", {}):
+                raise gcmd.error(f"RFID_ERASE: lane {lane} has an active scan candidate; cannot erase")
+
+        reader._debug(f"rfid[{reader.name}]: RFID_ERASE lane={lane}")
+
+        # Get the UID before erasing so we can evict it from the cache.
+        uid_hex = None
+        try:
+            tags = reader.reader.read_all_tags(max_pages=4)
+            if tags:
+                uid_hex = tags[0].get("uid_hex")
+        except Exception:
+            pass
+        if uid_hex is None:
+            try:
+                uid_hex = reader._read_uid_hex()
+            except Exception:
+                pass
+
+        # Erase the tag by writing an empty NDEF text record.
+        write_method = getattr(reader.reader, "write_ndef_text", None)
+        if write_method is None:
+            gcmd.respond_info("RFID_ERASE: driver does not support write_ndef_text")
+            return
+
+        try:
+            ok = write_method("")
+        except Exception as exc:
+            gcmd.respond_info(f"RFID_ERASE: write error — {exc}")
+            return
+
+        if not ok:
+            gcmd.respond_info(
+                f"RFID_ERASE: erase failed for lane {lane}"
+                " — check that the tag is writable and within range"
+            )
+            return
+
+        # Remove UID from Spoolman extra field and evict from local cache.
+        if uid_hex is not None:
+            reader._spoolman_remove_uid(uid_hex)
+            gcmd.respond_info(
+                f"RFID_ERASE: tag at {lane} erased; UID {uid_hex} removed from Spoolman and cache"
+            )
+        else:
+            gcmd.respond_info(
+                f"RFID_ERASE: tag at {lane} erased (UID unknown, Spoolman/cache not changed)"
+            )
+
+
+def load_config_prefix(config):
+    return Rfid(config)
