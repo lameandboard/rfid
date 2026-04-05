@@ -79,7 +79,7 @@ cd ~
 if [ -d "RFID/.git" ]; then
   git -C RFID pull
 else
-  git clone https://github.com/ikwidtech/RFID.git RFID
+  git clone https://github.com/lameandboard/RFID.git RFID
 fi
 cd RFID
 ./install.sh
@@ -474,7 +474,7 @@ The installer writes this style of block into `moonraker.conf`:
 type: git_repo
 channel: dev
 path: /absolute/path/to/RFID
-origin: https://github.com/ikwidtech/RFID.git
+origin: https://github.com/lameandboard/RFID.git
 primary_branch: main
 managed_services: klipper
 info_tags: desc=RFID for AFC / Klipper
