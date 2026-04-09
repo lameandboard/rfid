@@ -182,7 +182,7 @@ max_pages: 135
 | `messages:` | `True` | Print user-facing scan/commit messages to the Klipper console |
 | `debug:` | `False` | Print detailed step-by-step scan messages to the Klipper console |
 | `spi_speed:` | `100000` | SPI speed passed to the reader driver |
-| `scan_delay:` | `0.05` | Polling interval in seconds between tag read attempts during the scan window |
+| `scan_delay:` | `0.20` | Polling interval in seconds between tag read attempts during the scan window |
 | `scan_window:` | `10.0` | Seconds the timer-based scan engine keeps trying before giving up (used for both event-driven and GCode-initiated scans) |
 | `max_pages:` | `135` | Number of NTAG/Ultralight pages to read from page 4 onward (range(4, 4+max_pages)); reads stop early once a spool_id is found |
 | `event_timeout:` | `60.0` | Seconds before a pending scan result expires |
