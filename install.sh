@@ -604,7 +604,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "${FORCE}" -eq 1 ]]; then
-    repo_url="https://github.com/ikwidtech/RFID.git"
+    repo_url="https://github.com/ikwidtech/rfid.git"
     parent_dir="$(dirname "${REPO_DIR}")"
     repo_name="$(basename "${REPO_DIR}")"
     branch="${BRANCH:-$(current_branch)}"
