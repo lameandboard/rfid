@@ -184,6 +184,8 @@ max_pages: 135
 | `spi_speed:` | `100000` | SPI speed passed to the reader driver |
 | `scan_delay:` | `0.20` | Polling interval in seconds between tag read attempts during the scan window |
 | `scan_window:` | `10.0` | Seconds the timer-based scan engine keeps trying before giving up (used for both event-driven and GCode-initiated scans) |
+| `scan_backoff_after:` | `5` | After this many consecutive no-tag ticks the polling interval switches to `scan_backoff_delay` (0 = disabled) |
+| `scan_backoff_delay:` | `0.5` | Slower polling interval (seconds) used once `scan_backoff_after` is reached |
 | `max_pages:` | `135` | Number of NTAG/Ultralight pages to read from page 4 onward (range(4, 4+max_pages)); reads stop early once a spool_id is found |
 | `event_timeout:` | `60.0` | Seconds before a pending scan result expires |
 | `auto_create_spool:` | `False` | Automatically create a Spoolman spool when a tag has filament metadata but no spool ID |
@@ -489,6 +491,63 @@ Those options match Moonraker's documented `git_repo` updater fields for externa
 The installer places `post-merge` and `post-checkout` hooks in `~/AFC-Klipper-Add-On/.git/hooks/`. These hooks automatically re-run `install.sh --no-restart --no-hooks` whenever AFC is updated via `git pull` or a branch checkout, ensuring `AFC_lane.py` stays patched. Activity is logged to `~/printer_data/logs/rfid_hook.log`.
 
 Use `--no-hooks` to skip installing these hooks.
+
+---
+
+## Diagnosing TTC ("Timer Too Close") Errors During AFC Scans
+
+A Klipper **Timer Too Close (TTC)** shutdown means the MCU missed a real-time deadline, usually because the Klipper host process was too busy to send the next command in time.  When it coincides with an RFID auto AFC scan the most common root causes are:
+
+### What `MI_NOTAGERR` means
+
+`MI_NOTAGERR` is the MFRC522's way of saying "no 14443A tag responded to the WUPA/REQA wake-up pulse within the timeout period".  It is **not an error** — it simply means no spool tag was in range of the antenna at that instant.  Seeing many consecutive `MI_NOTAGERR` lines in the log is normal when the spool is rotating and the tag only passes the antenna periodically.
+
+The problem arises when the scan loop runs too fast and floods the Klipper reactor event queue with SPI work, leaving too little CPU time for motion/MCU heartbeat tasks.
+
+### Config knobs to reduce TTC risk
+
+```ini
+# Slow down the poll rate — each tick does one full SPI scan cycle.
+scan_delay: 0.20        # default; try 0.30–0.50 if TTC persists
+
+# After 5 consecutive no-tag ticks automatically back off to a slower rate.
+scan_backoff_after: 5   # 0 = disable backoff
+scan_backoff_delay: 0.5 # interval used during the backoff phase
+
+# Give the spool more time to rotate — a longer window with slower polling
+# is always safer than a short window with fast polling.
+scan_window: 20.0
+```
+
+The scan window expiry log now includes a summary of how many ticks ran and how long the no-tag streak was:
+
+```
+RFID: scan window expired for lane lane3 reader=mfrc522_1 ticks=42 no_tag_streak=42 — no tag found
+```
+
+A high `ticks` value with `no_tag_streak == ticks` means the tag was never detected.  Check antenna placement and distance; increasing `scan_window` or `scan_backoff_after` gives more opportunities to read while keeping CPU load low.
+
+### Wiring / SPI speed / antenna distance tips
+
+- **SPI speed**: keep `spi_speed` at or below `100000` (100 kHz).  Higher speeds can cause intermittent read errors that make the driver retry in a tight loop.
+- **Antenna distance**: the MFRC522/PN532 typically reads NTAG tags reliably within 0–20 mm.  Mount the antenna so the tag passes within 10–15 mm at its closest point.
+- **SPI wiring length**: keep SPI traces short (< 15 cm).  Long wires without proper termination cause signal integrity issues that produce `MI_ERR` spuriously.
+- **Power supply**: the MFRC522 draws up to 100 mA during active scanning.  Ensure the 3.3 V rail on your MCU board is not shared with other high-current consumers.
+
+### Enabling debug logs
+
+```ini
+debug: True
+```
+
+This enables per-tick trace output to both the Klipper console and `~/printer_data/logs/rfid.log`.  Watch for:
+
+- Repeated `request_status=MI_NOTAGERR` — tag not in range; normal if the spool is still rotating.
+- `request_status=MI_ERR` — hardware/SPI error; check wiring and power supply.
+- `timer_tick remaining=<low>s` lines firing very rapidly — `scan_delay` is too small.
+- `scan window expired … ticks=<N> no_tag_streak=<N>` — tag was never detected; check antenna placement.
+
+Once you have identified the issue, set `debug: False` again — verbose logging increases the work per tick and can itself contribute to timing pressure.
 
 ---
 
