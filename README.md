@@ -525,7 +525,7 @@ The scan window expiry log now includes a summary of how many ticks ran and how 
 RFID: scan window expired for lane lane3 reader=mfrc522_1 ticks=42 no_tag_streak=42 — no tag found
 ```
 
-A high `ticks` value with `no_tag_streak == ticks` means the tag was never detected.  Reduce `scan_delay` or increase `scan_window` to give the tag more chances to be read.
+A high `ticks` value with `no_tag_streak == ticks` means the tag was never detected.  Check antenna placement and distance; increasing `scan_window` or `scan_backoff_after` gives more opportunities to read while keeping CPU load low.
 
 ### Wiring / SPI speed / antenna distance tips
 

@@ -1599,6 +1599,10 @@ class Rfid:
             # Stale-callback guard: if the generation has moved on (another
             # _start_scan_timer or _end_scan_session ran since this callback was
             # registered) bail out immediately without doing any SPI work.
+            # _start_scan_timer always calls _end_scan_session first, which bumps
+            # the generation to >= 1, so the captured `gen` is always >= 1.
+            # The sentinel -1 ensures that a callback whose lane entry was
+            # unexpectedly removed from _scan_gen also bails out safely.
             if gen != self._scan_gen.get(lane, -1):
                 return self.reactor.NEVER
 
@@ -1935,8 +1939,7 @@ class Rfid:
                 self._clear_scan_state(lane)
                 self._respond(
                     f"RFID: scan window expired for lane {lane}"
-                    f" reader={self.name} ticks={ticks} no_tag_streak={streak}"
-                    f" — no tag found"
+                    f" reader={self.name} ticks={ticks} no_tag_streak={streak} — no tag found"
                 )
                 return self.reactor.NEVER
 
