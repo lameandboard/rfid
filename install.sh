@@ -281,7 +281,7 @@ if src.startswith(header_first_line):
 header = (
     "# Derived from ArmoredTurtle/AFC-Klipper-Add-On, file: extras/AFC_lane.py\n"
     "# Original Copyright (C) 2024 Armored Turtle\n"
-    "# Modifications Copyright (C) 2026 ikwidtech\n"
+    "# Modifications Copyright (C) 2026 lameandboard\n"
     "#\n"
     "# This file may be distributed under the terms of the GNU GPLv3 license.\n"
     "\n"
@@ -416,7 +416,7 @@ section = f"""
 type: git_repo
 channel: dev
 path: {repo_path}
-origin: https://github.com/ikwidtech/RFID.git
+origin: https://github.com/lameandboard/rfid.git
 primary_branch: {branch}
 managed_services: klipper
 info_tags: desc=RFID for AFC / Klipper
@@ -604,7 +604,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "${FORCE}" -eq 1 ]]; then
-    repo_url="https://github.com/ikwidtech/rfid.git"
+    repo_url="https://github.com/lameandboard/rfid.git"
     parent_dir="$(dirname "${REPO_DIR}")"
     repo_name="$(basename "${REPO_DIR}")"
     branch="${BRANCH:-$(current_branch)}"
