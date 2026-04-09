@@ -1,0 +1,19 @@
+# Created by GitHub Assistant
+
+# Ignore Python cache files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Ignore specific files and directories
+extras/AFC_lane.py
+config/
+cache/
