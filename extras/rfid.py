@@ -360,6 +360,11 @@ class Rfid:
         self.scan_window = float(config.getfloat("scan_window", 10.0, minval=1.0))
         self.fast_mode = config.getboolean("rfid_fast_mode", True)
         self.candidate_ttl = float(config.getfloat("candidate_ttl", 0.5, minval=0.1))
+        # After this many consecutive no-tag ticks the scan loop switches to the
+        # slower backoff delay (0 = disabled; the normal scan_delay is always used).
+        self.scan_backoff_after = int(config.getint("scan_backoff_after", 5, minval=0))
+        # Polling interval used during the backoff phase (seconds).
+        self.scan_backoff_delay = float(config.getfloat("scan_backoff_delay", 0.5, minval=0.0))
         self.auto_create_spool = config.getboolean("auto_create_spool", False)
         self.auto_write = config.getboolean("auto_write", False)
         self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
@@ -410,6 +415,9 @@ class Rfid:
         self._scan_blocked_uids: dict[str, set] = {} # lane -> set of UIDs suppressed for current window
         self._scan_seen_uids: dict[str, set] = {}    # lane -> all uid_hex strings seen this window
         self._sync_scan_lanes: set = set()            # lanes currently polled by _run_scan_window_sync
+        self._scan_gen: dict[str, int] = {}           # lane -> generation counter (invalidates stale callbacks)
+        self._scan_no_tag_streak: dict[str, int] = {} # lane -> consecutive no-tag tick count
+        self._scan_tick_count: dict[str, int] = {}    # lane -> total ticks this window
 
         self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
 
@@ -1297,13 +1305,7 @@ class Rfid:
 
         def _on_created(event_time):
             # Stop the scan timer — the spool has been created and is ready to commit.
-            existing = self._scan_timers.pop(_lane, None)
-            if existing is not None:
-                self.reactor.unregister_timer(existing)
-            self._scan_deadlines.pop(_lane, None)
-            self._scan_candidates.pop(_lane, None)
-            self._scan_blocked_uids.pop(_lane, None)
-            self._scan_seen_uids.pop(_lane, None)
+            self._end_scan_session(_lane, reason="auto_create_spool_done")
             _UID_SPOOL_CACHE[_uid] = _sid
             _mark_uid_cache_dirty()
             self._pending[_lane] = {
@@ -1370,13 +1372,7 @@ class Rfid:
 
                 def _on_found(event_time):
                     # Stop the scan timer — we have our answer.
-                    existing = self._scan_timers.pop(_lane, None)
-                    if existing is not None:
-                        self.reactor.unregister_timer(existing)
-                    self._scan_deadlines.pop(_lane, None)
-                    self._scan_candidates.pop(_lane, None)
-                    self._scan_blocked_uids.pop(_lane, None)
-                    self._scan_seen_uids.pop(_lane, None)
+                    self._end_scan_session(_lane, reason="uid_resolved_in_spoolman")
                     _UID_SPOOL_CACHE[_uid] = _sid
                     _mark_uid_cache_dirty()
                     self._pending[_lane] = {
@@ -1474,25 +1470,71 @@ class Rfid:
             )
 
     # ---------- event handlers ----------
+    # ---------- scan session lifecycle helpers ----------
+
+    def _clear_scan_state(self, lane: str, reason: str = "") -> None:
+        """Clear all per-lane scan bookkeeping and bump the generation counter.
+
+        Called both from ``_end_scan_session`` (outside a timer callback) and
+        directly from inside ``_scan_timer_callback`` (where controlling the
+        timer lifecycle via the return value is the correct pattern — not via
+        ``unregister_timer``).
+
+        Bumping the generation invalidates any timer callback that captured
+        the previous generation, so late-firing callbacks become safe no-ops.
+        """
+        self._scan_deadlines.pop(lane, None)
+        self._scan_candidates.pop(lane, None)
+        self._scan_blocked_uids.pop(lane, None)
+        self._scan_seen_uids.pop(lane, None)
+        self._scan_no_tag_streak.pop(lane, None)
+        self._scan_tick_count.pop(lane, None)
+        self._scan_gen[lane] = self._scan_gen.get(lane, 0) + 1
+        if reason:
+            self._debug(
+                f"rfid[{self.name}]: scan state cleared lane={lane} reason={reason}"
+            )
+
+    def _end_scan_session(self, lane: str, reason: str = "") -> None:
+        """Cancel the active scan timer for *lane* and clear all per-lane scan state.
+
+        Safe to call from event handlers and async reactor callbacks.  Do NOT
+        call from inside ``_scan_timer_callback`` — the callback controls its
+        own timer lifetime by returning ``reactor.NEVER`` after calling
+        ``_clear_scan_state``.
+
+        ``unregister_timer`` stops the timer even if it has already been
+        scheduled to fire imminently; the generation bump ensures that any
+        callback that slips through before the unregister takes effect will
+        return ``reactor.NEVER`` immediately without doing any work.
+        """
+        existing = self._scan_timers.pop(lane, None)
+        if existing is not None:
+            self.reactor.unregister_timer(existing)
+        self._clear_scan_state(lane, reason)
+
+    # ---------- timer engine ----------
+
     def _start_scan_timer(self, lane: str) -> None:
         """Start a reactor timer that keeps scanning until a spoolman_id is found
         or scan_window seconds have elapsed.  Safe to call from an event handler
         because it only registers a timer — no reactor.pause() is used.
         """
-        # Cancel any existing timer for this lane before starting a new one.
-        existing = self._scan_timers.pop(lane, None)
-        if existing is not None:
-            self.reactor.unregister_timer(existing)
+        # End any in-progress session (cancels old timer, bumps gen, clears state).
+        self._end_scan_session(lane, reason="new_window")
         # Clear any pending spool assignment from a previous scan window.
         self._pending.pop(lane, None)
         self._scan_deadlines[lane] = self.reactor.monotonic() + self.scan_window
-        # Reset candidate state for a fresh scan window.
-        self._scan_candidates.pop(lane, None)
+        # Initialise fresh per-window state.
         self._scan_blocked_uids[lane] = set()
         self._scan_seen_uids[lane] = set()
+        self._scan_no_tag_streak[lane] = 0
+        self._scan_tick_count[lane] = 0
+        # Capture current generation so the timer callback can detect staleness.
+        gen = self._scan_gen.get(lane, 0)
 
         handle = self.reactor.register_timer(
-            lambda event_time, _lane=lane: self._scan_timer_callback(_lane, event_time),
+            lambda event_time, _lane=lane, _gen=gen: self._scan_timer_callback(_lane, event_time, _gen),
             self.reactor.monotonic() + _ASYNC_MIN_DELAY,
         )
         self._scan_timers[lane] = handle
@@ -1522,18 +1564,12 @@ class Rfid:
                     return self._pending.get(lane)
                 if self.reactor.monotonic() > deadline + 0.5:
                     # Safety margin exceeded — cancel the stale timer and give up.
-                    existing = self._scan_timers.pop(lane, None)
-                    if existing is not None:
-                        self.reactor.unregister_timer(existing)
-                    self._scan_deadlines.pop(lane, None)
-                    self._scan_candidates.pop(lane, None)
-                    self._scan_blocked_uids.pop(lane, None)
-                    self._scan_seen_uids.pop(lane, None)
+                    self._end_scan_session(lane, reason="sync_scan_safety_timeout")
                     return self._pending.get(lane)
         finally:
             self._sync_scan_lanes.discard(lane)
 
-    def _scan_timer_callback(self, lane: str, event_time: float) -> float:
+    def _scan_timer_callback(self, lane: str, event_time: float, gen: int = 0) -> float:
         """Reactor timer callback: attempt one scan and reschedule or stop.
 
         Must NOT call reactor.pause().  Returns next wake time or
@@ -1560,6 +1596,12 @@ class Rfid:
         re-committed within the same scan window.
         """
         try:
+            # Stale-callback guard: if the generation has moved on (another
+            # _start_scan_timer or _end_scan_session ran since this callback was
+            # registered) bail out immediately without doing any SPI work.
+            if gen != self._scan_gen.get(lane, -1):
+                return self.reactor.NEVER
+
             now = self.reactor.monotonic()
             remaining = self._scan_deadlines.get(lane, 0.0) - now
             self._debug_verbose(
@@ -1582,6 +1624,13 @@ class Rfid:
             # Track every uid_hex seen this scan window for cache-recovery at lane_loaded.
             if uid_hex is not None:
                 self._scan_seen_uids.setdefault(lane, set()).add(uid_hex)
+
+            # Track no-tag streak and total tick count for backoff and diagnostics.
+            self._scan_tick_count[lane] = self._scan_tick_count.get(lane, 0) + 1
+            if uid_hex is None:
+                self._scan_no_tag_streak[lane] = self._scan_no_tag_streak.get(lane, 0) + 1
+            else:
+                self._scan_no_tag_streak[lane] = 0
 
             # UID known but spoolman_id not yet resolved — dispatch a Spoolman lookup.
             # This covers two cases:
@@ -1612,11 +1661,7 @@ class Rfid:
                             _td = json.loads(tag_text) if tag_text else None
                             if isinstance(_td, dict) and _td.get("protocol") == "openspool":
                                 blocked_uids.add(uid_hex)
-                                self._scan_timers.pop(lane, None)
-                                self._scan_deadlines.pop(lane, None)
-                                self._scan_candidates.pop(lane, None)
-                                self._scan_blocked_uids.pop(lane, None)
-                                self._scan_seen_uids.pop(lane, None)
+                                self._clear_scan_state(lane, reason="openspool_early_commit")
                                 self._debug(
                                     f"rfid[{self.name}]: DBG good_find_early_commit"
                                     f" lane={lane} uid={uid_hex}"
@@ -1652,11 +1697,7 @@ class Rfid:
                         f"RFID: lane {lane} tag uid={uid_hex} read"
                         f" (no spoolman_id, auto_create_spool=False — scan complete)"
                     )
-                    self._scan_timers.pop(lane, None)
-                    self._scan_deadlines.pop(lane, None)
-                    self._scan_candidates.pop(lane, None)
-                    self._scan_blocked_uids.pop(lane, None)
-                    self._scan_seen_uids.pop(lane, None)
+                    self._clear_scan_state(lane, reason="no_spoolman_no_autocreate")
                     return self.reactor.NEVER
 
             if spoolman_id is not None:
@@ -1689,9 +1730,7 @@ class Rfid:
                         "timeout": self.event_timeout,
                     }
                     self._scan_timers.pop(lane, None)
-                    self._scan_deadlines.pop(lane, None)
-                    self._scan_blocked_uids.pop(lane, None)
-                    self._scan_seen_uids.pop(lane, None)
+                    self._clear_scan_state(lane, reason="fast_mode_commit")
                     self._debug(
                         f"rfid[{self.name}]: DBG single_read_commit lane={lane}"
                         f" uid={uid_hex} sid={spoolman_id}"
@@ -1764,10 +1803,7 @@ class Rfid:
                                 "timeout": self.event_timeout,
                             }
                             self._scan_timers.pop(lane, None)
-                            self._scan_deadlines.pop(lane, None)
-                            self._scan_candidates.pop(lane, None)
-                            self._scan_blocked_uids.pop(lane, None)
-                            self._scan_seen_uids.pop(lane, None)
+                            self._clear_scan_state(lane, reason="safe_mode_confirm")
                             self._debug(
                                 f"rfid[{self.name}]: DBG candidate_confirm lane={lane}"
                                 f" uid={uid_hex} sid={spoolman_id}"
@@ -1811,11 +1847,7 @@ class Rfid:
                         tag_data = json.loads(tag_text) if tag_text else None
                         if isinstance(tag_data, dict) and tag_data.get("protocol") == "openspool":
                             blocked_uids.add(uid_hex)
-                            self._scan_timers.pop(lane, None)
-                            self._scan_deadlines.pop(lane, None)
-                            self._scan_candidates.pop(lane, None)
-                            self._scan_blocked_uids.pop(lane, None)
-                            self._scan_seen_uids.pop(lane, None)
+                            self._clear_scan_state(lane, reason="auto_create_defer")
                             self._debug(
                                 f"rfid[{self.name}]: DBG auto_create_defer"
                                 f" lane={lane} uid={uid_hex}"
@@ -1861,10 +1893,7 @@ class Rfid:
                                     "timeout": self.event_timeout,
                                 }
                                 self._scan_timers.pop(lane, None)
-                                self._scan_deadlines.pop(lane, None)
-                                self._scan_candidates.pop(lane, None)
-                                self._scan_blocked_uids.pop(lane, None)
-                                self._scan_seen_uids.pop(lane, None)
+                                self._clear_scan_state(lane, reason="single_sighting_fallback")
                                 self._debug(
                                     f"rfid[{self.name}]: DBG single_sighting_fallback lane={lane}"
                                     f" uid={cand_uid} sid={cand_sid}"
@@ -1900,26 +1929,29 @@ class Rfid:
                             self._scan_candidates.pop(lane, None)
 
             if now >= self._scan_deadlines.get(lane, 0.0):
+                ticks = self._scan_tick_count.get(lane, 0)
+                streak = self._scan_no_tag_streak.get(lane, 0)
                 self._scan_timers.pop(lane, None)
-                self._scan_deadlines.pop(lane, None)
-                self._scan_candidates.pop(lane, None)
-                self._scan_blocked_uids.pop(lane, None)
-                self._scan_seen_uids.pop(lane, None)
+                self._clear_scan_state(lane)
                 self._respond(
-                    f"RFID: scan window expired for lane {lane}, no tag found"
+                    f"RFID: scan window expired for lane {lane}"
+                    f" reader={self.name} ticks={ticks} no_tag_streak={streak}"
+                    f" — no tag found"
                 )
                 return self.reactor.NEVER
 
-            return event_time + max(_ASYNC_MIN_DELAY, self.scan_delay)
+            streak = self._scan_no_tag_streak.get(lane, 0)
+            if self.scan_backoff_after > 0 and streak >= self.scan_backoff_after:
+                next_delay = max(_ASYNC_MIN_DELAY, self.scan_backoff_delay)
+            else:
+                next_delay = max(_ASYNC_MIN_DELAY, self.scan_delay)
+            return event_time + next_delay
         except Exception:
             self._log.exception(
                 "rfid[%s]: scan timer callback failed for lane %s", self.name, lane
             )
             self._scan_timers.pop(lane, None)
-            self._scan_deadlines.pop(lane, None)
-            self._scan_candidates.pop(lane, None)
-            self._scan_blocked_uids.pop(lane, None)
-            self._scan_seen_uids.pop(lane, None)
+            self._clear_scan_state(lane, reason="callback_exception")
             return self.reactor.NEVER
 
     def _handle_klippy_flush(self) -> None:
@@ -1979,13 +2011,13 @@ class Rfid:
                     )
 
     def _handle_lane_prep_start(self, lane_obj) -> None:
-        self._debug(
+        self._debug_verbose(
             "rfid[%s]: EVENT afc:lane_prep_start raw=%r name=%r"
             % (self.name, lane_obj, getattr(lane_obj, "name", None))
         )
         try:
             lane = self._lane_name_from_event(lane_obj)
-            self._debug(
+            self._debug_verbose(
                 "rfid[%s]: EVENT normalized prep_start lane=%s reader_lanes=%s"
                 % (self.name, lane, self.lanes)
             )
@@ -1997,7 +2029,7 @@ class Rfid:
                 % (self.name, getattr(reader, "name", None), lane)
             )
             if reader is not self:
-                self._debug(f"rfid[{self.name}]: EVENT prep_start not for this reader")
+                self._debug_verbose(f"rfid[{self.name}]: EVENT prep_start not for this reader")
                 return
             # Start the continuous scan timer so the reader keeps scanning
             # throughout the spool-spinning window instead of only once.
@@ -2006,13 +2038,13 @@ class Rfid:
             self._log.exception("rfid[%s]: EVENT prep_start handler failed", self.name)
 
     def _handle_lane_loaded(self, lane_obj) -> None:
-        self._debug(
+        self._debug_verbose(
             "rfid[%s]: EVENT afc:lane_loaded raw=%r name=%r"
             % (self.name, lane_obj, getattr(lane_obj, "name", None))
         )
         try:
             lane = self._lane_name_from_event(lane_obj)
-            self._debug(
+            self._debug_verbose(
                 "rfid[%s]: EVENT normalized lane_loaded lane=%s reader_lanes=%s"
                 % (self.name, lane, self.lanes)
             )
@@ -2024,16 +2056,12 @@ class Rfid:
                 % (self.name, getattr(reader, "name", None), lane)
             )
             if reader is not self:
-                self._debug(f"rfid[{self.name}]: EVENT lane_loaded not for this reader")
+                self._debug_verbose(f"rfid[{self.name}]: EVENT lane_loaded not for this reader")
                 return
-            # Cancel any in-progress scan timer for this lane — the spool has
-            # finished loading and we no longer need to keep scanning.
-            existing = self._scan_timers.pop(lane, None)
-            if existing is not None:
-                self.reactor.unregister_timer(existing)
-            self._scan_deadlines.pop(lane, None)
-            self._scan_candidates.pop(lane, None)
-            self._scan_blocked_uids.pop(lane, None)
+            # Save seen-UIDs before ending the session (cache recovery uses them below).
+            seen_uids_snapshot = self._scan_seen_uids.get(lane, set()).copy()
+            # Cancel the scan timer and clear all per-lane scan state.
+            self._end_scan_session(lane, reason="lane_loaded")
 
             # --- Pending-entry cache-fill: uid_hex present but spoolman_id=None ---
             pending = self._pending.get(lane)
@@ -2052,11 +2080,10 @@ class Rfid:
 
             # --- Cache recovery: UID seen during scan window but SID not resolved in time ---
             # If _pending has no entry (or has an entry with spoolman_id=None after the
-            # cache-fill above), check _scan_seen_uids against _UID_SPOOL_CACHE.
+            # cache-fill above), check seen_uids_snapshot against _UID_SPOOL_CACHE.
             if lane not in self._pending or self._pending[lane].get("spoolman_id") is None:
-                seen = self._scan_seen_uids.get(lane, set())
                 # Iterate in a deterministic order to avoid non-deterministic spool assignment
-                for uid_hex in sorted(seen):
+                for uid_hex in sorted(seen_uids_snapshot):
                     _entry = _UID_SPOOL_CACHE.get(uid_hex)
                     if _entry is None:
                         continue
@@ -2084,9 +2111,6 @@ class Rfid:
                         "timeout": self.event_timeout,
                     }
                     break
-
-            # Clean up seen-UIDs set — no longer needed after lane_loaded.
-            self._scan_seen_uids.pop(lane, None)
 
             if lane not in self._pending or self._pending[lane].get("spoolman_id") is None:
                 self._debug(f"rfid[{self.name}]: lane_loaded but no pending scan for {lane}, skipping commit")
