@@ -56,6 +56,8 @@ Config parameters (per [rfid <name>] section):
     NTAG213: 45 total pages (41 user pages) — use max_pages=41 to cover the full user area.
     NTAG215: 135 total pages (131 user pages) — the default max_pages=135 safely covers these.
     NTAG216: 231 total pages (227 user pages) — use max_pages>=227 (e.g. 231) to cover all user pages.
+- scan_backoff_after / scan_backoff_delay: REMOVED.  These options are silently ignored if still
+  present in a config file.  The scan loop always uses scan_delay regardless of no-tag streak.
 
 Spoolman UID extra-field integration:
 - If spoolman_url is configured (and extras/spoolman_client.py is importable), the RFID UID
@@ -365,12 +367,17 @@ class Rfid:
         self.scan_window = float(config.getfloat("scan_window", 10.0, minval=1.0))
         self.fast_mode = config.getboolean("rfid_fast_mode", True)
         self.candidate_ttl = float(config.getfloat("candidate_ttl", 0.5, minval=0.1))
-        # After this many consecutive no-tag ticks the scan loop switches to the
-        # slower backoff delay (0 = disabled; the normal scan_delay is always used).
-        self.scan_backoff_after = int(config.getint("scan_backoff_after", 3, minval=0))
-        # Polling interval used during the backoff phase (seconds).
-        self.scan_backoff_delay = float(config.getfloat("scan_backoff_delay", 1.0, minval=0.0))
-        self.auto_create_spool = config.getboolean("auto_create_spool", False)
+        # DEPRECATED: scan_backoff_after and scan_backoff_delay are removed.  They are
+        # consumed silently so existing configs do not error out, but they have no effect.
+        # The scan loop always uses scan_delay.  Remove these from your config file.
+        _dep_bk_after = config.getint("scan_backoff_after", 0, minval=0)
+        _dep_bk_delay = config.getfloat("scan_backoff_delay", 0.0, minval=0.0)
+        if _dep_bk_after or _dep_bk_delay:
+            logging.getLogger("rfid").warning(
+                "rfid[%s]: config options 'scan_backoff_after' and 'scan_backoff_delay' are"
+                " deprecated and have no effect — remove them from your config",
+                config.get_name(),
+            )
         self.auto_write = config.getboolean("auto_write", False)
         self.auto_commit_on_scan = config.getboolean("auto_commit_on_scan", False)
         self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
@@ -1689,24 +1696,25 @@ class Rfid:
                 self._scan_seen_uids.setdefault(lane, set()).add(uid_hex)
                 self._scan_last_uid[lane] = uid_hex  # most recently seen UID for deferred lookup
 
-            # Track no-tag streak and total tick count for backoff and diagnostics.
+            # Track no-tag streak and total tick count for diagnostics (used in expiry log).
             self._scan_tick_count[lane] = self._scan_tick_count.get(lane, 0) + 1
             if uid_hex is None:
                 self._scan_no_tag_streak[lane] = self._scan_no_tag_streak.get(lane, 0) + 1
             else:
                 self._scan_no_tag_streak[lane] = 0
 
-            # UID known but spoolman_id not yet resolved — dispatch a Spoolman lookup.
+            # UID known but spoolman_id not yet resolved.
             # This covers two cases:
             #   • Full NDEF read (raw_len > 0): tag text present, auto-create path may apply.
             #   • UID-only read (raw_len == 0): anticollision succeeded but NDEF memory was
             #     not returned (tag passed too quickly, partial read, etc.).  The auto-create
-            #     OpenSpool path is skipped in this case because there is no NDEF payload;
-            #     only the Spoolman rfid_uid_N server lookup runs.
-            # Dispatch async Spoolman UID lookup (Step 2/3) when Spoolman is configured,
-            # while the scan timer keeps running to look for other tags with spool_ids.
-            # blocked_uids must be initialised here (before the spoolman_id branch) so
-            # we can mark the uid as dispatched and prevent re-dispatching every tick.
+            #     OpenSpool path is skipped in this case because there is no NDEF payload.
+            # For AFC event-driven scans, the Spoolman UID lookup is deferred to
+            # _handle_lane_loaded to keep HTTP work out of the hot SPI polling loop.
+            # For GCode sync scans (_sync_scan_lanes), the lookup is dispatched immediately
+            # so the blocking caller gets a result before the scan window expires.
+            # blocked_uids is initialised here (before the spoolman_id branch) so
+            # we can mark the uid as seen and prevent re-processing it every tick.
             blocked_uids = self._scan_blocked_uids.setdefault(lane, set())
 
             if (
@@ -2022,11 +2030,7 @@ class Rfid:
                 )
                 return self.reactor.NEVER
 
-            streak = self._scan_no_tag_streak.get(lane, 0)
-            if self.scan_backoff_after > 0 and streak >= self.scan_backoff_after:
-                next_delay = max(_ASYNC_MIN_DELAY, self.scan_backoff_delay)
-            else:
-                next_delay = max(_ASYNC_MIN_DELAY, self.scan_delay)
+            next_delay = max(_ASYNC_MIN_DELAY, self.scan_delay)
             return event_time + next_delay
         except Exception:
             self._log.exception(
@@ -2605,6 +2609,10 @@ class Rfid:
     def _event_scan_commit(self, port: str) -> bool:
         """Commit a pending scan; dispatches AFC or HH GCode based on detected system."""
         port = self._normalize_port(port)
+        # Single-shot guard: prevent double-commit within the same scan session.
+        if self._lane_committed.get(port):
+            self._debug(f"rfid[{self.name}]: commit guard: {port} already committed this session")
+            return False
         pending = self._pending.get(port)
         if not pending:
             self._debug(f"rfid[{self.name}]: no pending scan to commit for {port}")
@@ -2623,6 +2631,7 @@ class Rfid:
             self._respond(f"RFID: pending scan missing spoolman_id for {port}")
             return False
 
+        self._lane_committed[port] = True
         self._respond(
             f"RFID: scan committed for {port}, spoolman_id={spoolman_id}"
         )
