@@ -424,7 +424,10 @@ class Rfid:
         self._scan_gen: dict[str, int] = {}           # lane -> generation counter (invalidates stale callbacks)
         self._scan_no_tag_streak: dict[str, int] = {} # lane -> consecutive no-tag tick count
         self._scan_tick_count: dict[str, int] = {}    # lane -> total ticks this window
+        self._scan_last_uid: dict[str, Optional[str]] = {} # lane -> most recently seen uid_hex this window
         self._commit_in_progress: dict[str, bool] = {} # lane -> True once a commit has been decided
+        self._uid_lookup_in_flight: dict[str, bool] = {} # lane -> True while a deferred Spoolman fallback lookup is running
+        self._lane_committed: dict[str, bool] = {}   # lane -> True after _event_scan_commit has succeeded once this session
 
         self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
 
@@ -1519,6 +1522,7 @@ class Rfid:
         self._scan_candidates.pop(lane, None)
         self._scan_blocked_uids.pop(lane, None)
         self._scan_seen_uids.pop(lane, None)
+        self._scan_last_uid.pop(lane, None)
         self._scan_no_tag_streak.pop(lane, None)
         self._scan_tick_count.pop(lane, None)
         self._scan_gen[lane] = self._scan_gen.get(lane, 0) + 1
@@ -1557,10 +1561,13 @@ class Rfid:
         # Clear any pending spool assignment and commit-freeze from a previous scan window.
         self._pending.pop(lane, None)
         self._commit_in_progress.pop(lane, None)
+        self._lane_committed.pop(lane, None)
+        self._uid_lookup_in_flight.pop(lane, None)
         self._scan_deadlines[lane] = self.reactor.monotonic() + self.scan_window
         # Initialise fresh per-window state.
         self._scan_blocked_uids[lane] = set()
         self._scan_seen_uids[lane] = set()
+        self._scan_last_uid[lane] = None
         self._scan_no_tag_streak[lane] = 0
         self._scan_tick_count[lane] = 0
         # Capture current generation so the timer callback can detect staleness.
@@ -1680,6 +1687,7 @@ class Rfid:
             # Track every uid_hex seen this scan window for cache-recovery at lane_loaded.
             if uid_hex is not None:
                 self._scan_seen_uids.setdefault(lane, set()).add(uid_hex)
+                self._scan_last_uid[lane] = uid_hex  # most recently seen UID for deferred lookup
 
             # Track no-tag streak and total tick count for backoff and diagnostics.
             self._scan_tick_count[lane] = self._scan_tick_count.get(lane, 0) + 1
@@ -1740,13 +1748,26 @@ class Rfid:
                                 return self.reactor.NEVER
                         except (json.JSONDecodeError, ValueError):
                             pass
-                    # No early-commit: fire off background UID lookup and keep scanning.
-                    self._debug(
-                        f"rfid[{self.name}]: DBG uid_resolution_dispatch lane={lane} uid={uid_hex}"
-                    )
-                    blocked_uids.add(uid_hex)  # prevent re-dispatch this window
-                    self._dispatch_uid_resolution(lane, uid_hex, tag_text)
-                    # Fall through — scan timer continues looking for other spool_id tags.
+                    # No early-commit: fire off background UID lookup for sync scans; for
+                    # AFC event-driven scans defer the Spoolman lookup to _handle_lane_loaded
+                    # so it never runs inside the hot scan-timer / SPI loop.
+                    if lane in self._sync_scan_lanes:
+                        self._debug(
+                            f"rfid[{self.name}]: DBG uid_resolution_dispatch lane={lane} uid={uid_hex}"
+                        )
+                        blocked_uids.add(uid_hex)  # prevent re-dispatch this window
+                        self._dispatch_uid_resolution(lane, uid_hex, tag_text)
+                        # Fall through — scan timer continues looking for other spool_id tags.
+                    else:
+                        # AFC event path: record UID as seen but do NOT query Spoolman here.
+                        # The fallback Spoolman UID→SID lookup will run exactly once in
+                        # _handle_lane_loaded, after the scan window ends, avoiding HTTP
+                        # work during the tight SPI polling loop.
+                        self._debug(
+                            f"rfid[{self.name}]: DBG uid_seen_deferred lane={lane} uid={uid_hex}"
+                            f" (Spoolman lookup deferred to lane_loaded)"
+                        )
+                        blocked_uids.add(uid_hex)  # don't re-process this UID this window
                 elif not self.auto_create_spool:
                     # No Spoolman and no auto-create: nothing more to do.
                     self._respond(
@@ -2174,6 +2195,101 @@ class Rfid:
                     break
 
             if lane not in self._pending or self._pending[lane].get("spoolman_id") is None:
+                # --- Spoolman fallback: UID known but no spoolman_id from tag text or cache ---
+                # Run at most one Spoolman UID→SID lookup per lane per session, and only
+                # after lane_loaded (never during the hot scan-timer / SPI polling loop).
+                best_uid = self._scan_last_uid.get(lane)
+                if best_uid is None and seen_uids_snapshot:
+                    best_uid = min(seen_uids_snapshot)  # deterministic fallback
+                if (
+                    self._spoolman is not None
+                    and self._spoolman_executor is not None
+                    and best_uid is not None
+                    and not self._uid_lookup_in_flight.get(lane)
+                ):
+                    self._uid_lookup_in_flight[lane] = True
+                    _lane = lane
+                    _uid = best_uid
+                    _timeout = self.event_timeout
+                    self._debug(
+                        f"rfid[{self.name}]: lane_loaded: dispatching Spoolman fallback"
+                        f" lookup uid={_uid} lane={_lane}"
+                    )
+
+                    def _fallback_work():
+                        sid: Optional[int] = None
+                        try:
+                            sid = self._spoolman_find_spool_by_uid(_uid)
+                        except Exception as exc:
+                            self._log.warning(
+                                "rfid[%s]: Spoolman fallback lookup (attempt 1) uid=%s failed: %s",
+                                self.name, _uid, exc,
+                            )
+                        if sid is None:
+                            # One retry after a short delay before giving up.
+                            self._log.info(
+                                "rfid[%s]: Spoolman fallback lookup uid=%s: attempt 1 found nothing,"
+                                " retrying in 3s...",
+                                self.name, _uid,
+                            )
+                            time.sleep(3.0)
+                            try:
+                                sid = self._spoolman_find_spool_by_uid(_uid)
+                            except Exception as exc:
+                                self._log.warning(
+                                    "rfid[%s]: Spoolman fallback lookup (attempt 2) uid=%s failed: %s",
+                                    self.name, _uid, exc,
+                                )
+
+                        def _on_spoolman_result(event_time):
+                            self._uid_lookup_in_flight.pop(_lane, None)
+                            if self._commit_in_progress.get(_lane) or self._lane_committed.get(_lane):
+                                self._debug(
+                                    f"rfid[{self.name}]: fallback lookup: commit already"
+                                    f" in progress/done for {_lane}, discarding result"
+                                )
+                                return
+                            if sid is not None:
+                                _UID_SPOOL_CACHE[_uid] = sid
+                                _mark_uid_cache_dirty()
+                                self._pending[_lane] = {
+                                    "lane": _lane,
+                                    "spoolman_id": sid,
+                                    "uid_hex": _uid,
+                                    "raw_bytes": None,
+                                    "tag_text": None,
+                                    "filament_info": None,
+                                    "ts": time.time(),
+                                    "timeout": _timeout,
+                                }
+                                self._log.info(
+                                    "rfid[%s]: Spoolman fallback: found spool %s for uid=%s on lane %s",
+                                    self.name, sid, _uid, _lane,
+                                )
+                                self._respond(
+                                    f"RFID: tag uid={_uid} matched spool {sid} in Spoolman"
+                                    f" (deferred) on lane {_lane}"
+                                )
+                                _flush_uid_cache_if_dirty()
+                                self._commit_in_progress[_lane] = True
+                                self.gcode.run_script_from_command(
+                                    f"RFID_SCAN_COMMIT LANE={_lane}"
+                                )
+                            else:
+                                self._log.warning(
+                                    "rfid[%s]: Spoolman fallback lookup for uid=%s failed after"
+                                    " retry — aborting commit for lane %s",
+                                    self.name, _uid, _lane,
+                                )
+                                self._respond(
+                                    f"RFID: Spoolman lookup failed for uid={_uid} on lane {_lane}"
+                                    f" — commit aborted"
+                                )
+
+                        self.reactor.register_async_callback(_on_spoolman_result)
+
+                    self._spoolman_run_async(_fallback_work)
+                    return  # commit (or abort) will happen asynchronously from _on_spoolman_result
                 self._debug(f"rfid[{self.name}]: lane_loaded but no pending scan for {lane}, skipping commit")
                 return
             # Flush any new UID→spoolman_id mappings learned during this scan window.
