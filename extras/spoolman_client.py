@@ -630,10 +630,18 @@ class SpoolmanClient:
         return self._req("POST", "/api/v1/vendor", {"name": name})
 
     def find_or_create_vendor(self, name):
-        """Return the vendor_id for *name*, creating the vendor if it does not exist."""
+        """Return the vendor_id for *name*, creating the vendor if it does not exist.
+
+        Raises ``ValueError`` when both the lookup and the create call return an
+        unexpected response (e.g. Spoolman returns an empty body).
+        """
         vendor = self.find_vendor(name)
         if vendor is None:
             vendor = self.create_vendor(name)
+        if not isinstance(vendor, dict) or vendor.get("id") is None:
+            raise ValueError(
+                f"Spoolman vendor find/create for {name!r} returned unexpected response: {vendor!r}"
+            )
         return int(vendor["id"])
 
     # --- Filament helpers ---
@@ -670,10 +678,18 @@ class SpoolmanClient:
 
     def find_or_create_filament(self, name, vendor_id, material,
                                 density=None, color_hex=None):
-        """Return the filament_id for *name*+*vendor_id*, creating it if necessary."""
+        """Return the filament_id for *name*+*vendor_id*, creating it if necessary.
+
+        Raises ``ValueError`` when both the lookup and the create call return an
+        unexpected response (e.g. Spoolman returns an empty body).
+        """
         fil = self.find_filament(name, vendor_id)
         if fil is None:
             fil = self.create_filament(name, vendor_id, material, density, color_hex)
+        if not isinstance(fil, dict) or fil.get("id") is None:
+            raise ValueError(
+                f"Spoolman filament find/create for {name!r} returned unexpected response: {fil!r}"
+            )
         return int(fil["id"])
 
     # --- Spool helpers ---
@@ -917,6 +933,12 @@ class SpoolmanClient:
                 filament_body["settings_bed_temp"] = int(bed_temp)
             try:
                 created = self._req("POST", "/api/v1/filament", filament_body)
+                if not isinstance(created, dict) or created.get("id") is None:
+                    LOG.warning(
+                        "auto_create_spool: filament create returned unexpected response (id missing): %r",
+                        created,
+                    )
+                    return None
                 filament_id = int(created["id"])
                 LOG.debug(
                     "auto_create_spool: created filament id=%s name=%r density=%s",
@@ -939,6 +961,12 @@ class SpoolmanClient:
                 remaining_weight=float(weight_g),
                 spool_weight=spool_weight_g,
             )
+            if not isinstance(created_spool, dict) or created_spool.get("id") is None:
+                LOG.warning(
+                    "auto_create_spool: spool create returned unexpected response (id missing): %r",
+                    created_spool,
+                )
+                return None
             new_spool_id = int(created_spool["id"])
             LOG.debug("auto_create_spool: created spool id=%s", new_spool_id)
             return new_spool_id
