@@ -188,6 +188,7 @@ max_pages: 135
 | `scan_backoff_delay:` | `0.5` | Slower polling interval (seconds) used once `scan_backoff_after` is reached |
 | `max_pages:` | `135` | Number of NTAG/Ultralight pages to read from page 4 onward (range(4, 4+max_pages)); reads stop early once a spool_id is found |
 | `event_timeout:` | `60.0` | Seconds before a pending scan result expires |
+| `auto_commit_on_scan:` | `False` | When `True`, automatically run `RFID_SCAN_COMMIT` immediately after the scan timer stores a valid `spoolman_id`. Useful when scanning outside an AFC load cycle (i.e. `afc:lane_loaded` may not fire). Has no effect on the synchronous `RFID_SCAN_BEGIN` / `RFID_SCAN` GCode path, which handles its own commit. |
 | `auto_create_spool:` | `False` | Automatically create a Spoolman spool when a tag has filament metadata but no spool ID |
 | `auto_write:` | `False` | Write the resolved `spool_id` back to the RFID tag after a successful Spoolman UID lookup or auto-create. Best-effort only — silently skipped if the tag has moved. |
 | `spoolman_url:` | `""` | Base URL of the Spoolman API (e.g. `http://localhost:7912`). If not set, auto-detected from Moonraker's `[spoolman]` config. Required for `auto_create_spool` and `RFID_CHECK_TAG CREATE=1`. |

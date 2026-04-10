@@ -41,6 +41,11 @@ Config parameters (per [rfid <name>] section):
   the moment the tag is no longer detected — useful for fast-moving spools even in safe mode)
 - candidate_ttl: (fast_mode=False only) how long (seconds) a scan candidate survives without
   re-sighting before it ages out (default 0.5, min 0.1)
+- auto_commit_on_scan: when True, automatically run RFID_SCAN_COMMIT immediately after a valid
+  spoolman_id is stored in _pending by the scan timer engine (default False).  Useful when scans
+  happen outside an AFC load cycle and afc:lane_loaded may not fire.  Has no effect on
+  synchronous GCode scan paths (_run_scan_window_sync / RFID_SCAN_BEGIN), which handle their
+  own commit flow.
 - max_uids: maximum number of RFID tags (UIDs) that can be associated with a single
   spool in Spoolman.  Each UID is stored in a separate extra field (rfid_uid_1 …
   rfid_uid_N).  Default 8, min 2.
@@ -367,6 +372,7 @@ class Rfid:
         self.scan_backoff_delay = float(config.getfloat("scan_backoff_delay", 0.5, minval=0.0))
         self.auto_create_spool = config.getboolean("auto_create_spool", False)
         self.auto_write = config.getboolean("auto_write", False)
+        self.auto_commit_on_scan = config.getboolean("auto_commit_on_scan", False)
         self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
         self._spoolman_api_key = config.get("spoolman_api_key", None)
         self._spoolman_timeout = config.getfloat("spoolman_timeout", 5.0, minval=1.0)
@@ -1547,6 +1553,25 @@ class Rfid:
             f" window={self.scan_window:.1f}s"
         )
 
+    def _maybe_schedule_auto_commit(self, lane: str, spoolman_id) -> None:
+        """Schedule an async RFID_SCAN_COMMIT for *lane* when auto_commit_on_scan is enabled.
+
+        Only schedules when the lane is NOT in _sync_scan_lanes (i.e. not a
+        synchronous GCode scan via RFID_SCAN_BEGIN / _run_scan_window_sync,
+        which handles its own commit flow).
+        """
+        if not self.auto_commit_on_scan or lane in self._sync_scan_lanes:
+            return
+        self._log.info(
+            "rfid[%s]: auto_commit_on_scan: scheduling RFID_SCAN_COMMIT for lane=%s sid=%s",
+            self.name, lane, spoolman_id,
+        )
+        self.reactor.register_async_callback(
+            lambda e, ln=lane: self.gcode.run_script_from_command(
+                f"RFID_SCAN_COMMIT LANE={ln}"
+            )
+        )
+
     def _run_scan_window_sync(self, lane: str) -> Optional[dict]:
         """Start the timer-based scan engine and block (via reactor.pause) until a
         result is stored in self._pending[lane] or the scan window expires.
@@ -1746,6 +1771,7 @@ class Rfid:
                     self._respond(
                         f"RFID: tag found on lane {lane}, spoolman_id={spoolman_id}"
                     )
+                    self._maybe_schedule_auto_commit(lane, spoolman_id)
                     # Step 4: async ensure the UID is recorded in the spool's extra fields.
                     if uid_hex is not None and self._spoolman is not None and self._spoolman_executor is not None:
                         _eu, _es = uid_hex, int(spoolman_id)
@@ -1819,6 +1845,7 @@ class Rfid:
                             self._respond(
                                 f"RFID: tag found on lane {lane}, spoolman_id={spoolman_id}"
                             )
+                            self._maybe_schedule_auto_commit(lane, spoolman_id)
                             # Step 4: async ensure the UID is recorded in the spool's extra fields.
                             if uid_hex is not None and self._spoolman is not None and self._spoolman_executor is not None:
                                 _eu, _es = uid_hex, int(spoolman_id)
@@ -1909,6 +1936,7 @@ class Rfid:
                                 self._respond(
                                     f"RFID: tag found on lane {lane}, spoolman_id={cand_sid}"
                                 )
+                                self._maybe_schedule_auto_commit(lane, cand_sid)
                                 # Step 4: async ensure the UID is recorded in the spool's extra fields.
                                 if cand_uid is not None and self._spoolman is not None and self._spoolman_executor is not None:
                                     _eu, _es = cand_uid, int(cand_sid)
