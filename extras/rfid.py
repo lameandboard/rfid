@@ -170,6 +170,11 @@ _ASYNC_MIN_DELAY = 0.010  # 10 ms
 # How long to wait before retrying a failed Spoolman fallback lookup in _handle_lane_loaded.
 _SPOOLMAN_RETRY_DELAY_S = 3.0
 
+# How long (seconds) a deferred UID saved at scan-window expiry remains valid for use
+# by a subsequent lane_loaded event.  Prevents stale UIDs from being applied to a later
+# load cycle that happens to use the same lane.
+_DEFERRED_UID_TTL_S = 120.0
+
 # UID → spoolman_id cache: populated on every successful full read so that
 # a subsequent pass that only yields a UID (no NDEF payload) can still
 # resolve the spool ID.  Shared across all Rfid instances in this process.
@@ -439,6 +444,10 @@ class Rfid:
         self._commit_in_progress: dict[str, bool] = {} # lane -> True once a commit has been decided
         self._uid_lookup_in_flight: dict[str, bool] = {} # lane -> True while a deferred Spoolman fallback lookup is running
         self._lane_committed: dict[str, bool] = {}   # lane -> True after _event_scan_commit has succeeded once this session
+        # Survives _clear_scan_state so lane_loaded can still find a deferred UID even
+        # when the scan window timer expired before the lane_loaded event arrived.
+        # Format: lane -> {"last_uid": str|None, "seen_uids": set, "ts": float}
+        self._deferred_uid: dict[str, dict] = {}
 
         self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
 
@@ -1574,6 +1583,9 @@ class Rfid:
         self._commit_in_progress.pop(lane, None)
         self._lane_committed.pop(lane, None)
         self._uid_lookup_in_flight.pop(lane, None)
+        # Discard any deferred UID from a previous scan window so it is never
+        # applied to the newly-starting window's lane_loaded event.
+        self._deferred_uid.pop(lane, None)
         self._scan_deadlines[lane] = self.reactor.monotonic() + self.scan_window
         # Initialise fresh per-window state.
         self._scan_blocked_uids[lane] = set()
@@ -2026,6 +2038,23 @@ class Rfid:
             if now >= self._scan_deadlines.get(lane, 0.0):
                 ticks = self._scan_tick_count.get(lane, 0)
                 streak = self._scan_no_tag_streak.get(lane, 0)
+                # Before wiping scan state, persist any seen UIDs so that lane_loaded
+                # can still trigger the deferred Spoolman lookup even when the scan
+                # window has already expired (the common race condition).
+                if not self._pending.get(lane, {}).get("spoolman_id"):
+                    _last = self._scan_last_uid.get(lane)
+                    _seen = self._scan_seen_uids.get(lane, set())
+                    if _last is not None or _seen:
+                        self._deferred_uid[lane] = {
+                            "last_uid": _last,
+                            "seen_uids": set(_seen),
+                            "ts": time.time(),
+                        }
+                        self._debug(
+                            f"rfid[{self.name}]: deferred_uid_saved lane={lane}"
+                            f" uid={_last} seen={sorted(_seen)!r}"
+                            f" (scan window expired; awaiting lane_loaded)"
+                        )
                 self._scan_timers.pop(lane, None)
                 self._clear_scan_state(lane)
                 self._respond(
@@ -2154,6 +2183,28 @@ class Rfid:
             last_uid_snapshot = self._scan_last_uid.get(lane)
             # Cancel the scan timer and clear all per-lane scan state.
             self._end_scan_session(lane, reason="lane_loaded")
+
+            # --- Deferred-UID fallback: scan timer may have already expired and
+            # called _clear_scan_state before lane_loaded arrived, leaving empty
+            # snapshots.  _deferred_uid is saved at window-expiry and survives
+            # _clear_scan_state so we can still recover the UID here.
+            _deferred = self._deferred_uid.pop(lane, None)
+            if not seen_uids_snapshot and last_uid_snapshot is None and _deferred is not None:
+                _age = time.time() - _deferred["ts"]
+                if _age <= _DEFERRED_UID_TTL_S:
+                    seen_uids_snapshot = _deferred["seen_uids"]
+                    last_uid_snapshot = _deferred["last_uid"]
+                    self._debug(
+                        f"rfid[{self.name}]: deferred_uid_recovered lane={lane}"
+                        f" uid={last_uid_snapshot} seen={sorted(seen_uids_snapshot)!r}"
+                        f" age={_age:.1f}s (scan window had expired before lane_loaded)"
+                    )
+                else:
+                    self._log.info(
+                        "rfid[%s]: deferred_uid for lane=%s expired"
+                        " (age=%.1fs > ttl=%.1fs), ignoring",
+                        self.name, lane, _age, _DEFERRED_UID_TTL_S,
+                    )
 
             # --- Pending-entry cache-fill: uid_hex present but spoolman_id=None ---
             pending = self._pending.get(lane)

@@ -462,6 +462,12 @@ The installer patches `AFC_lane.py` to fire two Klipper events:
 
 This means RFID scanning and spool assignment are fully automatic during normal AFC load operations, with no manual G-code commands required.
 
+### Deferred Spoolman Lookup
+
+When a tag UID is detected during the scan window but a Spoolman spool ID cannot be resolved from the tag's NDEF payload (e.g., the tag only carries a UID with no embedded spool ID), the Spoolman UID → spool ID lookup is deferred until `afc:lane_loaded` fires. This avoids HTTP calls inside the tight SPI polling loop.
+
+If the scan window timer expires (no more tag detections) **before** `afc:lane_loaded` arrives, the UID is preserved in an internal `_deferred_uid` buffer with a timestamp. When `lane_loaded` subsequently fires, the module recovers the buffered UID and performs the Spoolman fallback lookup at that point. The deferred UID is only used if it is no more than 120 seconds old (configurable via `_DEFERRED_UID_TTL_S`), preventing stale UIDs from being applied to a later load cycle on the same lane.
+
 ### GCode-Initiated Scans Use the Same Engine
 
 `RFID_SCAN`, `RFID_SCAN_BEGIN`, and `RFID_SCAN_COMMIT` all use the same timer-based scan engine as the event-driven path. This means they benefit from the same fast-mode / safe-mode two-read confirmation, candidate TTL aging, and `scan_window` deadline. The deprecated `TRIES` and `DELAY` parameters have been removed — use `TIMEOUT` (overrides `scan_window` for one call) and the config-level `scan_delay` instead.
