@@ -41,6 +41,11 @@ Config parameters (per [rfid <name>] section):
   the moment the tag is no longer detected — useful for fast-moving spools even in safe mode)
 - candidate_ttl: (fast_mode=False only) how long (seconds) a scan candidate survives without
   re-sighting before it ages out (default 0.5, min 0.1)
+- auto_commit_on_scan: when True, automatically run RFID_SCAN_COMMIT immediately after a valid
+  spoolman_id is stored in _pending by the scan timer engine (default False).  Useful when scans
+  happen outside an AFC load cycle and afc:lane_loaded may not fire.  Has no effect on
+  synchronous GCode scan paths (_run_scan_window_sync / RFID_SCAN_BEGIN), which handle their
+  own commit flow.
 - max_uids: maximum number of RFID tags (UIDs) that can be associated with a single
   spool in Spoolman.  Each UID is stored in a separate extra field (rfid_uid_1 …
   rfid_uid_N).  Default 8, min 2.
@@ -362,11 +367,12 @@ class Rfid:
         self.candidate_ttl = float(config.getfloat("candidate_ttl", 0.5, minval=0.1))
         # After this many consecutive no-tag ticks the scan loop switches to the
         # slower backoff delay (0 = disabled; the normal scan_delay is always used).
-        self.scan_backoff_after = int(config.getint("scan_backoff_after", 5, minval=0))
+        self.scan_backoff_after = int(config.getint("scan_backoff_after", 3, minval=0))
         # Polling interval used during the backoff phase (seconds).
-        self.scan_backoff_delay = float(config.getfloat("scan_backoff_delay", 0.5, minval=0.0))
+        self.scan_backoff_delay = float(config.getfloat("scan_backoff_delay", 1.0, minval=0.0))
         self.auto_create_spool = config.getboolean("auto_create_spool", False)
         self.auto_write = config.getboolean("auto_write", False)
+        self.auto_commit_on_scan = config.getboolean("auto_commit_on_scan", False)
         self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
         self._spoolman_api_key = config.get("spoolman_api_key", None)
         self._spoolman_timeout = config.getfloat("spoolman_timeout", 5.0, minval=1.0)
@@ -418,6 +424,7 @@ class Rfid:
         self._scan_gen: dict[str, int] = {}           # lane -> generation counter (invalidates stale callbacks)
         self._scan_no_tag_streak: dict[str, int] = {} # lane -> consecutive no-tag tick count
         self._scan_tick_count: dict[str, int] = {}    # lane -> total ticks this window
+        self._commit_in_progress: dict[str, bool] = {} # lane -> True once a commit has been decided
 
         self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
 
@@ -917,6 +924,24 @@ class Rfid:
             f"rfid[{self.name}]: DBG _scan_once enter lane={lane} max_pages={max_pages}"
         )
 
+        # Commit-freeze guard: if a commit has already been decided for this lane,
+        # do not touch the reader at all.  The scan timer will return NEVER on its
+        # next tick; this guard prevents any racing _scan_once calls (e.g. from the
+        # auto_write path) from issuing further SPI I/O on an already-frozen lane.
+        if self._commit_in_progress.get(lane, False):
+            self._debug_verbose(
+                f"rfid[{self.name}]: DBG _scan_once skipped lane={lane} reason=commit_in_progress"
+            )
+            return {
+                "lane": lane,
+                "uid_hex": None,
+                "tag_text": None,
+                "raw_len": 0,
+                "raw_bytes": b"",
+                "spoolman_id": None,
+                "ts": time.time(),
+            }
+
         # Try multi-tag enumeration path first so adjacent tags can be skipped.
         if hasattr(self.reader, "read_all_tags"):
             self._debug_verbose(f"rfid[{self.name}]: DBG _scan_once path=read_all_tags")
@@ -1308,6 +1333,8 @@ class Rfid:
         _timeout = self.event_timeout
 
         def _on_created(event_time):
+            # Freeze the lane immediately so no further reader I/O can overlap.
+            self._commit_in_progress[_lane] = True
             # Stop the scan timer — the spool has been created and is ready to commit.
             self._end_scan_session(_lane, reason="auto_create_spool_done")
             _UID_SPOOL_CACHE[_uid] = _sid
@@ -1375,6 +1402,8 @@ class Rfid:
                 _sid = found_sid
 
                 def _on_found(event_time):
+                    # Freeze the lane immediately so no further reader I/O can overlap.
+                    self._commit_in_progress[_lane] = True
                     # Stop the scan timer — we have our answer.
                     self._end_scan_session(_lane, reason="uid_resolved_in_spoolman")
                     _UID_SPOOL_CACHE[_uid] = _sid
@@ -1407,7 +1436,6 @@ class Rfid:
 
                 self.reactor.register_async_callback(_on_found)
                 return
-
             # 3. Not found in Spoolman — try auto-create if enabled and tag is OpenSpool.
             if self.auto_create_spool and _text:
                 try:
@@ -1526,8 +1554,9 @@ class Rfid:
         """
         # End any in-progress session (cancels old timer, bumps gen, clears state).
         self._end_scan_session(lane, reason="new_window")
-        # Clear any pending spool assignment from a previous scan window.
+        # Clear any pending spool assignment and commit-freeze from a previous scan window.
         self._pending.pop(lane, None)
+        self._commit_in_progress.pop(lane, None)
         self._scan_deadlines[lane] = self.reactor.monotonic() + self.scan_window
         # Initialise fresh per-window state.
         self._scan_blocked_uids[lane] = set()
@@ -1545,6 +1574,25 @@ class Rfid:
         self._respond(
             f"rfid[{self.name}]: scan timer started for lane {lane}"
             f" window={self.scan_window:.1f}s"
+        )
+
+    def _maybe_schedule_auto_commit(self, lane: str, spoolman_id: int) -> None:
+        """Schedule an async RFID_SCAN_COMMIT for *lane* when auto_commit_on_scan is enabled.
+
+        Only schedules when the lane is NOT in _sync_scan_lanes (i.e. not a
+        synchronous GCode scan via RFID_SCAN_BEGIN / _run_scan_window_sync,
+        which handles its own commit flow).
+        """
+        if not self.auto_commit_on_scan or lane in self._sync_scan_lanes:
+            return
+        self._log.info(
+            "rfid[%s]: auto_commit_on_scan: scheduling RFID_SCAN_COMMIT for lane=%s sid=%s",
+            self.name, lane, spoolman_id,
+        )
+        self.reactor.register_async_callback(
+            lambda e, ln=lane: self.gcode.run_script_from_command(
+                f"RFID_SCAN_COMMIT LANE={ln}"
+            )
         )
 
     def _run_scan_window_sync(self, lane: str) -> Optional[dict]:
@@ -1737,6 +1785,7 @@ class Rfid:
                         "ts": time.time(),
                         "timeout": self.event_timeout,
                     }
+                    self._commit_in_progress[lane] = True
                     self._scan_timers.pop(lane, None)
                     self._clear_scan_state(lane, reason="fast_mode_commit")
                     self._debug(
@@ -1746,6 +1795,7 @@ class Rfid:
                     self._respond(
                         f"RFID: tag found on lane {lane}, spoolman_id={spoolman_id}"
                     )
+                    self._maybe_schedule_auto_commit(lane, int(spoolman_id))
                     # Step 4: async ensure the UID is recorded in the spool's extra fields.
                     if uid_hex is not None and self._spoolman is not None and self._spoolman_executor is not None:
                         _eu, _es = uid_hex, int(spoolman_id)
@@ -1810,6 +1860,7 @@ class Rfid:
                                 "ts": time.time(),
                                 "timeout": self.event_timeout,
                             }
+                            self._commit_in_progress[lane] = True
                             self._scan_timers.pop(lane, None)
                             self._clear_scan_state(lane, reason="safe_mode_confirm")
                             self._debug(
@@ -1819,6 +1870,7 @@ class Rfid:
                             self._respond(
                                 f"RFID: tag found on lane {lane}, spoolman_id={spoolman_id}"
                             )
+                            self._maybe_schedule_auto_commit(lane, int(spoolman_id))
                             # Step 4: async ensure the UID is recorded in the spool's extra fields.
                             if uid_hex is not None and self._spoolman is not None and self._spoolman_executor is not None:
                                 _eu, _es = uid_hex, int(spoolman_id)
@@ -1900,6 +1952,7 @@ class Rfid:
                                     "ts": time.time(),
                                     "timeout": self.event_timeout,
                                 }
+                                self._commit_in_progress[lane] = True
                                 self._scan_timers.pop(lane, None)
                                 self._clear_scan_state(lane, reason="single_sighting_fallback")
                                 self._debug(
@@ -1909,6 +1962,7 @@ class Rfid:
                                 self._respond(
                                     f"RFID: tag found on lane {lane}, spoolman_id={cand_sid}"
                                 )
+                                self._maybe_schedule_auto_commit(lane, int(cand_sid))
                                 # Step 4: async ensure the UID is recorded in the spool's extra fields.
                                 if cand_uid is not None and self._spoolman is not None and self._spoolman_executor is not None:
                                     _eu, _es = cand_uid, int(cand_sid)

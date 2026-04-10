@@ -184,10 +184,11 @@ max_pages: 135
 | `spi_speed:` | `100000` | SPI speed passed to the reader driver |
 | `scan_delay:` | `0.20` | Polling interval in seconds between tag read attempts during the scan window |
 | `scan_window:` | `10.0` | Seconds the timer-based scan engine keeps trying before giving up (used for both event-driven and GCode-initiated scans) |
-| `scan_backoff_after:` | `5` | After this many consecutive no-tag ticks the polling interval switches to `scan_backoff_delay` (0 = disabled) |
-| `scan_backoff_delay:` | `0.5` | Slower polling interval (seconds) used once `scan_backoff_after` is reached |
+| `scan_backoff_after:` | `3` | After this many consecutive no-tag ticks the polling interval switches to `scan_backoff_delay` (0 = disabled) |
+| `scan_backoff_delay:` | `1.0` | Slower polling interval (seconds) used once `scan_backoff_after` is reached |
 | `max_pages:` | `135` | Number of NTAG/Ultralight pages to read from page 4 onward (range(4, 4+max_pages)); reads stop early once a spool_id is found |
 | `event_timeout:` | `60.0` | Seconds before a pending scan result expires |
+| `auto_commit_on_scan:` | `False` | When `True`, automatically run `RFID_SCAN_COMMIT` immediately after the scan timer stores a valid `spoolman_id`. Useful when scanning outside an AFC load cycle (i.e. `afc:lane_loaded` may not fire). Has no effect on the synchronous `RFID_SCAN_BEGIN` / `RFID_SCAN` GCode path, which handles its own commit. |
 | `auto_create_spool:` | `False` | Automatically create a Spoolman spool when a tag has filament metadata but no spool ID |
 | `auto_write:` | `False` | Write the resolved `spool_id` back to the RFID tag after a successful Spoolman UID lookup or auto-create. Best-effort only — silently skipped if the tag has moved. |
 | `spoolman_url:` | `""` | Base URL of the Spoolman API (e.g. `http://localhost:7912`). If not set, auto-detected from Moonraker's `[spoolman]` config. Required for `auto_create_spool` and `RFID_CHECK_TAG CREATE=1`. |
@@ -510,9 +511,9 @@ The problem arises when the scan loop runs too fast and floods the Klipper react
 # Slow down the poll rate — each tick does one full SPI scan cycle.
 scan_delay: 0.20        # default; try 0.30–0.50 if TTC persists
 
-# After 5 consecutive no-tag ticks automatically back off to a slower rate.
-scan_backoff_after: 5   # 0 = disable backoff
-scan_backoff_delay: 0.5 # interval used during the backoff phase
+# After 3 consecutive no-tag ticks automatically back off to a slower rate.
+scan_backoff_after: 3   # 0 = disable backoff
+scan_backoff_delay: 1.0 # interval used during the backoff phase
 
 # Give the spool more time to rotate — a longer window with slower polling
 # is always safer than a short window with fast polling.
