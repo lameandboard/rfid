@@ -1553,7 +1553,7 @@ class Rfid:
             f" window={self.scan_window:.1f}s"
         )
 
-    def _maybe_schedule_auto_commit(self, lane: str, spoolman_id) -> None:
+    def _maybe_schedule_auto_commit(self, lane: str, spoolman_id: int) -> None:
         """Schedule an async RFID_SCAN_COMMIT for *lane* when auto_commit_on_scan is enabled.
 
         Only schedules when the lane is NOT in _sync_scan_lanes (i.e. not a
