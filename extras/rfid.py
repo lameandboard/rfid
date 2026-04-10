@@ -167,6 +167,9 @@ _CACHE_PATH = os.path.expanduser("~/RFID/cache/rfid_uid_cache.json")
 # between timer callbacks to avoid starving the event loop.
 _ASYNC_MIN_DELAY = 0.010  # 10 ms
 
+# How long to wait before retrying a failed Spoolman fallback lookup in _handle_lane_loaded.
+_SPOOLMAN_RETRY_DELAY_S = 3.0
+
 # UID → spoolman_id cache: populated on every successful full read so that
 # a subsequent pass that only yields a UID (no NDEF payload) can still
 # resolve the spool ID.  Shared across all Rfid instances in this process.
@@ -2233,10 +2236,10 @@ class Rfid:
                             # One retry after a short delay before giving up.
                             self._log.info(
                                 "rfid[%s]: Spoolman fallback lookup uid=%s: attempt 1 found nothing,"
-                                " retrying in 3s...",
-                                self.name, _uid,
+                                " retrying in %.0fs...",
+                                self.name, _uid, _SPOOLMAN_RETRY_DELAY_S,
                             )
-                            time.sleep(3.0)
+                            time.sleep(_SPOOLMAN_RETRY_DELAY_S)
                             try:
                                 sid = self._spoolman_find_spool_by_uid(_uid)
                             except Exception as exc:
