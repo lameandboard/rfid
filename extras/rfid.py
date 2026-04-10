@@ -2147,8 +2147,10 @@ class Rfid:
             if reader is not self:
                 self._debug_verbose(f"rfid[{self.name}]: EVENT lane_loaded not for this reader")
                 return
-            # Save seen-UIDs before ending the session (cache recovery uses them below).
+            # Save seen-UIDs and last-seen UID before ending the session; both are
+            # cleared by _end_scan_session → _clear_scan_state and are needed below.
             seen_uids_snapshot = self._scan_seen_uids.get(lane, set()).copy()
+            last_uid_snapshot = self._scan_last_uid.get(lane)
             # Cancel the scan timer and clear all per-lane scan state.
             self._end_scan_session(lane, reason="lane_loaded")
 
@@ -2205,7 +2207,7 @@ class Rfid:
                 # --- Spoolman fallback: UID known but no spoolman_id from tag text or cache ---
                 # Run at most one Spoolman UID→SID lookup per lane per session, and only
                 # after lane_loaded (never during the hot scan-timer / SPI polling loop).
-                best_uid = self._scan_last_uid.get(lane)
+                best_uid = last_uid_snapshot
                 if best_uid is None and seen_uids_snapshot:
                     best_uid = min(seen_uids_snapshot)  # deterministic fallback
                 if (
@@ -2214,7 +2216,6 @@ class Rfid:
                     and best_uid is not None
                     and not self._uid_lookup_in_flight.get(lane)
                 ):
-                    self._uid_lookup_in_flight[lane] = True
                     _lane = lane
                     _uid = best_uid
                     _timeout = self.event_timeout
@@ -2224,6 +2225,9 @@ class Rfid:
                     )
 
                     def _fallback_work():
+                        # Mark in-flight only when the worker actually starts running
+                        # (i.e., the submit succeeded).  Cleared in the reactor callback.
+                        self._uid_lookup_in_flight[_lane] = True
                         sid: Optional[int] = None
                         try:
                             sid = self._spoolman_find_spool_by_uid(_uid)
