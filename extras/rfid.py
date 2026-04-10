@@ -383,6 +383,7 @@ class Rfid:
             )
         self.auto_write = config.getboolean("auto_write", False)
         self.auto_commit_on_scan = config.getboolean("auto_commit_on_scan", False)
+        self.auto_create_spool = config.getboolean("auto_create_spool", False)
         self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
         self._spoolman_api_key = config.get("spoolman_api_key", None)
         self._spoolman_timeout = config.getfloat("spoolman_timeout", 5.0, minval=1.0)
