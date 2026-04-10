@@ -2041,13 +2041,14 @@ class Rfid:
                 # Before wiping scan state, persist any seen UIDs so that lane_loaded
                 # can still trigger the deferred Spoolman lookup even when the scan
                 # window has already expired (the common race condition).
-                if not self._pending.get(lane, {}).get("spoolman_id"):
+                _pending_entry = self._pending.get(lane)
+                if not (_pending_entry and _pending_entry.get("spoolman_id")):
                     _last = self._scan_last_uid.get(lane)
                     _seen = self._scan_seen_uids.get(lane, set())
                     if _last is not None or _seen:
                         self._deferred_uid[lane] = {
                             "last_uid": _last,
-                            "seen_uids": set(_seen),
+                            "seen_uids": _seen,
                             "ts": time.time(),
                         }
                         self._debug(

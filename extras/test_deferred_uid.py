@@ -143,7 +143,7 @@ class TestDeferredUidConstantAndInit(unittest.TestCase):
                     if found:
                         break
                 break
-        self.assertTrue(found, "self._deferred_uid must be initialised in Rfid.__init__")
+        self.assertTrue(found, "self._deferred_uid must be initialized in Rfid.__init__")
 
 
 # ---------------------------------------------------------------------------
