@@ -563,10 +563,14 @@ class Rfid:
         self._emit_console(msg)
 
     def _debug(self, msg: str) -> None:
-        """Debug message: always written to log file; printed to console only when debug=True (bypasses messages gate)."""
+        """Debug message: always written to log file; never printed to console.
+
+        User-facing messages should go through _respond() which respects the
+        ``messages`` gate.  Emitting debug lines to the Klipper console caused
+        duplicate entries in klippy.log (rotating log + gcode response sink)
+        and could trigger BlockingIOError on the gcode FD under load.
+        """
         self._log.info(msg)
-        if self.debug_en:
-            self.gcode.respond_info(msg)
 
     def _debug_verbose(self, msg: str) -> None:
         """Verbose trace: always written to log file; NEVER printed to console.
@@ -2148,7 +2152,10 @@ class Rfid:
                 )
             return sid
         except Exception as exc:
-            self._debug(f"rfid: _spoolman_find_spool_by_uid uid={uid_hex} failed: {exc}")
+            self._log.warning(
+                "rfid[%s]: _spoolman_find_spool_by_uid uid=%s failed: %s",
+                self.name, uid_hex, exc,
+            )
             return None
 
     def _spoolman_add_uid_to_spool(self, spool_id: int, uid_hex: str) -> bool:
@@ -2166,8 +2173,9 @@ class Rfid:
         try:
             return self._spoolman.add_uid_to_spool(spool_id, uid_hex, self.max_uids)
         except Exception as exc:
-            self._debug(
-                f"rfid: _spoolman_add_uid_to_spool spool_id={spool_id} uid={uid_hex} failed: {exc}"
+            self._log.warning(
+                "rfid[%s]: _spoolman_add_uid_to_spool spool_id=%s uid=%s failed: %s",
+                self.name, spool_id, uid_hex, exc,
             )
             return False
 
@@ -2186,8 +2194,9 @@ class Rfid:
         try:
             return self._spoolman.remove_uid_from_spool(spool_id, uid_hex, self.max_uids)
         except Exception as exc:
-            self._debug(
-                f"rfid: _spoolman_remove_uid_from_spool spool_id={spool_id} uid={uid_hex} failed: {exc}"
+            self._log.warning(
+                "rfid[%s]: _spoolman_remove_uid_from_spool spool_id=%s uid=%s failed: %s",
+                self.name, spool_id, uid_hex, exc,
             )
             return False
 
