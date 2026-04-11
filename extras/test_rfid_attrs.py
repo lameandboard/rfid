@@ -31,6 +31,7 @@ _REQUIRED_CONFIG_ATTRS = {
     "max_uids",
     "event_timeout",
     "spoolman_url",
+    "uid_fast_scan",
 }
 
 
