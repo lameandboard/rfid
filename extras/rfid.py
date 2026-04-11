@@ -39,6 +39,10 @@ Config parameters (per [rfid <name>] section):
 - rfid_fast_mode: when True (default), commit on the very first valid read; when False, require
   two consecutive reads of the same UID (with a fallback that commits a single-read candidate
   the moment the tag is no longer detected — useful for fast-moving spools even in safe mode)
+- uid_fast_scan: when True (default), attempt a quick anticollision-only UID read before the
+  full page-read scan on each tick.  If the UID is already in the local cache the full scan is
+  skipped entirely, saving ~50–200 ms per tick for previously-seen tags.  Falls back to the full
+  scan automatically on a cache miss or if the fast read is unavailable for the current driver.
 - candidate_ttl: (fast_mode=False only) how long (seconds) a scan candidate survives without
   re-sighting before it ages out (default 0.5, min 0.1)
 - auto_commit_on_scan: when True, automatically run RFID_SCAN_COMMIT immediately after a valid
@@ -375,6 +379,7 @@ class Rfid:
         self.scan_window = float(config.getfloat("scan_window", 10.0, minval=1.0))
         self.fast_mode = config.getboolean("rfid_fast_mode", True)
         self.candidate_ttl = float(config.getfloat("candidate_ttl", 0.5, minval=0.1))
+        self.uid_fast_scan = config.getboolean("uid_fast_scan", True)
         # DEPRECATED: scan_backoff_after and scan_backoff_delay are removed.  They are
         # consumed silently so existing configs do not error out, but they have no effect.
         # The scan loop always uses scan_delay.  Remove these from your config file.
@@ -965,6 +970,69 @@ class Rfid:
                 "ts": time.time(),
             }
 
+        # --- Fast UID pre-scan + cache lookup ---
+        # If uid_fast_scan is enabled and the reader supports read_uid_fast(),
+        # obtain the UID without the full SELECT + page-read cycle.  A cache hit
+        # skips the full scan entirely, giving near-instant identification for
+        # previously-seen tags.  On a cache miss we fall through to the full scan
+        # so that NDEF payload data (and the spoolman_id embedded in it) can still
+        # be parsed for tags that have never been seen before.
+        if self.uid_fast_scan and hasattr(self.reader, "read_uid_fast"):
+            fast_uid: Optional[list[int]] = None
+            try:
+                fast_uid = self.reader.read_uid_fast()
+            except Exception:
+                self._log.exception(
+                    "rfid[%s]: read_uid_fast failed, falling back to full scan", self.name
+                )
+            if fast_uid is not None:
+                fast_uid_hex = "".join("%02X" % b for b in fast_uid)
+                self._log.info(
+                    "rfid[%s]: UID acquired (fast) uid=%s lane=%s",
+                    self.name, fast_uid_hex, lane,
+                )
+                cached = _UID_SPOOL_CACHE.get(fast_uid_hex)
+                if cached is not None:
+                    sid = _cache_entry_sid(cached)
+                    if sid is not None and not self._is_spool_assigned_elsewhere(lane, sid):
+                        self._log.info(
+                            "rfid[%s]: UID cache hit uid=%s sid=%s lane=%s"
+                            " — skipping full scan",
+                            self.name, fast_uid_hex, sid, lane,
+                        )
+                        if fast_uid_hex and sid is not None:
+                            if _UID_SPOOL_CACHE.get(fast_uid_hex) != sid:
+                                _UID_SPOOL_CACHE[fast_uid_hex] = sid
+                                _mark_uid_cache_dirty()
+                        return {
+                            "lane": lane,
+                            "uid_hex": fast_uid_hex,
+                            "tag_text": "",
+                            "raw_len": 0,
+                            "raw_bytes": b"",
+                            "spoolman_id": sid,
+                            "ts": time.time(),
+                        }
+                self._debug_verbose(
+                    f"rfid[{self.name}]: fast_uid cache_miss uid={fast_uid_hex}"
+                    f" lane={lane} — proceeding to full scan"
+                )
+            else:
+                # Fast read returned None: no tag detected; skip full scan to
+                # avoid a redundant round-trip that will also find nothing.
+                self._debug_verbose(
+                    f"rfid[{self.name}]: fast_uid no_tag lane={lane} — skipping full scan"
+                )
+                return {
+                    "lane": lane,
+                    "uid_hex": None,
+                    "tag_text": None,
+                    "raw_len": 0,
+                    "raw_bytes": b"",
+                    "spoolman_id": None,
+                    "ts": time.time(),
+                }
+
         # Try multi-tag enumeration path first so adjacent tags can be skipped.
         if hasattr(self.reader, "read_all_tags"):
             self._debug_verbose(f"rfid[{self.name}]: DBG _scan_once path=read_all_tags")
@@ -1377,7 +1445,7 @@ class Rfid:
             if self.auto_write:
                 try:
                     current_uid = None
-                    current_scan = self._scan_once(_lane)
+                    current_scan = self._scan_once(_lane, max_pages=self.max_pages)
                     if isinstance(current_scan, dict):
                         current_uid = current_scan.get("uid_hex") or current_scan.get("uid")
                     elif isinstance(current_scan, (tuple, list)) and current_scan:
@@ -1446,7 +1514,7 @@ class Rfid:
                     if self.auto_write:
                         try:
                             current_uid = None
-                            current_scan = self._scan_once(_lane)
+                            current_scan = self._scan_once(_lane, max_pages=self.max_pages)
                             if isinstance(current_scan, dict):
                                 current_uid = current_scan.get("uid_hex") or current_scan.get("uid")
                             elif isinstance(current_scan, (tuple, list)) and current_scan:
@@ -1776,8 +1844,10 @@ class Rfid:
                     # AFC event-driven scans defer the Spoolman lookup to _handle_lane_loaded
                     # so it never runs inside the hot scan-timer / SPI loop.
                     if lane in self._sync_scan_lanes:
-                        self._debug(
-                            f"rfid[{self.name}]: DBG uid_resolution_dispatch lane={lane} uid={uid_hex}"
+                        self._log.info(
+                            "rfid[%s]: UID acquired uid=%s lane=%s"
+                            " — dispatching Spoolman lookup (sync scan)",
+                            self.name, uid_hex, lane,
                         )
                         blocked_uids.add(uid_hex)  # prevent re-dispatch this window
                         self._dispatch_uid_resolution(lane, uid_hex, tag_text)
@@ -1787,9 +1857,10 @@ class Rfid:
                         # The fallback Spoolman UID→SID lookup will run exactly once in
                         # _handle_lane_loaded, after the scan window ends, avoiding HTTP
                         # work during the tight SPI polling loop.
-                        self._debug(
-                            f"rfid[{self.name}]: DBG uid_seen_deferred lane={lane} uid={uid_hex}"
-                            f" (Spoolman lookup deferred to lane_loaded)"
+                        self._log.info(
+                            "rfid[%s]: UID acquired uid=%s lane=%s"
+                            " — Spoolman lookup deferred to lane_loaded",
+                            self.name, uid_hex, lane,
                         )
                         blocked_uids.add(uid_hex)  # don't re-process this UID this window
                 elif not self.auto_create_spool:
@@ -2272,9 +2343,8 @@ class Rfid:
                     _lane = lane
                     _uid = best_uid
                     _timeout = self.event_timeout
-                    self._debug(
-                        f"rfid[{self.name}]: lane_loaded: dispatching Spoolman fallback"
-                        f" lookup uid={_uid} lane={_lane}"
+                    self._respond(
+                        f"RFID: lane {_lane} uid={_uid} — dispatching Spoolman lookup"
                     )
 
                     def _fallback_work():

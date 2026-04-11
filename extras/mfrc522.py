@@ -549,6 +549,69 @@ class MFRC522Device:
             return None
         return "".join("%02X" % b for b in uid)
 
+    def read_uid_fast(self) -> Optional[list[int]]:
+        """Obtain UID as quickly as possible: REQA + anticollision only, no SELECT.
+
+        Faster than :meth:`read_uid` because it skips the SELECT command at each
+        cascade level — no CRC calculation, no additional SPI round-trip per level.
+        The tag is **not** placed into the Selected state after this call, so memory
+        reads are not possible in the same transaction.
+
+        On a cache-hit fast path this lets the scan loop skip the full page-read
+        entirely, shaving ~50–200 ms off each tick for already-known tags.
+
+        If anticollision succeeds at level 1 but fails at a higher level, any UID
+        bytes collected so far are returned (partial-UID best effort).
+
+        Falls back to ``None`` if no tag is detected or anticollision fails at
+        the very first level.
+        """
+        self.initialize()
+        self._dbg("mfrc522.read_uid_fast enter")
+        with self.antenna_enabled():
+            st, _ = self.request(self.PICC_REQA)
+            if st != self.MI_OK:
+                self._dbg("mfrc522.read_uid_fast returning None (no tag)")
+                return None
+            uid: list[int] = []
+            for sel in (0x93, 0x95, 0x97):
+                level = self._SEL_TO_LEVEL[sel]
+                self._dbg("mfrc522.read_uid_fast level=%d sel=0x%02X uid_so_far=%s" % (
+                    level, sel, "".join("%02X" % b for b in uid)))
+                st, cln = self._anticoll_level(sel)
+                if st != self.MI_OK:
+                    self._dbg(
+                        "mfrc522.read_uid_fast anticoll failed at level=%d returning %s" % (
+                            level,
+                            "".join("%02X" % b for b in uid) if uid else "None",
+                        )
+                    )
+                    return uid if uid else None
+                if cln[0] == 0x88:
+                    # Cascade tag: collect UID bytes from this level and continue
+                    uid.extend(cln[1:4])
+                    self._dbg(
+                        "mfrc522.read_uid_fast cascade_continue level=%d uid_so_far=%s" % (
+                            level, "".join("%02X" % b for b in uid)))
+                else:
+                    uid.extend(cln[0:4])
+                    self._dbg("mfrc522.read_uid_fast complete uid=%s" % (
+                        "".join("%02X" % b for b in uid)))
+                    return uid
+            # All 3 cascade levels completed without clearing the cascade bit —
+            # return whatever was collected (malformed / exotic tag).
+            if uid:
+                self._dbg("mfrc522.read_uid_fast cascade_exhausted uid=%s" % (
+                    "".join("%02X" % b for b in uid)))
+            return uid or None
+
+    def read_uid_fast_hex(self) -> Optional[str]:
+        """Return UID as a hex string via :meth:`read_uid_fast`, or ``None``."""
+        uid = self.read_uid_fast()
+        if uid is None:
+            return None
+        return "".join("%02X" % b for b in uid)
+
     # ---------- MIFARE Classic authenticated reads ----------
 
     def _auth_mifare_block(self, cmd: int, block_addr: int, key: bytes, uid: bytes) -> bool:

@@ -188,6 +188,8 @@ max_pages: 135
 | `scan_backoff_delay:` | `1.0` | Slower polling interval (seconds) used once `scan_backoff_after` is reached |
 | `max_pages:` | `135` | Number of NTAG/Ultralight pages to read from page 4 onward (range(4, 4+max_pages)); reads stop early once a spool_id is found |
 | `event_timeout:` | `60.0` | Seconds before a pending scan result expires |
+| `rfid_fast_mode:` | `True` | When `True`, commit on the very first valid read. When `False`, require two consecutive reads of the same UID for confirmation. |
+| `uid_fast_scan:` | `True` | When `True`, attempt a quick anticollision-only UID read before the full page-read scan on each tick. Cache hits skip the full scan entirely (~50–200 ms saved per tick for previously-seen tags). Falls back to the full scan on a cache miss. |
 | `auto_commit_on_scan:` | `False` | When `True`, automatically run `RFID_SCAN_COMMIT` immediately after the scan timer stores a valid `spoolman_id`. Useful when scanning outside an AFC load cycle (i.e. `afc:lane_loaded` may not fire). Has no effect on the synchronous `RFID_SCAN_BEGIN` / `RFID_SCAN` GCode path, which handles its own commit. |
 | `auto_create_spool:` | `False` | Automatically create a Spoolman spool when a tag has filament metadata but no spool ID |
 | `auto_write:` | `False` | Write the resolved `spool_id` back to the RFID tag after a successful Spoolman UID lookup or auto-create. Best-effort only — silently skipped if the tag has moved. |
