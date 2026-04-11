@@ -974,9 +974,11 @@ class Rfid:
         # If uid_fast_scan is enabled and the reader supports read_uid_fast(),
         # obtain the UID without the full SELECT + page-read cycle.  A cache hit
         # skips the full scan entirely, giving near-instant identification for
-        # previously-seen tags.  On a cache miss we fall through to the full scan
-        # so that NDEF payload data (and the spoolman_id embedded in it) can still
-        # be parsed for tags that have never been seen before.
+        # previously-seen tags.  The returned dict on a cache hit has tag_text=""
+        # and raw_bytes=b"" (NDEF payload is only populated by the full scan path).
+        # On a cache miss we fall through to the full scan so that NDEF payload
+        # data (and the spoolman_id embedded in it) can still be parsed for tags
+        # that have never been seen before.
         if self.uid_fast_scan and hasattr(self.reader, "read_uid_fast"):
             fast_uid: Optional[list[int]] = None
             try:

@@ -560,8 +560,11 @@ class MFRC522Device:
         On a cache-hit fast path this lets the scan loop skip the full page-read
         entirely, shaving ~50–200 ms off each tick for already-known tags.
 
-        If anticollision succeeds at level 1 but fails at a higher level, any UID
-        bytes collected so far are returned (partial-UID best effort).
+        If anticollision succeeds at cascade level 1 (with byte 0 == 0x88 indicating
+        a multi-level tag) but then fails at a higher level, the UID bytes collected
+        so far are returned (partial-UID best effort).  A partial UID will not match
+        any full UID in the cache (since cache entries always use the complete UID
+        hex string), so it will fall through to the full scan path harmlessly.
 
         Falls back to ``None`` if no tag is detected or anticollision fails at
         the very first level.
