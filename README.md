@@ -139,7 +139,7 @@ spi_speed: 100000
 lanes: 1,2
 messages: True
 debug: False
-scan_delay: 0.20
+scan_delay: 0.05
 scan_window: 10.0
 driver: auto
 max_pages: 135
@@ -151,7 +151,7 @@ spi_speed: 100000
 lanes: 3,4
 messages: True
 debug: False
-scan_delay: 0.20
+scan_delay: 0.05
 scan_window: 10.0
 driver: auto
 max_pages: 135
