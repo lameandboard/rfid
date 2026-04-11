@@ -550,7 +550,7 @@ class MFRC522Device:
         return "".join("%02X" % b for b in uid)
 
     def read_uid_fast(self) -> Optional[list[int]]:
-        """Obtain UID as quickly as possible: REQA + anticollision only, no SELECT.
+        """Obtain UID as quickly as possible: anticollision only, no SELECT.
 
         Faster than :meth:`read_uid` because it skips the SELECT command at each
         cascade level — no CRC calculation, no additional SPI round-trip per level.
@@ -559,6 +559,12 @@ class MFRC522Device:
 
         On a cache-hit fast path this lets the scan loop skip the full page-read
         entirely, shaving ~50–200 ms off each tick for already-known tags.
+
+        Wake strategy: tries REQA first (finds tags in IDLE state).  If REQA finds
+        nothing, issues WUPA so that tags left in HALT by a previous full scan can
+        respond.  This prevents a halted tag from being invisible to the fast-read
+        path.  Callers should not assume the tag is halted after this method returns
+        — callers that need a clean halted state should perform a full scan instead.
 
         If anticollision succeeds at cascade level 1 (with byte 0 == 0x88 indicating
         a multi-level tag) but then fails at a higher level, the UID bytes collected
@@ -572,9 +578,14 @@ class MFRC522Device:
         self.initialize()
         self._dbg("mfrc522.read_uid_fast enter")
         with self.antenna_enabled():
+            # Try REQA first; if nothing responds, try WUPA so tags halted by a
+            # prior full scan can still be seen.
             st, _ = self.request(self.PICC_REQA)
             if st != self.MI_OK:
-                self._dbg("mfrc522.read_uid_fast returning None (no tag)")
+                self._dbg("mfrc522.read_uid_fast reqa_miss — trying wupa")
+                st, _ = self.request(self.PICC_WUPA)
+            if st != self.MI_OK:
+                self._dbg("mfrc522.read_uid_fast returning None (no tag after reqa+wupa)")
                 return None
             uid: list[int] = []
             for sel in (0x93, 0x95, 0x97):

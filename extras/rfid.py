@@ -976,9 +976,9 @@ class Rfid:
         # skips the full scan entirely, giving near-instant identification for
         # previously-seen tags.  The returned dict on a cache hit has tag_text=""
         # and raw_bytes=b"" (NDEF payload is only populated by the full scan path).
-        # On a cache miss we fall through to the full scan so that NDEF payload
-        # data (and the spoolman_id embedded in it) can still be parsed for tags
-        # that have never been seen before.
+        # On a cache miss or fast-read None we fall through to the full scan so
+        # that read_all_tags() can issue WUPA for halted tags and NDEF payload data
+        # can still be parsed for tags that have never been seen before.
         if self.uid_fast_scan and hasattr(self.reader, "read_uid_fast"):
             fast_uid: Optional[list[int]] = None
             try:
@@ -989,9 +989,8 @@ class Rfid:
                 )
             if fast_uid is not None:
                 fast_uid_hex = "".join("%02X" % b for b in fast_uid)
-                self._log.info(
-                    "rfid[%s]: UID acquired (fast) uid=%s lane=%s",
-                    self.name, fast_uid_hex, lane,
+                self._debug_verbose(
+                    f"rfid[{self.name}]: fast_uid acquired uid={fast_uid_hex} lane={lane}"
                 )
                 cached = _UID_SPOOL_CACHE.get(fast_uid_hex)
                 if cached is not None:
@@ -1017,23 +1016,15 @@ class Rfid:
                         }
                 self._debug_verbose(
                     f"rfid[{self.name}]: fast_uid cache_miss uid={fast_uid_hex}"
-                    f" lane={lane} — proceeding to full scan"
+                    f" lane={lane} -- proceeding to full scan"
                 )
             else:
-                # Fast read returned None: no tag detected; skip full scan to
-                # avoid a redundant round-trip that will also find nothing.
+                # Fast read returned None: no tag in IDLE or HALT state was detected.
+                # Fall through to the full scan path (read_all_tags pass 0 uses WUPA
+                # which can also wake halted tags, so it is the authoritative no-tag check).
                 self._debug_verbose(
-                    f"rfid[{self.name}]: fast_uid no_tag lane={lane} — skipping full scan"
+                    f"rfid[{self.name}]: fast_uid no_tag lane={lane} -- proceeding to full scan"
                 )
-                return {
-                    "lane": lane,
-                    "uid_hex": None,
-                    "tag_text": None,
-                    "raw_len": 0,
-                    "raw_bytes": b"",
-                    "spoolman_id": None,
-                    "ts": time.time(),
-                }
 
         # Try multi-tag enumeration path first so adjacent tags can be skipped.
         if hasattr(self.reader, "read_all_tags"):
