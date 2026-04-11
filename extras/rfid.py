@@ -997,13 +997,13 @@ class Rfid:
                     if sid is not None and not self._is_spool_assigned_elsewhere(lane, sid):
                         self._log.info(
                             "rfid[%s]: UID cache hit uid=%s sid=%s lane=%s"
-                            " — skipping full scan",
+                            " -- skipping full scan",
                             self.name, fast_uid_hex, sid, lane,
                         )
-                        if fast_uid_hex and sid is not None:
-                            if _UID_SPOOL_CACHE.get(fast_uid_hex) != sid:
-                                _UID_SPOOL_CACHE[fast_uid_hex] = sid
-                                _mark_uid_cache_dirty()
+                        # Normalize any old dict-format entry to the current plain-int format.
+                        if not isinstance(cached, int):
+                            _UID_SPOOL_CACHE[fast_uid_hex] = sid
+                            _mark_uid_cache_dirty()
                         return {
                             "lane": lane,
                             "uid_hex": fast_uid_hex,
@@ -2344,7 +2344,7 @@ class Rfid:
                     _uid = best_uid
                     _timeout = self.event_timeout
                     self._respond(
-                        f"RFID: lane {_lane} uid={_uid} — dispatching Spoolman lookup"
+                        f"RFID: lane {_lane} uid={_uid} -- dispatching Spoolman lookup"
                     )
 
                     def _fallback_work():
