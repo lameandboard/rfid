@@ -930,8 +930,15 @@ class TestReadAuthenticatedBlocksHaltReselect(unittest.TestCase):
 
         # Every call must have been passed expected_uid=bytes(uid[:4])
         for call_args in dev._halt_and_reselect.call_args_list:
+            # expected_uid may be passed as keyword or positional arg
+            if call_args.kwargs.get("expected_uid") is not None:
+                actual_uid = call_args.kwargs["expected_uid"]
+            elif call_args.args:
+                actual_uid = call_args.args[0]
+            else:
+                actual_uid = None
             self.assertEqual(
-                call_args.kwargs.get("expected_uid") or call_args.args[0] if call_args.args else call_args.kwargs.get("expected_uid"),
+                actual_uid,
                 bytes(uid[:4]),
                 "_halt_and_reselect must receive expected_uid matching the tag UID",
             )
