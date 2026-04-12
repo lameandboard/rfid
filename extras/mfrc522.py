@@ -628,6 +628,94 @@ class MFRC522Device:
 
     # ---------- MIFARE Classic authenticated reads ----------
 
+    def _halt_and_reselect(self, expected_uid: Optional[bytes] = None) -> bool:
+        """Halt the active tag then re-SELECT it so that a fresh sector authentication
+        can be issued.
+
+        The MFRC522 Crypto1 state machine requires this sequence between consecutive
+        sector authentications.  Once ``PCD_AUTHENT`` succeeds and ``MFCrypto1On``
+        (Status2Reg bit 3) is set, the cipher remains active for the authenticated
+        sector.  Attempting to authenticate a *different* sector without first
+        leaving and re-entering the ACTIVE state causes the MFRC522 to reject all
+        subsequent ``PCD_AUTHENT`` commands — hence only sector 0 ever succeeds in
+        a naive loop.
+
+        Android's ``MifareClassic.authenticateSectorWithKeyA/B()`` API transparently
+        issues a HALT (deselect) and re-SELECT between sectors, which is why the
+        Android app can read all sectors without this explicit step.  Most bare-metal
+        MFRC522 Python drivers do not replicate this behaviour.
+
+        Fix sequence (per MFRC522 datasheet §8.1.3 and ISO 14443-3A §6.3.5):
+          1. Clear ``Status2Reg[MFCrypto1On]`` explicitly.
+          2. Send ISO 14443-3A HALT (0x50 0x00 + CRC) — tag enters HALT state.
+          3. Wait ≥ 5 ms for the tag to process the command.
+          4. Send WUPA (0x52) — REQA is ignored by halted tags; WUPA wakes them.
+          5. Run anticollision + SELECT to return the tag to ACTIVE state.
+          6. Wait ≥ 5 ms after re-select before issuing AUTH.
+
+        Parameters
+        ----------
+        expected_uid : bytes or None
+            When provided, the re-selected tag UID must match (first
+            ``len(expected_uid)`` bytes).  A mismatch returns ``False`` so the
+            caller aborts rather than continuing authenticated reads/writes on a
+            different tag — a risk when multiple tags are in the RF field, since
+            WUPA wakes *all* halted tags simultaneously.
+
+        Returns True on success (tag re-selected, UID matches if checked).
+        Returns False if WUPA, re-select, or UID validation fails.
+        The caller should abort reading remaining sectors on False.
+        """
+        # Step 1: clear the Crypto1 cipher flag before halting.
+        self._clear_mask(self.Status2Reg, 0x08)
+
+        # Step 2: send HALT.
+        self.halt_tag()
+
+        # Step 3: 5 ms settling time after HALT.
+        _delay_s = 0.005
+        if self._reactor is None:
+            self._wait_time(_delay_s)
+        else:
+            _deadline = self._now() + _delay_s
+            while self._now() < _deadline:
+                pass
+
+        # Step 4: wake the halted tag with WUPA (REQA is ignored in HALT state).
+        st, _ = self.request(self.PICC_WUPA)
+        if st != self.MI_OK:
+            self._dbg("mfrc522.halt_and_reselect wupa_failed")
+            return False
+
+        # Step 5: re-run anticollision + SELECT to return tag to ACTIVE state.
+        reselect_uid = self._anticoll_and_select()
+        if reselect_uid is None:
+            self._dbg("mfrc522.halt_and_reselect select_failed")
+            return False
+
+        # Validate UID when requested to guard against silently switching to a
+        # different tag (WUPA wakes all halted tags in the RF field).
+        if expected_uid is not None:
+            got_uid = bytes(reselect_uid[:len(expected_uid)])
+            if got_uid != bytes(expected_uid):
+                self._dbg(
+                    "mfrc522.halt_and_reselect uid_mismatch expected=%s got=%s" % (
+                        bytes(expected_uid).hex(), got_uid.hex())
+                )
+                return False
+
+        # Step 6: 5 ms settling time after SELECT before AUTH.
+        if self._reactor is None:
+            self._wait_time(_delay_s)
+        else:
+            _deadline = self._now() + _delay_s
+            while self._now() < _deadline:
+                pass
+
+        self._dbg("mfrc522.halt_and_reselect ok uid=%s" % (
+            "".join("%02X" % b for b in reselect_uid)))
+        return True
+
     def _auth_mifare_block(self, cmd: int, block_addr: int, key: bytes, uid: bytes) -> bool:
         """Authenticate a MIFARE Classic sector using the PCD_AUTHENT command.
 
@@ -690,6 +778,15 @@ class MFRC522Device:
         The tag must have already been selected (anticollision + select completed)
         and the antenna must be enabled when this method is called.
 
+        Between consecutive sectors this method issues a HALT → WUPA → re-SELECT
+        sequence (via :meth:`_halt_and_reselect`) before each new sector
+        authentication.  This is required by the MFRC522 Crypto1 state machine:
+        once ``PCD_AUTHENT`` succeeds the cipher stays active for the current
+        sector.  Without HALT + re-SELECT every subsequent sector authentication
+        fails — matching the user-observed symptom of "only sector 0 succeeds".
+        Android's ``MifareClassic`` API handles this transparently; bare-metal
+        MFRC522 drivers must replicate it explicitly.
+
         Parameters
         ----------
         uid       : Tag UID bytes (from anticollision).
@@ -706,6 +803,20 @@ class MFRC522Device:
         auth_cmd = self.PICC_AUTHENT1B if use_key_b else self.PICC_AUTHENT1A
         result: dict = {}
         for sector in range(num_sectors):
+            # Between consecutive sectors: HALT the tag and re-SELECT it so that
+            # the MFRC522 Crypto1 cipher is fully reset before the next AUTH
+            # command.  See _halt_and_reselect() docstring for full rationale.
+            if sector > 0:
+                if not self._halt_and_reselect(expected_uid=bytes(uid[:4])):
+                    self._dbg(
+                        "mfrc522.read_auth_blocks sector=%d halt_reselect_failed — "
+                        "aborting remaining sectors" % sector
+                    )
+                    for s in range(sector, num_sectors):
+                        for b in range(3):
+                            result[s * 4 + b] = None
+                    return result
+
             key = key_list[sector] if sector < len(key_list) else bytes(6)
             # Trailer block = sector * 4 + 3
             trailer_block = sector * 4 + 3
@@ -714,7 +825,7 @@ class MFRC522Device:
             if not self._auth_mifare_block(auth_cmd, trailer_block, key, uid):
                 self._dbg("mfrc522.read_auth_blocks sector=%d auth_failed trailer=%d" % (
                     sector, trailer_block))
-                # Clear crypto state before next sector
+                # Clear crypto state; halt/reselect will be issued for next sector.
                 self._clear_mask(self.Status2Reg, 0x08)
                 # Pre-fill None for the three data blocks so callers get a consistent index map
                 for blk_in_sector in range(3):
@@ -727,7 +838,8 @@ class MFRC522Device:
                     self._dbg("mfrc522.read_auth_blocks sector=%d block=%d read_failed" % (
                         sector, abs_block))
                 result[abs_block] = data
-            # Clear MFCrypto1On before authenticating next sector
+            # Clear MFCrypto1On; halt/reselect for the next sector is issued at
+            # the top of the next loop iteration.
             self._clear_mask(self.Status2Reg, 0x08)
         return result
 
@@ -1506,7 +1618,19 @@ class MFRC522Device:
                 continue
             sectors_needed.setdefault(sector, []).append(block_addr)
 
+        prev_sector = None
         for sector, blocks in sorted(sectors_needed.items()):
+            # Between consecutive sectors: HALT + re-SELECT to reset Crypto1 state.
+            # See _halt_and_reselect() for full rationale.
+            if prev_sector is not None:
+                if not self._halt_and_reselect(expected_uid=uid_bytes):
+                    self._dbg(
+                        "mfrc522.write_auth_blocks sector=%d halt_reselect_failed" % sector
+                    )
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    return False
+            prev_sector = sector
+
             key = key_list[sector] if sector < len(key_list) else bytes(6)
             trailer_block = sector * 4 + 3
             self._dbg(
@@ -1527,6 +1651,7 @@ class MFRC522Device:
                     )
                     self._clear_mask(self.Status2Reg, 0x08)
                     return False
+            # Clear MFCrypto1On; halt/reselect is issued at the top of the next iteration.
             self._clear_mask(self.Status2Reg, 0x08)
 
         return True
@@ -1602,6 +1727,9 @@ class MFRC522Device:
         (48 bytes).  Sector trailer blocks are skipped.  Each sector is authenticated
         individually before its data blocks are written.
 
+        Between consecutive sectors a HALT + re-SELECT sequence is performed to
+        reset the MFRC522 Crypto1 state.  See :meth:`_halt_and_reselect`.
+
         Returns True on full success, False on any auth or write failure.
         """
         data = text.encode("utf-8")
@@ -1612,7 +1740,19 @@ class MFRC522Device:
 
         offset = 0
         sector = 1  # sector 0 holds manufacturer data; start at sector 1
+        first_sector = True
         while offset < padded_len:
+            # Between consecutive sectors: HALT + re-SELECT to reset Crypto1 state.
+            if not first_sector:
+                if not self._halt_and_reselect(expected_uid=uid_bytes):
+                    self._dbg(
+                        "mfrc522._write_mifare_classic_json halt_reselect_failed sector=%d"
+                        % sector
+                    )
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    return False
+            first_sector = False
+
             trailer = sector * 4 + 3
             if not self._auth_mifare_block(0x60, trailer, default_key, uid_bytes):
                 self._dbg("mfrc522._write_mifare_classic_json auth failed sector=%d" % sector)
@@ -1630,6 +1770,7 @@ class MFRC522Device:
                     self._clear_mask(self.Status2Reg, 0x08)
                     return False
                 offset += 16
+            # Clear MFCrypto1On; halt/reselect is issued at the top of the next iteration.
             self._clear_mask(self.Status2Reg, 0x08)
             sector += 1
 

@@ -755,6 +755,282 @@ class TestWriteMifareClassicAuthBlocks(unittest.TestCase):
         args = dev._auth_mifare_block.call_args[0]
         self.assertEqual(args[0], dev.PICC_AUTHENT1A)
 
+    def test_halt_reselect_called_between_sectors(self):
+        """HALT + re-SELECT must be issued between consecutive sector writes.
+
+        When blocks from two different sectors are written, _halt_and_reselect()
+        must be called exactly once (between the two sectors) to reset the
+        MFRC522 Crypto1 state machine.
+        """
+        dev = self._make_device()
+        dev._halt_and_reselect = MagicMock(return_value=True)
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        # Block 1 is in sector 0, block 9 is in sector 2 → two sectors
+        ok = dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {1: b"\xAA" * 16, 9: b"\xBB" * 16}, use_key_b=True
+        )
+        self.assertTrue(ok)
+        dev._halt_and_reselect.assert_called_once()
+
+    def test_halt_reselect_not_called_for_single_sector(self):
+        """When all writes are within a single sector, no HALT + re-SELECT is needed."""
+        dev = self._make_device()
+        dev._halt_and_reselect = MagicMock(return_value=True)
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        ok = dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {9: b"\xAA" * 16, 10: b"\xBB" * 16}, use_key_b=True
+        )
+        self.assertTrue(ok)
+        dev._halt_and_reselect.assert_not_called()
+
+    def test_halt_reselect_failure_aborts_write(self):
+        """If _halt_and_reselect fails mid-write, the method must return False."""
+        dev = self._make_device()
+        dev._halt_and_reselect = MagicMock(return_value=False)
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        ok = dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {1: b"\xAA" * 16, 9: b"\xBB" * 16}, use_key_b=True
+        )
+        self.assertFalse(ok)
+
+
+# ---------------------------------------------------------------------------
+# Tests: read_authenticated_blocks — HALT + re-SELECT between sectors
+# ---------------------------------------------------------------------------
+
+class TestReadAuthenticatedBlocksHaltReselect(unittest.TestCase):
+    """read_authenticated_blocks must HALT + re-SELECT between consecutive sectors.
+
+    The MFRC522 Crypto1 state machine requires a HALT + re-SELECT sequence
+    between each sector authentication.  Without it, all sectors after sector 0
+    fail authentication — the user-observed symptom.  Android's MifareClassic
+    API handles this transparently; bare-metal drivers must replicate it.
+    """
+
+    def _make_device(self, auth_ok=True):
+        """Return an MFRC522Device with key methods mocked for unit testing."""
+        dev = _make_device()
+        dev._auth_mifare_block = MagicMock(return_value=auth_ok)
+        dev._read_mifare_block = MagicMock(return_value=bytes(16))
+        dev._clear_mask = MagicMock()
+        dev._halt_and_reselect = MagicMock(return_value=True)
+        return dev
+
+    def test_halt_reselect_called_between_every_sector(self):
+        """_halt_and_reselect must be called exactly (num_sectors - 1) times."""
+        num_sectors = 4
+        dev = self._make_device()
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        dev.read_authenticated_blocks(uid, keys, num_sectors=num_sectors)
+
+        self.assertEqual(
+            dev._halt_and_reselect.call_count,
+            num_sectors - 1,
+            "Expected _halt_and_reselect called %d times for %d sectors" % (
+                num_sectors - 1, num_sectors),
+        )
+
+    def test_halt_reselect_not_called_for_single_sector(self):
+        """When reading only 1 sector, no HALT + re-SELECT is needed."""
+        dev = self._make_device()
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        dev.read_authenticated_blocks(uid, keys, num_sectors=1)
+
+        dev._halt_and_reselect.assert_not_called()
+
+    def test_halt_reselect_failure_fills_remaining_sectors_with_none(self):
+        """If _halt_and_reselect fails, remaining sectors must be filled with None."""
+        dev = self._make_device()
+        # Fail the re-select that happens before sector 2
+        dev._halt_and_reselect = MagicMock(side_effect=[True, False])
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        result = dev.read_authenticated_blocks(uid, keys, num_sectors=4)
+
+        # Sectors 0 and 1 succeed (halt_reselect[0] = True).
+        # Data blocks per sector: sector 0 → 0,1,2; sector 1 → 4,5,6
+        for blk in (0, 1, 2, 4, 5, 6):
+            self.assertIsNotNone(result.get(blk),
+                                 "Block %d should have data (sector 0 or 1)" % blk)
+        # Sectors 2 and 3 must be None (halt_reselect[1] = False).
+        # Data blocks: sector 2 → 8,9,10; sector 3 → 12,13,14
+        for blk in (8, 9, 10, 12, 13, 14):
+            self.assertIsNone(result.get(blk),
+                              "Block %d should be None (sector 2+ after reselect failure)" % blk)
+
+    def test_all_16_sectors_readable_with_successful_halt_reselect(self):
+        """All 48 data blocks must be readable when halt_reselect always succeeds."""
+        dev = self._make_device()
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        result = dev.read_authenticated_blocks(uid, keys, num_sectors=16)
+
+        # 16 sectors × 3 data blocks = 48 entries.
+        # Sector N has data blocks: N*4, N*4+1, N*4+2 (trailer N*4+3 is excluded).
+        self.assertEqual(len(result), 48)
+        for sector in range(16):
+            for offset in range(3):
+                blk = sector * 4 + offset
+                self.assertIsNotNone(result.get(blk),
+                                     "Block %d (sector %d) should have data" % (blk, sector))
+
+    def test_auth_failure_still_continues_to_next_sector(self):
+        """An auth failure on one sector must not stop reading subsequent sectors."""
+        dev = self._make_device()
+        # Fail auth on sector 1 only (block 7 is sector 1's trailer)
+        def auth_side_effect(cmd, block, key, uid):
+            return block != 7
+        dev._auth_mifare_block = MagicMock(side_effect=auth_side_effect)
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        result = dev.read_authenticated_blocks(uid, keys, num_sectors=4)
+
+        # Sector 0 (blocks 0-2) should have data
+        for blk in range(3):
+            self.assertIsNotNone(result.get(blk), "Sector 0 block %d should have data" % blk)
+        # Sector 1 (blocks 4-6) should be None (auth failed)
+        for blk in range(4, 7):
+            self.assertIsNone(result.get(blk), "Sector 1 block %d should be None" % blk)
+        # Sector 2 (blocks 8-10) should have data (read continues after sector 1 failure)
+        for blk in range(8, 11):
+            self.assertIsNotNone(result.get(blk), "Sector 2 block %d should have data" % blk)
+
+    def test_halt_reselect_called_even_after_auth_failure(self):
+        """_halt_and_reselect must be called before sector 2 even if sector 1 auth failed."""
+        dev = self._make_device()
+        # Fail auth on sector 1
+        def auth_side_effect(cmd, block, key, uid):
+            return block != 7
+        dev._auth_mifare_block = MagicMock(side_effect=auth_side_effect)
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        dev.read_authenticated_blocks(uid, keys, num_sectors=3)
+
+        # _halt_and_reselect must be called twice: before sector 1 and before sector 2
+        self.assertEqual(dev._halt_and_reselect.call_count, 2)
+
+    def test_halt_reselect_receives_expected_uid(self):
+        """_halt_and_reselect must be called with the tag UID as expected_uid."""
+        dev = self._make_device()
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        dev.read_authenticated_blocks(uid, keys, num_sectors=3)
+
+        # Every call must have been passed expected_uid=bytes(uid[:4])
+        for call_args in dev._halt_and_reselect.call_args_list:
+            # expected_uid may be passed as keyword or positional arg
+            if call_args.kwargs.get("expected_uid") is not None:
+                actual_uid = call_args.kwargs["expected_uid"]
+            elif call_args.args:
+                actual_uid = call_args.args[0]
+            else:
+                actual_uid = None
+            self.assertEqual(
+                actual_uid,
+                bytes(uid[:4]),
+                "_halt_and_reselect must receive expected_uid matching the tag UID",
+            )
+
+    def test_uid_mismatch_fills_remaining_sectors_with_none(self):
+        """A UID mismatch on re-select must abort remaining sectors (fill with None)."""
+        dev = self._make_device()
+        # First reselect succeeds; second fails with UID mismatch (returns False)
+        dev._halt_and_reselect = MagicMock(side_effect=[True, False])
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        result = dev.read_authenticated_blocks(uid, keys, num_sectors=4)
+
+        # Sector 2 and 3 must be None
+        for blk in (8, 9, 10, 12, 13, 14):
+            self.assertIsNone(result.get(blk),
+                              "Block %d should be None after UID mismatch" % blk)
+
+
+class TestHaltAndReSelectUidValidation(unittest.TestCase):
+    """_halt_and_reselect must validate re-selected UID against expected_uid."""
+
+    def _make_device(self):
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(_make_device().MI_OK, None))
+        return dev
+
+    def test_uid_match_returns_true(self):
+        """Returns True when re-selected UID matches expected_uid."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        dev._anticoll_and_select = MagicMock(return_value=[0xC2, 0xC3, 0x04, 0xEB])
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertTrue(result)
+
+    def test_uid_mismatch_returns_false(self):
+        """Returns False when re-selected UID does not match expected_uid."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        # Re-select returns a different tag's UID
+        dev._anticoll_and_select = MagicMock(return_value=[0xAA, 0xBB, 0xCC, 0xDD])
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertFalse(result)
+
+    def test_no_expected_uid_accepts_any_tag(self):
+        """When expected_uid is None (default), any re-selected UID is accepted."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        dev._anticoll_and_select = MagicMock(return_value=[0xAA, 0xBB, 0xCC, 0xDD])
+
+        result = dev._halt_and_reselect()
+
+        self.assertTrue(result)
+
+    def test_wupa_failure_returns_false(self):
+        """Returns False when WUPA gets no response."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_NOTAGERR, None))
+        dev._anticoll_and_select = MagicMock(return_value=[0xC2, 0xC3, 0x04, 0xEB])
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertFalse(result)
+        dev._anticoll_and_select.assert_not_called()
+
+    def test_select_failure_returns_false(self):
+        """Returns False when anticollision + SELECT fails after WUPA."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        dev._anticoll_and_select = MagicMock(return_value=None)
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertFalse(result)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
