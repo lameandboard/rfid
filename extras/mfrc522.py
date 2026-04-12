@@ -628,7 +628,7 @@ class MFRC522Device:
 
     # ---------- MIFARE Classic authenticated reads ----------
 
-    def _halt_and_reselect(self) -> bool:
+    def _halt_and_reselect(self, expected_uid: Optional[bytes] = None) -> bool:
         """Halt the active tag then re-SELECT it so that a fresh sector authentication
         can be issued.
 
@@ -650,10 +650,20 @@ class MFRC522Device:
           2. Send ISO 14443-3A HALT (0x50 0x00 + CRC) — tag enters HALT state.
           3. Wait ≥ 5 ms for the tag to process the command.
           4. Send WUPA (0x52) — REQA is ignored by halted tags; WUPA wakes them.
-          5. Wait ≥ 5 ms after WUPA before issuing AUTH.
-          6. Run anticollision + SELECT to return the tag to ACTIVE state.
+          5. Run anticollision + SELECT to return the tag to ACTIVE state.
+          6. Wait ≥ 5 ms after re-select before issuing AUTH.
 
-        Returns True on success (tag re-selected), False if WUPA or re-select fails.
+        Parameters
+        ----------
+        expected_uid : bytes or None
+            When provided, the re-selected tag UID must match (first
+            ``len(expected_uid)`` bytes).  A mismatch returns ``False`` so the
+            caller aborts rather than continuing authenticated reads/writes on a
+            different tag — a risk when multiple tags are in the RF field, since
+            WUPA wakes *all* halted tags simultaneously.
+
+        Returns True on success (tag re-selected, UID matches if checked).
+        Returns False if WUPA, re-select, or UID validation fails.
         The caller should abort reading remaining sectors on False.
         """
         # Step 1: clear the Crypto1 cipher flag before halting.
@@ -682,6 +692,17 @@ class MFRC522Device:
         if reselect_uid is None:
             self._dbg("mfrc522.halt_and_reselect select_failed")
             return False
+
+        # Validate UID when requested to guard against silently switching to a
+        # different tag (WUPA wakes all halted tags in the RF field).
+        if expected_uid is not None:
+            got_uid = bytes(reselect_uid[:len(expected_uid)])
+            if got_uid != bytes(expected_uid):
+                self._dbg(
+                    "mfrc522.halt_and_reselect uid_mismatch expected=%s got=%s" % (
+                        bytes(expected_uid).hex(), got_uid.hex())
+                )
+                return False
 
         # Step 6: 5 ms settling time after SELECT before AUTH.
         if self._reactor is None:
@@ -786,7 +807,7 @@ class MFRC522Device:
             # the MFRC522 Crypto1 cipher is fully reset before the next AUTH
             # command.  See _halt_and_reselect() docstring for full rationale.
             if sector > 0:
-                if not self._halt_and_reselect():
+                if not self._halt_and_reselect(expected_uid=bytes(uid[:4])):
                     self._dbg(
                         "mfrc522.read_auth_blocks sector=%d halt_reselect_failed — "
                         "aborting remaining sectors" % sector
@@ -1602,7 +1623,7 @@ class MFRC522Device:
             # Between consecutive sectors: HALT + re-SELECT to reset Crypto1 state.
             # See _halt_and_reselect() for full rationale.
             if prev_sector is not None:
-                if not self._halt_and_reselect():
+                if not self._halt_and_reselect(expected_uid=uid_bytes):
                     self._dbg(
                         "mfrc522.write_auth_blocks sector=%d halt_reselect_failed" % sector
                     )
@@ -1723,7 +1744,7 @@ class MFRC522Device:
         while offset < padded_len:
             # Between consecutive sectors: HALT + re-SELECT to reset Crypto1 state.
             if not first_sector:
-                if not self._halt_and_reselect():
+                if not self._halt_and_reselect(expected_uid=uid_bytes):
                     self._dbg(
                         "mfrc522._write_mifare_classic_json halt_reselect_failed sector=%d"
                         % sector

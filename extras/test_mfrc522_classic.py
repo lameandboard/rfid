@@ -920,6 +920,110 @@ class TestReadAuthenticatedBlocksHaltReselect(unittest.TestCase):
         # _halt_and_reselect must be called twice: before sector 1 and before sector 2
         self.assertEqual(dev._halt_and_reselect.call_count, 2)
 
+    def test_halt_reselect_receives_expected_uid(self):
+        """_halt_and_reselect must be called with the tag UID as expected_uid."""
+        dev = self._make_device()
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        dev.read_authenticated_blocks(uid, keys, num_sectors=3)
+
+        # Every call must have been passed expected_uid=bytes(uid[:4])
+        for call_args in dev._halt_and_reselect.call_args_list:
+            self.assertEqual(
+                call_args.kwargs.get("expected_uid") or call_args.args[0] if call_args.args else call_args.kwargs.get("expected_uid"),
+                bytes(uid[:4]),
+                "_halt_and_reselect must receive expected_uid matching the tag UID",
+            )
+
+    def test_uid_mismatch_fills_remaining_sectors_with_none(self):
+        """A UID mismatch on re-select must abort remaining sectors (fill with None)."""
+        dev = self._make_device()
+        # First reselect succeeds; second fails with UID mismatch (returns False)
+        dev._halt_and_reselect = MagicMock(side_effect=[True, False])
+        uid = bytes.fromhex("C2C304EB")
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+
+        result = dev.read_authenticated_blocks(uid, keys, num_sectors=4)
+
+        # Sector 2 and 3 must be None
+        for blk in (8, 9, 10, 12, 13, 14):
+            self.assertIsNone(result.get(blk),
+                              "Block %d should be None after UID mismatch" % blk)
+
+
+class TestHaltAndReSelectUidValidation(unittest.TestCase):
+    """_halt_and_reselect must validate re-selected UID against expected_uid."""
+
+    def _make_device(self):
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(_make_device().MI_OK, None))
+        return dev
+
+    def test_uid_match_returns_true(self):
+        """Returns True when re-selected UID matches expected_uid."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        dev._anticoll_and_select = MagicMock(return_value=[0xC2, 0xC3, 0x04, 0xEB])
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertTrue(result)
+
+    def test_uid_mismatch_returns_false(self):
+        """Returns False when re-selected UID does not match expected_uid."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        # Re-select returns a different tag's UID
+        dev._anticoll_and_select = MagicMock(return_value=[0xAA, 0xBB, 0xCC, 0xDD])
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertFalse(result)
+
+    def test_no_expected_uid_accepts_any_tag(self):
+        """When expected_uid is None (default), any re-selected UID is accepted."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        dev._anticoll_and_select = MagicMock(return_value=[0xAA, 0xBB, 0xCC, 0xDD])
+
+        result = dev._halt_and_reselect()
+
+        self.assertTrue(result)
+
+    def test_wupa_failure_returns_false(self):
+        """Returns False when WUPA gets no response."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_NOTAGERR, None))
+        dev._anticoll_and_select = MagicMock(return_value=[0xC2, 0xC3, 0x04, 0xEB])
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertFalse(result)
+        dev._anticoll_and_select.assert_not_called()
+
+    def test_select_failure_returns_false(self):
+        """Returns False when anticollision + SELECT fails after WUPA."""
+        dev = _make_device()
+        dev.halt_tag = MagicMock()
+        dev._clear_mask = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, None))
+        dev._anticoll_and_select = MagicMock(return_value=None)
+
+        result = dev._halt_and_reselect(expected_uid=bytes.fromhex("C2C304EB"))
+
+        self.assertFalse(result)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
