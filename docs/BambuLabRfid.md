@@ -15,7 +15,9 @@ and logged by `rfid.py` after a successful authenticated read.
 
 Bambu Lab spool tags are **MIFARE Classic 1K** chips (ISO/IEC 14443 Type A,
 13.56 MHz) with a 4-byte UID and 16 sectors × 4 blocks × 16 bytes = 1 024
-bytes of user memory.
+bytes total.  Of those, 16 sector trailer blocks (keys + access bits) and the
+manufacturer block (sector 0 block 0) are not user data, leaving 752 bytes of
+usable data storage.
 
 Each sector's **Key A** is derived per-UID using HKDF-SHA256:
 

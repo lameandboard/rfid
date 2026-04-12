@@ -1543,9 +1543,9 @@ def format_bambu_info(info: dict, uid_hex: Optional[str] = None) -> str:
       Weight             : 1000 g
       Filament Length    : 330 m
       Production Date    : 2024_03_15_10_30
-      Drying             : 55 °C × 8 h
+      Drying             : 55 °C x 8 h
       Bed Temperature    : 60 °C
-      Hotend Range       : 190–220 °C
+      Hotend Range       : 190-220 °C
     """
     lines = ["=== Bambu Lab RFID Tag ==="]
 

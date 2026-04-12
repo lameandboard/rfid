@@ -1274,9 +1274,13 @@ class Rfid:
                                         summary = _tag_parser.format_bambu_info(
                                             filament_info, uid_hex=uid_hex
                                         )
-                                        self._log.info(
-                                            "rfid[%s]: %s", self.name, summary
-                                        )
+                                        # Prefix every line with the reader name so
+                                        # each line is attributable in syslog /
+                                        # journald / file-tail output where log
+                                        # records are not grouped.
+                                        prefix = f"rfid[{self.name}]: "
+                                        for line in summary.splitlines():
+                                            self._log.info("%s%s", prefix, line)
                                     else:
                                         self._debug(
                                             f"rfid[{self.name}]: Bambu tag parsed"
