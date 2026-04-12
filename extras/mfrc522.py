@@ -702,19 +702,69 @@ class MFRC522Device:
         dict mapping absolute block index → 16-byte data bytes.
         Sectors that fail authentication store None for their data blocks.
         The sector trailer block (block 3 of each sector) is not included.
+
+        Implementation note — inter-sector re-select
+        ---------------------------------------------
+        MIFARE Classic sector-to-sector re-authentication should work without
+        re-selecting the tag, but the SPI round-trip overhead in Klipper's MCU
+        bridge (Python → MCU firmware → RF) can push total inter-auth latency
+        beyond the tag's active-session window.  The result is that every sector
+        after sector 0 fails authentication with MFCrypto1On=0 even though the
+        keys are correct.
+
+        The fix: before authenticating each sector after sector 0, issue HALT
+        (while MFCrypto1On is still set so the tag accepts an encrypted HALT),
+        clear MFCrypto1On, then WUPA + anticoll + select to re-establish a fresh
+        selected state before the next AUTH command.  WUPA wakes both HALT-state
+        and IDLE-state tags, so the same path handles both successful and failed
+        prior sectors.
         """
         auth_cmd = self.PICC_AUTHENT1B if use_key_b else self.PICC_AUTHENT1A
         result: dict = {}
+        # Normalise uid to bytes for _auth_mifare_block.
+        uid_bytes: bytes = bytes(uid) if not isinstance(uid, bytes) else uid
+
         for sector in range(num_sectors):
+            # For every sector after the first: end the previous RF session and
+            # re-select the tag before authenticating the new sector.
+            if sector > 0:
+                # Halt while MFCrypto1On may still be set (encrypted HALT accepted by tag).
+                self.halt_tag()
+                self._clear_mask(self.Status2Reg, 0x08)  # clear MFCrypto1On
+                # WUPA wakes both HALT-state (cleanly halted) and IDLE-state
+                # (tag reset itself after a prior auth failure) tags.
+                st, _ = self.request(self.PICC_WUPA)
+                if st != self.MI_OK:
+                    self._dbg(
+                        "mfrc522.read_auth_blocks sector=%d wupa_failed"
+                        " — tag left field" % sector
+                    )
+                    for s in range(sector, num_sectors):
+                        for blk in range(3):
+                            result.setdefault(s * 4 + blk, None)
+                    break
+                new_uid = self._anticoll_and_select()
+                if new_uid is None:
+                    self._dbg(
+                        "mfrc522.read_auth_blocks sector=%d reselect_failed" % sector
+                    )
+                    for s in range(sector, num_sectors):
+                        for blk in range(3):
+                            result.setdefault(s * 4 + blk, None)
+                    break
+                uid_bytes = bytes(new_uid)
+
             key = key_list[sector] if sector < len(key_list) else bytes(6)
             # Trailer block = sector * 4 + 3
             trailer_block = sector * 4 + 3
             self._dbg("mfrc522.read_auth_blocks sector=%d trailer=%d key=%s" % (
                 sector, trailer_block, key.hex()))
-            if not self._auth_mifare_block(auth_cmd, trailer_block, key, uid):
+            if not self._auth_mifare_block(auth_cmd, trailer_block, key, uid_bytes):
                 self._dbg("mfrc522.read_auth_blocks sector=%d auth_failed trailer=%d" % (
                     sector, trailer_block))
-                # Clear crypto state before next sector
+                # Auth failed: tag is now in IDLE.  Clear crypto (no-op since auth
+                # never established it) so the re-select at the top of the next
+                # iteration can proceed cleanly.
                 self._clear_mask(self.Status2Reg, 0x08)
                 # Pre-fill None for the three data blocks so callers get a consistent index map
                 for blk_in_sector in range(3):
@@ -727,8 +777,12 @@ class MFRC522Device:
                     self._dbg("mfrc522.read_auth_blocks sector=%d block=%d read_failed" % (
                         sector, abs_block))
                 result[abs_block] = data
-            # Clear MFCrypto1On before authenticating next sector
-            self._clear_mask(self.Status2Reg, 0x08)
+            # MFCrypto1On is intentionally left set here.  The halt_tag() at the
+            # top of the next iteration issues an encrypted HALT so the tag
+            # transitions cleanly to HALT state before MFCrypto1On is cleared.
+
+        # Final cleanup: ensure MFCrypto1On is cleared before returning.
+        self._clear_mask(self.Status2Reg, 0x08)
         return result
 
     def read_mifare_classic_tag(self, key_list: list, num_sectors: int = 16) -> Optional[dict]:

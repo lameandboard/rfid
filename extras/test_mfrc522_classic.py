@@ -513,5 +513,205 @@ class TestAuthFailCache(unittest.TestCase):
         self.rfid._try_bambu_read.assert_called_once_with("F29CDAEF")
 
 
+
+# ---------------------------------------------------------------------------
+# Tests: read_authenticated_blocks — inter-sector re-select
+# ---------------------------------------------------------------------------
+
+class TestReadAuthenticatedBlocksReselect(unittest.TestCase):
+    """read_authenticated_blocks must halt + WUPA + re-select between sectors."""
+
+    def _make_dev_all_ok(self, num_sectors=3):
+        """Return an MFRC522Device whose auth/read/halt/request/select all succeed."""
+        dev = _make_device()
+        uid = [0xF2, 0x9C, 0xDA, 0xEF]
+        dev.halt_tag = MagicMock()
+        dev.request = MagicMock(return_value=(dev.MI_OK, [0x04, 0x00]))
+        dev._anticoll_and_select = MagicMock(return_value=list(uid))
+        dev._auth_mifare_block = MagicMock(return_value=True)
+        dev._read_mifare_block = MagicMock(return_value=bytes(16))
+        dev._clear_mask = MagicMock()
+        return dev, bytes(uid)
+
+    def test_halt_called_between_sectors(self):
+        """halt_tag must be called once per sector transition (num_sectors-1 times)."""
+        dev, uid = self._make_dev_all_ok(num_sectors=3)
+        key_list = [bytes(6)] * 3
+        dev.read_authenticated_blocks(uid, key_list, num_sectors=3)
+        # halt_tag is called at sector 1 and sector 2 transitions (before each re-select)
+        self.assertGreaterEqual(dev.halt_tag.call_count, 2,
+                                "halt_tag must be called between sectors")
+
+    def test_wupa_sent_between_sectors(self):
+        """PICC_WUPA must be sent once for each sector after sector 0."""
+        dev, uid = self._make_dev_all_ok()
+        key_list = [bytes(6)] * 3
+        dev.read_authenticated_blocks(uid, key_list, num_sectors=3)
+        wupa_calls = [c for c in dev.request.call_args_list
+                      if c.args and c.args[0] == dev.PICC_WUPA]
+        self.assertEqual(len(wupa_calls), 2,
+                         "WUPA must be sent once per sector after sector 0 (2 times for 3 sectors)")
+
+    def test_anticoll_and_select_called_between_sectors(self):
+        """_anticoll_and_select must be called once per sector after sector 0."""
+        dev, uid = self._make_dev_all_ok()
+        key_list = [bytes(6)] * 3
+        dev.read_authenticated_blocks(uid, key_list, num_sectors=3)
+        self.assertEqual(dev._anticoll_and_select.call_count, 2,
+                         "_anticoll_and_select must be called between sectors")
+
+    def test_sector0_data_read_without_reselect(self):
+        """Sector 0 must be read without any halt/wupa/select (no re-select for first sector)."""
+        dev, uid = self._make_dev_all_ok()
+        key_list = [bytes(6)] * 1
+        dev.read_authenticated_blocks(uid, key_list, num_sectors=1)
+        # With only one sector, halt and re-select must NOT be called.
+        dev.halt_tag.assert_not_called()
+        dev._anticoll_and_select.assert_not_called()
+        wupa_calls = [c for c in dev.request.call_args_list
+                      if c.args and c.args[0] == dev.PICC_WUPA]
+        self.assertEqual(len(wupa_calls), 0,
+                         "WUPA must NOT be sent for single-sector read")
+
+    def test_wupa_failure_fills_remaining_sectors_with_none(self):
+        """When WUPA fails mid-read, all remaining sector blocks must be None."""
+        dev, uid = self._make_dev_all_ok()
+        # Override request so WUPA always fails (simulates tag leaving the field)
+        dev.request = MagicMock(return_value=(dev.MI_NOTAGERR, None))
+        key_list = [bytes(6)] * 3
+        result = dev.read_authenticated_blocks(uid, key_list, num_sectors=3)
+        # Sector 0 blocks (0, 1, 2) must have been read successfully
+        self.assertIsNotNone(result.get(0), "Sector 0 block 0 should have data")
+        self.assertIsNotNone(result.get(1), "Sector 0 block 1 should have data")
+        self.assertIsNotNone(result.get(2), "Sector 0 block 2 should have data")
+        # Sectors 1 and 2 blocks must be None (WUPA failed, tag left field)
+        for blk in (4, 5, 6, 8, 9, 10):
+            self.assertIsNone(result.get(blk),
+                              f"Block {blk} must be None after WUPA failure")
+
+    def test_reselect_failure_fills_remaining_sectors_with_none(self):
+        """When _anticoll_and_select fails, all remaining sector blocks must be None."""
+        dev, uid = self._make_dev_all_ok()
+        # request (WUPA) succeeds, but re-select fails
+        dev._anticoll_and_select = MagicMock(return_value=None)
+        key_list = [bytes(6)] * 3
+        result = dev.read_authenticated_blocks(uid, key_list, num_sectors=3)
+        # Sector 0 must have been read
+        self.assertIsNotNone(result.get(1), "Sector 0 block 1 should have data")
+        # Sectors 1+ must be None
+        for blk in (4, 5, 6, 8, 9, 10):
+            self.assertIsNone(result.get(blk),
+                              f"Block {blk} must be None after re-select failure")
+
+    def test_auth_failure_does_not_stop_subsequent_sectors(self):
+        """An auth failure on one sector must not prevent reading subsequent sectors."""
+        dev, uid = self._make_dev_all_ok()
+        # Sector 1 auth fails; sectors 0 and 2 succeed
+        auth_results = {0: True, 1: False, 2: True}
+        sector_calls = [0]
+
+        def _auth_side_effect(cmd, trailer, key, uid_b):
+            sector = (trailer - 3) // 4
+            return auth_results.get(sector, True)
+
+        dev._auth_mifare_block = MagicMock(side_effect=_auth_side_effect)
+        key_list = [bytes(6)] * 3
+        result = dev.read_authenticated_blocks(uid, key_list, num_sectors=3)
+        # Sector 0 and 2 blocks must have data; sector 1 blocks must be None
+        self.assertIsNotNone(result.get(0), "Sector 0 block 0 should have data")
+        self.assertIsNone(result.get(4), "Sector 1 block 0 must be None (auth failed)")
+        self.assertIsNone(result.get(5), "Sector 1 block 1 must be None (auth failed)")
+        self.assertIsNotNone(result.get(8), "Sector 2 block 0 should have data")
+
+
+# ---------------------------------------------------------------------------
+# Tests: _scan_once — filament_info propagation in result dict
+# ---------------------------------------------------------------------------
+
+class TestScanOnceFilamentInfoPropagation(unittest.TestCase):
+    """_scan_once must include filament_info in result when Bambu blocks parse successfully."""
+
+    def setUp(self):
+        self.rfid = _make_rfid(lanes="lane3")
+        self.lane = "lane3"
+        _rfid_module._UID_SPOOL_CACHE.clear()
+
+    def _wire_reader(self, tags):
+        self.rfid.reader = MagicMock()
+        self.rfid.reader.read_all_tags = MagicMock(return_value=tags)
+        self.rfid.uid_fast_scan = False
+
+    def test_filament_info_in_result_when_parsed(self):
+        """When Bambu blocks parse successfully, result must include filament_info dict."""
+        self._wire_reader([_classic_tag_entry()])
+        fi = {
+            "material": "PLA",
+            "color_hex": "FF0000",
+            "brand": "Bambu Lab",
+            "spoolman_id": None,
+            "tag_format": "bambu",
+        }
+        self.rfid._try_bambu_read = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
+        self.rfid._apply_tag_parser = MagicMock(return_value=fi)
+
+        result = self.rfid._scan_once(self.lane, max_pages=135)
+
+        self.assertIsNotNone(result.get("filament_info"),
+                             "filament_info must be present when Bambu parse succeeds")
+        self.assertEqual(result["filament_info"]["material"], "PLA")
+        self.assertEqual(result["filament_info"]["color_hex"], "FF0000")
+
+    def test_filament_info_none_when_parser_returns_none(self):
+        """When tag parser returns None, result filament_info must be None."""
+        self._wire_reader([_classic_tag_entry()])
+        self.rfid._try_bambu_read = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
+        self.rfid._apply_tag_parser = MagicMock(return_value=None)
+
+        result = self.rfid._scan_once(self.lane, max_pages=135)
+
+        self.assertIsNone(result.get("filament_info"),
+                          "filament_info must be None when parser returns None")
+
+    def test_filament_info_none_for_non_classic_tag(self):
+        """NTAG/Ultralight tags must not have filament_info in result."""
+        ntag_entry = {
+            "uid": [0x01, 0x02, 0x03, 0x04],
+            "uid_hex": "01020304",
+            "raw_bytes": b"\x00" * 32,
+            "raw_len": 32,
+            "spoolman_id": None,
+            "tag_text": "",
+            "sak": 0x00,
+        }
+        self._wire_reader([ntag_entry])
+        self.rfid._try_bambu_read = MagicMock(return_value=None)
+
+        result = self.rfid._scan_once(self.lane, max_pages=135)
+
+        self.assertIsNone(result.get("filament_info"),
+                          "filament_info must be None for non-Bambu tags")
+
+    def test_spoolman_id_none_but_filament_info_present_gives_valid_result(self):
+        """When Bambu parser returns spoolman_id=None, result must still be returned."""
+        self._wire_reader([_classic_tag_entry()])
+        fi = {
+            "material": "PETG",
+            "color_hex": "00FF00",
+            "brand": "Bambu Lab",
+            "spoolman_id": None,
+            "tag_format": "bambu",
+        }
+        self.rfid._try_bambu_read = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
+        self.rfid._apply_tag_parser = MagicMock(return_value=fi)
+
+        result = self.rfid._scan_once(self.lane, max_pages=135)
+
+        # Scan must not return None — uid was read
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("uid_hex"), "C2C304EB")
+        self.assertIsNone(result.get("spoolman_id"))
+        self.assertEqual(result["filament_info"]["material"], "PETG")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

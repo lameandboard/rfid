@@ -1140,6 +1140,16 @@ class Rfid:
                                 if filament_info is not None:
                                     sid = filament_info.get("spoolman_id")
                                     tag["spoolman_id"] = sid
+                                    tag["filament_info"] = filament_info
+                                    if filament_info.get("material"):
+                                        self._log.info(
+                                            "rfid[%s]: Bambu tag parsed uid=%s"
+                                            " material=%s color=#%s brand=%s",
+                                            self.name, uid_hex,
+                                            filament_info.get("material"),
+                                            filament_info.get("color_hex") or "?",
+                                            filament_info.get("brand") or "?",
+                                        )
                             else:
                                 # Cache this failure for the rest of the scan window.
                                 self._auth_fail_uids.setdefault(lane, {})[uid_hex] = (
@@ -1168,6 +1178,7 @@ class Rfid:
                             "raw_len": tag.get("raw_len", 0),
                             "raw_bytes": tag.get("raw_bytes") or b"",
                             "spoolman_id": sid,
+                            "filament_info": tag.get("filament_info"),
                             "ts": time.time(),
                         }
                 # No unassigned tag found — return first tag so caller can log it,
@@ -1904,6 +1915,32 @@ class Rfid:
                                 return self.reactor.NEVER
                         except (json.JSONDecodeError, ValueError):
                             pass
+                        # Bambu tag: filament_info was parsed from authenticated blocks.
+                        # Trigger the same auto-create flow as for OpenSpool tags.
+                        _fi = result.get("filament_info")
+                        if _fi is not None and _fi.get("material"):
+                            blocked_uids.add(uid_hex)
+                            self._clear_scan_state(lane, reason="bambu_auto_create_defer")
+                            self._log.info(
+                                "rfid[%s]: Bambu tag auto-create triggered"
+                                " lane=%s uid=%s material=%s color=#%s",
+                                self.name, lane, uid_hex,
+                                _fi.get("material"),
+                                _fi.get("color_hex") or "?",
+                            )
+                            _lane, _uid, _data = lane, uid_hex, dict(_fi)
+                            if self._spoolman_executor is not None:
+                                self._spoolman_run_async(
+                                    lambda l=_lane, u=_uid, d=_data:
+                                        self._do_auto_create_spool(l, u, d)
+                                )
+                            else:
+                                self._log.warning(
+                                    "rfid[%s]: not scheduling Bambu auto-create for uid=%s lane=%s"
+                                    " (executor not available)",
+                                    self.name, uid_hex, lane,
+                                )
+                            return self.reactor.NEVER
                     # No early-commit: fire off background UID lookup for sync scans; for
                     # AFC event-driven scans defer the Spoolman lookup to _handle_lane_loaded
                     # so it never runs inside the hot scan-timer / SPI loop.
@@ -1915,6 +1952,23 @@ class Rfid:
                         )
                         blocked_uids.add(uid_hex)  # prevent re-dispatch this window
                         self._dispatch_uid_resolution(lane, uid_hex, tag_text)
+                        # For Bambu tags (filament_info parsed, spoolman_id None), store a
+                        # partial pending entry now so _run_scan_window_sync can return
+                        # something for _event_scan_begin to process (auto-create or display),
+                        # and to prevent a false "no tag found" when a tag was present.
+                        if lane not in self._pending:
+                            _fi = result.get("filament_info")
+                            if _fi is not None and _fi.get("material"):
+                                self._pending[lane] = {
+                                    "lane": lane,
+                                    "spoolman_id": None,
+                                    "uid_hex": uid_hex,
+                                    "tag_text": tag_text,
+                                    "raw_bytes": result.get("raw_bytes"),
+                                    "filament_info": _fi,
+                                    "ts": time.time(),
+                                    "timeout": self.event_timeout,
+                                }
                         # Fall through — scan timer continues looking for other spool_id tags.
                     else:
                         # AFC event path: record UID as seen but do NOT query Spoolman here.
@@ -2744,13 +2798,17 @@ class Rfid:
                     self._debug(f"rfid[{self.name}]: pending stored for {port}")
                     return True
             if self.auto_create_spool and uid != "unknown" and _tag_parser is not None:
-                raw_bytes = result.get("raw_bytes") or b""
-                filament_info = self._apply_tag_parser(uid, raw_bytes, result.get("tag_text"))
-                # If raw bytes didn't yield a result and we have a UID, try Bambu authenticated read.
-                if filament_info is None and uid != "unknown":
-                    bambu_blocks = self._try_bambu_read(uid)
-                    if bambu_blocks is not None:
-                        filament_info = self._apply_tag_parser(uid, bambu_blocks)
+                # Prefer filament_info already parsed during the scan (e.g. from
+                # Bambu partial pending), so we don't need a second tag read.
+                filament_info = result.get("filament_info")
+                if filament_info is None:
+                    raw_bytes = result.get("raw_bytes") or b""
+                    filament_info = self._apply_tag_parser(uid, raw_bytes, result.get("tag_text"))
+                    # If raw bytes didn't yield a result and we have a UID, try Bambu authenticated read.
+                    if filament_info is None and uid != "unknown":
+                        bambu_blocks = self._try_bambu_read(uid)
+                        if bambu_blocks is not None:
+                            filament_info = self._apply_tag_parser(uid, bambu_blocks)
                 if filament_info:
                     self._debug(
                         f"rfid[{self.name}]: auto_create_spool: parsed tag"
