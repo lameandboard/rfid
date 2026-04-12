@@ -413,7 +413,41 @@ class TestBambuKeyDerivation(unittest.TestCase):
         uid = bytes.fromhex("C2C304EB")
         self.assertEqual(_rtp._bambu_derive_keys(uid), _rtp._bambu_derive_keys(uid))
 
-    def test_derive_keys_import_error_when_no_pycryptodome(self):
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_master_is_ikm_not_salt(self):
+        """HKDF must use _BAMBU_MASTER_KEY as IKM and uid as salt (not swapped).
+
+        pycryptodome HKDF signature: HKDF(master, key_len, salt, ...).
+        Swapping master and salt produces completely different (wrong) keys and
+        causes silent authentication failure on every Bambu tag sector.
+
+        This test guards against the regression where uid_bytes was accidentally
+        passed as the first (master/IKM) argument and _BAMBU_MASTER_KEY as salt.
+        """
+        from Crypto.Protocol.KDF import HKDF as _HKDF_direct
+        from Crypto.Hash import SHA256 as _SHA256_direct
+
+        uid = bytes.fromhex("C2C304EB")
+        master = _rtp._BAMBU_MASTER_KEY
+
+        # Correctly derived keys (master as IKM, uid as salt)
+        correct_raw = _HKDF_direct(master, 6, uid, _SHA256_direct, 16,
+                                   context=b"RFID-A\x00")
+        correct_keys = list(correct_raw)
+
+        # Swapped (wrong) derivation (uid as IKM, master as salt)
+        swapped_raw = _HKDF_direct(uid, 6, master, _SHA256_direct, 16,
+                                   context=b"RFID-A\x00")
+        swapped_keys = list(swapped_raw)
+
+        # The function must match the correctly-ordered derivation
+        actual_keys = _rtp._bambu_derive_keys(uid)
+        self.assertEqual(actual_keys, correct_keys,
+                         "Keys must match HKDF(master=_BAMBU_MASTER_KEY, salt=uid)")
+        self.assertNotEqual(actual_keys, swapped_keys,
+                            "Keys must NOT match the swapped (wrong) derivation")
+
+
         """_bambu_derive_keys raises ImportError when pycryptodome is unavailable."""
         orig = _rtp._PYCRYPTODOME_OK
         try:
