@@ -51,10 +51,14 @@ Optional dependencies
 Bambu Lab tag authentication — how it works
 --------------------------------------------
 Bambu Lab spool tags are MIFARE Classic 1K chips with per-tag, per-sector
-encryption keys derived via HKDF-SHA256:
+encryption keys derived via HKDF-SHA256.  The derivation procedure is adapted
+from MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp (GPLv3):
+  https://github.com/MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp/blob/c8aa59e6d4c132f9e78bde24d791bbb330a12b7d/source/app/src/main/java/app/mrb/bambuspoolpal/nfc/NfcTagProcessor.kt#L53-L139
+No code was copied; the algorithm was reimplemented in Python from the
+published procedure.
 
-  IKM   = static 16-byte Bambu device master key (see ``_BAMBU_MASTER_KEY``)
-  Salt  = 4-byte tag UID (unique per spool)
+  IKM   = 4-byte tag UID (unique per spool) — uid is the HKDF input key material
+  Salt  = static 16-byte Bambu device master key (see ``_BAMBU_MASTER_KEY``)
   Info  = b"RFID-A\\x00"
   Output = 96 bytes split into 16 × 6-byte MIFARE sector keys
 
@@ -481,23 +485,27 @@ def _detect_bambu(raw: bytes) -> bool:
 # ---------------------------------------------------------------------------
 # Bambu Lab HKDF sector-key derivation
 # ---------------------------------------------------------------------------
-# Bambu Lab MIFARE Classic 1K tags use per-UID sector keys derived from a
-# static device master key via HKDF-SHA256.  The algorithm is documented in
-# the publicly available Bambu-Research-Group/RFID-Tag-Guide repository and
-# has been independently re-implemented here from first principles without
-# copying any code.
+# Adapted from MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp
+# (GPLv3), NfcTagProcessor.kt lines 53–139, commit c8aa59e6d4c132f9e78bde24d791bbb330a12b7d:
+#   https://github.com/MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp/blob/c8aa59e6d4c132f9e78bde24d791bbb330a12b7d/source/app/src/main/java/app/mrb/bambuspoolpal/nfc/NfcTagProcessor.kt
+# No code was copied; the procedure was faithfully reimplemented in Python.
+#
+# The Android app uses BouncyCastle's HKDFBytesGenerator with:
+#   HKDFParameters(uid, masterKey, context)
+#   → HKDFParameters(IKM=uid, salt=masterKey, info=context)
 #
 # Key derivation overview:
-#   IKM  (input key material) = _BAMBU_MASTER_KEY  (static 16-byte device key)
-#   Salt                       = tag UID bytes       (4 bytes, unique per tag)
-#   Info / context             = b"RFID-A\x00"       (7 bytes, incl. null)
-#   Output length per sector   = 6 bytes             (MIFARE Classic key width)
-#   Number of sector keys      = 16                  (one per MIFARE Classic 1K sector)
+#   IKM  (input key material) = tag UID bytes        (4 bytes, unique per tag)
+#   Salt                       = _BAMBU_MASTER_KEY    (static 16-byte device key)
+#   Info / context             = b"RFID-A\x00"        (7 bytes, incl. null)
+#   Output length              = sector_count × 6 bytes (96 bytes for 16 sectors)
 #
 # pycryptodome HKDF signature:
 #   HKDF(master, key_len, salt, hashmod, num_keys=1, context=b"")
-#          ↑                ↑
-#         IKM             salt  ← note: master comes FIRST, then salt
+#   where 'master' is the IKM (first positional argument).
+#
+#   Correct call: HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, SHA256, 16, context=...)
+#                           ↑ IKM              ↑ salt
 #
 # Hardware requirements:
 #   Authenticated MIFARE Classic reads require hardware that supports the
@@ -515,8 +523,12 @@ _BAMBU_MASTER_KEY = bytes([
 def _bambu_derive_keys(uid_bytes: bytes) -> list:
     """Derive the 16 MIFARE sector Key-A values for a Bambu Lab tag.
 
-    Uses HKDF-SHA256 with the static Bambu master key as the IKM and the
-    tag UID as the salt.  Returns a list of 16 × 6-byte keys (one per MIFARE
+    Procedure adapted from MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp
+    (GPLv3), NfcTagProcessor.kt lines 53–139, commit c8aa59e6d4c132f9e78bde24d791bbb330a12b7d.
+    No code was copied; reimplemented from the published algorithm.
+
+    Uses HKDF-SHA256 with the tag UID as the IKM and the static Bambu master
+    key as the salt.  Returns a list of 16 × 6-byte keys (one per MIFARE
     Classic 1K sector, sectors 0-15).
 
     Parameters
@@ -535,10 +547,20 @@ def _bambu_derive_keys(uid_bytes: bytes) -> list:
 
     Notes
     -----
-    pycryptodome's HKDF signature is HKDF(master, key_len, salt, hashmod, …).
-    The FIRST argument is the IKM (master / input key material); the THIRD
-    argument is the salt.  This is easy to confuse — do not swap them or all
-    derived sector keys will be wrong and every authentication will fail.
+    The Android reference (BouncyCastle HKDFParameters) uses:
+      HKDFParameters(uid, masterKey, context)
+      → IKM=uid, salt=masterKey, info=context
+
+    pycryptodome's HKDF signature: HKDF(master, key_len, salt, hashmod, …)
+    where 'master' is the IKM (first argument).
+
+    Correct mapping:
+      HKDF(master=uid_bytes, key_len=6, salt=_BAMBU_MASTER_KEY, …)
+
+    WARNING: Do NOT swap uid_bytes and _BAMBU_MASTER_KEY.  The uid must be the
+    IKM (first argument) and _BAMBU_MASTER_KEY must be the salt (third argument),
+    matching the Android reference.  Swapping them produces completely wrong keys
+    and silent authentication failure on every sector.
     """
     if not _PYCRYPTODOME_OK:
         raise ImportError(
@@ -546,17 +568,13 @@ def _bambu_derive_keys(uid_bytes: bytes) -> list:
             "Install with: pip3 install pycryptodome"
         )
     # pycryptodome HKDF(master, key_len, salt, hashmod, num_keys, context):
-    #   master  = _BAMBU_MASTER_KEY  (IKM — the static Bambu device secret)
+    #   master  = uid_bytes          (IKM — tag UID, per Android HKDFParameters)
     #   key_len = 6                  (MIFARE Classic key width in bytes)
-    #   salt    = uid_bytes          (per-tag differentiator)
+    #   salt    = _BAMBU_MASTER_KEY  (static Bambu device secret, used as salt)
     #   num_keys= 16                 (one key per sector; internally derives
     #                                 96 bytes and splits into 16 × 6-byte keys)
     #   context = b"RFID-A\x00"     (7-byte info/context string)
-    #
-    # WARNING: Do NOT swap master and salt here.  uid_bytes must be the salt
-    # (third argument), not the master (first).  Swapping them produces
-    # completely wrong keys and silent authentication failure on the tag.
-    raw = _HKDF(_BAMBU_MASTER_KEY, 6, uid_bytes, _SHA256, 16, context=b"RFID-A\x00")
+    raw = _HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, _SHA256, 16, context=b"RFID-A\x00")
     return list(raw)
 
 
