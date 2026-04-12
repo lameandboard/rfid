@@ -668,8 +668,14 @@ class SpoolmanClient:
         """Create a new filament and return the filament dict."""
         body = {"name": name, "vendor_id": int(vendor_id), "material": material}
         # density and diameter are required by the Spoolman API; always send them.
-        body["density"] = float(density) if density is not None else _DENSITY_DEFAULT
-        body["diameter"] = float(diameter) if diameter is not None else 1.75
+        try:
+            body["density"] = float(density) if density is not None else _DENSITY_DEFAULT
+        except (TypeError, ValueError):
+            body["density"] = _DENSITY_DEFAULT
+        try:
+            body["diameter"] = float(diameter) if diameter is not None else 1.75
+        except (TypeError, ValueError):
+            body["diameter"] = 1.75
         if color_hex:
             body["color_hex"] = str(color_hex).lstrip("#").upper()
         return self._req("POST", "/api/v1/filament", body)

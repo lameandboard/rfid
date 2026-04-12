@@ -1032,5 +1032,62 @@ class TestHaltAndReSelectUidValidation(unittest.TestCase):
         self.assertFalse(result)
 
 
+# ---------------------------------------------------------------------------
+# Tests: rfid_tag_parser._parse_bambu_blocks — block-9 tray UID handling
+# ---------------------------------------------------------------------------
+
+class TestParseBambuBlocksTrayUID(unittest.TestCase):
+    """_parse_bambu_blocks() should hex-encode block 9 bytes as the tray UID."""
+
+    def _minimal_blocks(self, b9_bytes=None):
+        """Return a minimal blocks dict with the required material block (block 2)."""
+        blocks = {
+            2: b"PLA\x00" + b"\x00" * 12,  # basic filament type — required
+        }
+        if b9_bytes is not None:
+            blocks[9] = b9_bytes
+        return blocks
+
+    def test_tray_uid_hex_encodes_raw_bytes(self):
+        """block 9 raw bytes are returned as uppercase 32-char hex string."""
+        uid_bytes = bytes.fromhex("5F390A603AAB4B8FB1524EA53B16FA77")
+        blocks = self._minimal_blocks(b9_bytes=uid_bytes)
+        result = _rtp._parse_bambu_blocks(blocks)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("tray_uid"), "5F390A603AAB4B8FB1524EA53B16FA77")
+
+    def test_tray_uid_is_uppercase(self):
+        """tray_uid is always returned in uppercase."""
+        uid_bytes = bytes.fromhex("aabbccddeeff00112233445566778899")
+        blocks = self._minimal_blocks(b9_bytes=uid_bytes)
+        result = _rtp._parse_bambu_blocks(blocks)
+        self.assertIsNotNone(result)
+        tray_uid = result.get("tray_uid", "")
+        self.assertEqual(tray_uid, tray_uid.upper())
+        self.assertEqual(len(tray_uid), 32)
+
+    def test_all_zero_block9_gives_no_tray_uid(self):
+        """All-zero block 9 is treated as unwritten; tray_uid should be absent."""
+        blocks = self._minimal_blocks(b9_bytes=bytes(16))
+        result = _rtp._parse_bambu_blocks(blocks)
+        self.assertIsNotNone(result)
+        self.assertNotIn("tray_uid", result)
+
+    def test_missing_block9_gives_no_tray_uid(self):
+        """When block 9 is not present tray_uid should be absent."""
+        blocks = self._minimal_blocks()  # no b9_bytes
+        result = _rtp._parse_bambu_blocks(blocks)
+        self.assertIsNotNone(result)
+        self.assertNotIn("tray_uid", result)
+
+    def test_tray_uid_is_exactly_32_chars(self):
+        """tray_uid is always a 32-character string for a full 16-byte block."""
+        uid_bytes = bytes(range(16))
+        blocks = self._minimal_blocks(b9_bytes=uid_bytes)
+        result = _rtp._parse_bambu_blocks(blocks)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result.get("tray_uid", "")), 32)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

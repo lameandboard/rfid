@@ -1779,7 +1779,7 @@ class Rfid:
         if spool_id is None:
             self._log.warning(
                 "rfid: auto_create_spool: spool creation returned None lane=%s uid=%s"
-                " — check material/color_hex fields and Spoolman logs",
+                " — check material/OpenSpool type data and Spoolman API/logs",
                 lane, uid_hex,
             )
             return
