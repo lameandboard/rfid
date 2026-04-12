@@ -857,19 +857,20 @@ class Rfid:
 
     @staticmethod
     def _bambu_blocks_ok(result: Optional[dict]) -> bool:
-        """Return True only when required Bambu metadata blocks (1 and 4) are present.
+        """Return True only when required Bambu metadata blocks (2 and 5) are present.
 
-        Blocks 1 and 4 contain the material string and color/diameter/weight
-        respectively; without both we cannot parse meaningful filament info.
+        Block 2 contains the basic filament type string; block 5 contains color,
+        spool weight, and diameter.  Without both we cannot parse meaningful
+        filament info.  (Block numbering per BambuLabRfid.md.)
         """
         if result is None:
             return False
         blocks = result.get("blocks") or {}
-        b1 = blocks.get(1)
-        b4 = blocks.get(4)
+        b2 = blocks.get(2)
+        b5 = blocks.get(5)
         return (
-            isinstance(b1, (bytes, bytearray)) and len(b1) == 16
-            and isinstance(b4, (bytes, bytearray)) and len(b4) == 16
+            isinstance(b2, (bytes, bytearray)) and len(b2) == 16
+            and isinstance(b5, (bytes, bytearray)) and len(b5) == 16
         )
 
     def _try_bambu_read(
