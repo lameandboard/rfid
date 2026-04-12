@@ -967,6 +967,10 @@ class Rfid:
         # Fall back to the default MIFARE key (FFFFFFFFFFFF).
         read_method = getattr(self.reader, "read_mifare_classic_tag", None)
         if read_method is None:
+            self._debug(
+                f"rfid[{self.name}]: default key fallback skipped uid={uid_hex}"
+                " — reader has no read_mifare_classic_tag"
+            )
             return result
 
         self._log.warning(
