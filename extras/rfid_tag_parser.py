@@ -1510,6 +1510,128 @@ def is_bambu_tag(info: Optional[dict]) -> bool:
     return isinstance(info, dict) and info.get("tag_format") == "bambu"
 
 
+def format_bambu_info(info: dict, uid_hex: Optional[str] = None) -> str:
+    """Format a parsed Bambu Lab filament info dict into a human-readable summary.
+
+    Produces a labeled, multi-line string showing all available spool fields —
+    matching the data visible in the Bambu Lab Android app and public tag decoders
+    (e.g. queengooborg/Bambu-Lab-RFID-Tag-Guide, BambuSpoolPal).
+
+    Parameters
+    ----------
+    info:
+        Dict returned by ``parse_tag()`` for a Bambu Lab tag.
+    uid_hex:
+        Optional hardware UID hex string (4-byte MIFARE UID, e.g. ``"62F0E76B"``).
+        Shown as "Tag UID" in the summary to distinguish it from the Tray UID
+        stored inside the tag's block 9.
+
+    Returns
+    -------
+    Multi-line string suitable for passing to ``logging.info()``.
+
+    Example output
+    --------------
+    === Bambu Lab RFID Tag ===
+      Tag UID (hardware) : 62F0E76B
+      Tray UID           : 5F390A603AAB4B8FB1524EA53B16FA77
+      Filament Type      : PLA Basic
+      Material           : PLA
+      Material ID        : GFA50
+      Color              : #FF3700
+      Diameter           : 1.75 mm
+      Weight             : 1000 g
+      Filament Length    : 330 m
+      Production Date    : 2024_03_15_10_30
+      Drying             : 55 °C × 8 h
+      Bed Temperature    : 60 °C
+      Hotend Range       : 190–220 °C
+    """
+    lines = ["=== Bambu Lab RFID Tag ==="]
+
+    # Hardware UID (anti-collision UID from the MFRC522; 4 bytes for MIFARE Classic 1K)
+    if uid_hex:
+        lines.append(f"  Tag UID (hardware) : {uid_hex}")
+
+    # Tray UID — 16-byte ASCII hex string stored in block 9 of the tag.
+    # This is the "UID" shown by Bambu apps and tag decoders; it is NOT the
+    # same as the MIFARE anti-collision UID above.
+    tray_uid = info.get("tray_uid")
+    if tray_uid:
+        lines.append(f"  Tray UID           : {tray_uid}")
+
+    # Detailed filament type (e.g. "PLA Basic") comes from block 4.
+    # Basic material name (e.g. "PLA") comes from block 2.
+    material_detail = info.get("material_detail")
+    material = info.get("material")
+    if material_detail:
+        lines.append(f"  Filament Type      : {material_detail}")
+    if material:
+        lines.append(f"  Material           : {material}")
+
+    # Material IDs from the tray info index block (block 1).
+    # material_id is the SKU-style code (e.g. "GFA50").
+    # material_variant_id is the variant byte prefix (e.g. "GFL99").
+    material_id = info.get("material_id")
+    if material_id:
+        lines.append(f"  Material ID        : {material_id}")
+    material_variant_id = info.get("material_variant_id")
+    if material_variant_id:
+        lines.append(f"  Variant ID         : {material_variant_id}")
+
+    # Color as 6-digit HTML hex (no '#') from block 5 bytes 0-3 (RGBA).
+    color_hex = info.get("color_hex")
+    if color_hex:
+        lines.append(f"  Color              : #{color_hex}")
+    # Second color for multi-colour filaments (block 16, ABGR → RGBA).
+    second_color = info.get("second_color_hex")
+    if second_color:
+        lines.append(f"  Second Color       : #{second_color}")
+
+    # Physical spool dimensions from block 5.
+    diameter_mm = info.get("diameter_mm")
+    if diameter_mm is not None:
+        lines.append(f"  Diameter           : {diameter_mm:.2f} mm")
+    weight_g = info.get("weight_g")
+    if weight_g is not None:
+        lines.append(f"  Weight             : {weight_g} g")
+
+    # Filament length in metres from block 14 offset 4.
+    filament_length_m = info.get("filament_length_m")
+    if filament_length_m is not None:
+        lines.append(f"  Filament Length    : {filament_length_m} m")
+
+    # Production date as ASCII "yyyy_MM_dd_HH_mm" from block 12.
+    production_date = info.get("production_date")
+    if production_date:
+        lines.append(f"  Production Date    : {production_date}")
+
+    # Drying recommendation from block 6 bytes 0-3.
+    drying_temp = info.get("drying_temp")
+    drying_time_h = info.get("drying_time_h")
+    if drying_temp is not None and drying_time_h is not None:
+        lines.append(f"  Drying             : {drying_temp} \u00b0C \u00d7 {drying_time_h} h")
+    elif drying_temp is not None:
+        lines.append(f"  Drying Temp        : {drying_temp} \u00b0C")
+
+    # Bed temperature from block 6 bytes 6-7.
+    bed_temp = info.get("bed_temp")
+    if bed_temp is not None:
+        lines.append(f"  Bed Temperature    : {bed_temp} \u00b0C")
+
+    # Hotend temperature range from block 6 bytes 8-11.
+    min_temp = info.get("min_temp")
+    max_temp = info.get("max_temp")
+    if min_temp is not None and max_temp is not None:
+        lines.append(f"  Hotend Range       : {min_temp}\u2013{max_temp} \u00b0C")
+    elif max_temp is not None:
+        lines.append(f"  Hotend Max         : {max_temp} \u00b0C")
+    elif min_temp is not None:
+        lines.append(f"  Hotend Min         : {min_temp} \u00b0C")
+
+    return "\n".join(lines)
+
+
 def is_parse_error(info: Optional[dict]) -> bool:
     """Return True if the info dict represents a detection-only result or parse error.
 

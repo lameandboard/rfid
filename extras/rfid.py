@@ -1264,12 +1264,27 @@ class Rfid:
                                     sid = filament_info.get("spoolman_id")
                                     tag["spoolman_id"] = sid
                                     tag["filament_info"] = filament_info
-                                    self._debug(
-                                        f"rfid[{self.name}]: Bambu tag parsed uid={uid_hex}"
-                                        f" material={filament_info.get('material')}"
-                                        f" color=#{filament_info.get('color_hex')}"
-                                        f" brand={filament_info.get('brand')}"
-                                    )
+                                    # Log a full labeled summary of all parsed spool
+                                    # fields so users can see tray UID, weight,
+                                    # production date, temperatures, etc. in one place
+                                    # (matching what the Bambu Android app shows).
+                                    if _tag_parser is not None and hasattr(
+                                        _tag_parser, "format_bambu_info"
+                                    ):
+                                        summary = _tag_parser.format_bambu_info(
+                                            filament_info, uid_hex=uid_hex
+                                        )
+                                        self._log.info(
+                                            "rfid[%s]: %s", self.name, summary
+                                        )
+                                    else:
+                                        self._debug(
+                                            f"rfid[{self.name}]: Bambu tag parsed"
+                                            f" uid={uid_hex}"
+                                            f" material={filament_info.get('material')}"
+                                            f" color=#{filament_info.get('color_hex')}"
+                                            f" brand={filament_info.get('brand')}"
+                                        )
                             else:
                                 # Required blocks not obtained — track rounds; mark
                                 # exhausted once _BAMBU_MAX_ROUNDS rounds have been tried.
