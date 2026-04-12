@@ -250,10 +250,14 @@ def _classic_tag_entry(uid_hex="C2C304EB", sak=0x08):
     }
 
 
+# MIFARE Classic 1K data blocks: 16 sectors × 3 data blocks per sector
+# (sector trailer is not included in authenticated block reads).
+_MIFARE_CLASSIC_1K_DATA_BLOCKS = 48  # 16 sectors × 3 data blocks
+
 _FAKE_BAMBU_BLOCKS = {
     "uid_bytes": bytes.fromhex("C2C304EB"),
     "uid_hex": "C2C304EB",
-    "blocks": {i: bytes(16) for i in range(45)},  # 45 data blocks (16 sectors × 3 data blocks + 1 sector with partial)
+    "blocks": {i: bytes(16) for i in range(_MIFARE_CLASSIC_1K_DATA_BLOCKS)},
 }
 
 

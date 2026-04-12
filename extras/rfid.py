@@ -1100,11 +1100,15 @@ class Rfid:
                             )
                             filament_info = self._apply_tag_parser(uid_hex, bambu_blocks)
                             tag["raw_bytes"] = bambu_blocks
-                            # raw_len: use block-count × 16 as byte-count estimate;
-                            # fall back to 1 as a non-zero sentinel so the result is
-                            # not treated as "no data read".
-                            _blocks = (bambu_blocks.get("blocks") or {}) if isinstance(bambu_blocks, dict) else {}
-                            tag["raw_len"] = len(_blocks) * 16 or 1
+                            # raw_len: use block-count × MIFARE_BLOCK_SIZE as a
+                            # byte-count estimate; fall back to 1 as a non-zero
+                            # sentinel so the result is not treated as "no data read".
+                            _MIFARE_BLOCK_SIZE = 16
+                            if isinstance(bambu_blocks, dict):
+                                _block_count = len(bambu_blocks.get("blocks") or {})
+                            else:
+                                _block_count = 0
+                            tag["raw_len"] = _block_count * _MIFARE_BLOCK_SIZE or 1
                             if filament_info is not None:
                                 sid = filament_info.get("spoolman_id")
                                 tag["spoolman_id"] = sid
