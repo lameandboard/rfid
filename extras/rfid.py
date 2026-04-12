@@ -338,7 +338,7 @@ def _setup_logger(name: str) -> logging.Logger:
         parent.setLevel(logging.INFO)
         fh = logging.handlers.RotatingFileHandler(
             _LOG_PATH,
-            maxBytes=1_000_000,
+            maxBytes=5_000_000,
             backupCount=5,
             encoding="utf-8",
         )
