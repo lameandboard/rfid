@@ -945,16 +945,56 @@ class Rfid:
         uid_hex: str,
         round_num: int = 1,
     ) -> Optional[dict]:
-        """Attempt a single Bambu MIFARE Classic authenticated read (Key A only).
+        """Attempt a Bambu MIFARE Classic authenticated read with default-key fallback.
 
-        Bambu Lab tags use HKDF-derived Key A keys exclusively — no Key B
-        fallback is attempted.  Each call makes exactly one read attempt.
+        First tries HKDF-derived Key A keys (Bambu authentication).  If the
+        required blocks are not obtained, logs a warning and retries with the
+        default MIFARE key (FFFFFFFFFFFF) for backwards compatibility with tags
+        that were programmed with factory-default sector keys.
+
+        If both attempts fail, logs a clear error with the UID.
 
         round_num is a human-readable counter used only in debug log messages.
         """
-        # Single attempt per call; Key A only.  The caller (_scan_once) enforces
-        # the per-scan-window limit via _BAMBU_MAX_ROUNDS and _auth_fail_uids.
-        return self._try_bambu_read(uid_hex, attempt_num=round_num)
+        _DEFAULT_MIFARE_KEY = b"\xff\xff\xff\xff\xff\xff"
+
+        # First attempt: Bambu HKDF-derived keys.
+        result = self._try_bambu_read(uid_hex, attempt_num=round_num)
+        if self._bambu_blocks_ok(result):
+            return result
+
+        # HKDF authentication did not yield the required blocks.
+        # Fall back to the default MIFARE key (FFFFFFFFFFFF).
+        read_method = getattr(self.reader, "read_mifare_classic_tag", None)
+        if read_method is None:
+            return result
+
+        self._log.warning(
+            "rfid[%s]: Bambu HKDF auth did not yield required blocks uid=%s"
+            " — retrying with default key FFFFFFFFFFFF",
+            self.name, uid_hex,
+        )
+        try:
+            fallback_result = read_method([_DEFAULT_MIFARE_KEY] * 16)
+        except Exception as exc:
+            self._log.error(
+                "rfid[%s]: default key fallback failed uid=%s: %s",
+                self.name, uid_hex, exc,
+            )
+            return result
+
+        if self._bambu_blocks_ok(fallback_result):
+            self._debug(
+                f"rfid[{self.name}]: default key fallback succeeded uid={uid_hex}"
+            )
+            return fallback_result
+
+        self._log.error(
+            "rfid[%s]: all MIFARE auth attempts failed uid=%s"
+            " — both HKDF-derived and default key (FFFFFFFFFFFF) failed",
+            self.name, uid_hex,
+        )
+        return fallback_result if fallback_result is not None else result
 
     def _apply_tag_parser(
         self,

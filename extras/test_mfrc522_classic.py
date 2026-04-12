@@ -414,15 +414,23 @@ class TestBambuKeyDerivation(unittest.TestCase):
         self.assertEqual(_rtp._bambu_derive_keys(uid), _rtp._bambu_derive_keys(uid))
 
     @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
-    def test_derive_keys_master_is_ikm_not_salt(self):
-        """HKDF must use _BAMBU_MASTER_KEY as IKM and uid as salt (not swapped).
+    def test_derive_keys_uid_is_ikm_not_salt(self):
+        """HKDF must use uid_bytes as IKM and _BAMBU_MASTER_KEY as salt (not swapped).
 
-        pycryptodome HKDF signature: HKDF(master, key_len, salt, ...).
-        Swapping master and salt produces completely different (wrong) keys and
-        causes silent authentication failure on every Bambu tag sector.
+        The Android reference (MrBambuSpoolPal-BambuSpoolPal_AndroidApp,
+        NfcTagProcessor.kt) uses BouncyCastle HKDFParameters(uid, masterKey, context)
+        where the first argument is the IKM and the second is the salt:
+          IKM  = uid bytes
+          salt = _BAMBU_MASTER_KEY (the static Bambu device key)
 
-        This test guards against the regression where uid_bytes was accidentally
-        passed as the first (master/IKM) argument and _BAMBU_MASTER_KEY as salt.
+        pycryptodome HKDF signature: HKDF(master, key_len, salt, ...)
+        where 'master' is the IKM (first positional argument).
+        Correct call: HKDF(master=uid_bytes, salt=_BAMBU_MASTER_KEY, ...)
+
+        This test guards against the regression where _BAMBU_MASTER_KEY was
+        accidentally passed as the IKM and uid_bytes as the salt, which produces
+        completely wrong keys and causes silent authentication failure on every
+        Bambu tag sector.
         """
         # Use the same _HKDF and _SHA256 that rfid_tag_parser.py resolved at
         # import time (either Cryptodome.* or Crypto.*) so this test works under
@@ -433,20 +441,20 @@ class TestBambuKeyDerivation(unittest.TestCase):
         uid = bytes.fromhex("C2C304EB")
         master = _rtp._BAMBU_MASTER_KEY
 
-        # Correctly derived keys (master as IKM, uid as salt)
-        correct_raw = _HKDF_direct(master, 6, uid, _SHA256_direct, 16,
+        # Correctly derived keys (uid as IKM, _BAMBU_MASTER_KEY as salt)
+        correct_raw = _HKDF_direct(uid, 6, master, _SHA256_direct, 16,
                                    context=b"RFID-A\x00")
         correct_keys = list(correct_raw)
 
-        # Swapped (wrong) derivation (uid as IKM, master as salt)
-        swapped_raw = _HKDF_direct(uid, 6, master, _SHA256_direct, 16,
+        # Swapped (wrong) derivation (_BAMBU_MASTER_KEY as IKM, uid as salt)
+        swapped_raw = _HKDF_direct(master, 6, uid, _SHA256_direct, 16,
                                    context=b"RFID-A\x00")
         swapped_keys = list(swapped_raw)
 
         # The function must match the correctly-ordered derivation
         actual_keys = _rtp._bambu_derive_keys(uid)
         self.assertEqual(actual_keys, correct_keys,
-                         "Keys must match HKDF(master=_BAMBU_MASTER_KEY, salt=uid)")
+                         "Keys must match HKDF(master=uid_bytes, salt=_BAMBU_MASTER_KEY)")
         self.assertNotEqual(actual_keys, swapped_keys,
                             "Keys must NOT match the swapped (wrong) derivation")
 
