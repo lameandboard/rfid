@@ -16,9 +16,10 @@
 """
 RFID tag format parser for the rfid Klipper extra.
 
-Provides a single entry point:
+Provides two public entry points:
 
     parse_tag(raw, uid_hex: str | None = None) -> dict | None
+    is_parse_error(info: dict | None) -> bool
 
 ``raw`` may be:
   * ``bytes`` / ``bytearray`` — raw user-memory dump (starting at page 4 for
@@ -44,7 +45,7 @@ Optional dependencies
 ---------------------
 - pycryptodome (``pip3 install pycryptodome``) — required for Bambu Lab tag
   decryption via HKDF key derivation.  Without it, Bambu detection still works
-  but parse_tag() returns None for Bambu tags instead of a filament dict.
+  but parse_tag() returns an error dict (not a full filament dict) for Bambu tags.
 - cbor2 (``pip3 install cbor2``) — required for OpenPrintTag CBOR payloads.
 
 Known limitations
@@ -1202,6 +1203,8 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
         return None
 
     # --- Raw bytes path ---
+    # Each format is tried exactly once in priority order; the first successful
+    # parse is returned immediately.  No format is re-attempted or double-decoded.
     if not raw:
         return None
 
@@ -1266,12 +1269,23 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
         return result
 
     # 6 — Bambu Lab (encrypted raw dump — only detectable, cannot decrypt without auth)
+    # Return a clear error dict instead of None so callers can surface a helpful
+    # message.  Full decryption requires an authenticated MIFARE Classic read with
+    # HKDF-derived Key A keys; a raw byte dump cannot be decrypted here.
+    # Use is_parse_error() to distinguish this from a successful parse.
     if _detect_bambu(raw):
         _log.debug(
             "rfid: Bambu Lab tag detected in raw dump%s — "
             "use authenticated read for full data", uid_info
         )
-        return None
+        return {
+            "error": (
+                "Detected Bambu Lab tag but decryption/authentication not available; "
+                "see README for hardware requirements"
+            ),
+            "tag_format": "bambu",
+            "brand": "Bambu Lab",
+        }
 
     # 7 — Fallback: try raw bytes as UTF-8 text for JSON / URL formats
     try:
@@ -1299,4 +1313,15 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
 def is_bambu_tag(info: Optional[dict]) -> bool:
     """Return True if the parsed info dict originated from a Bambu Lab tag."""
     return isinstance(info, dict) and info.get("tag_format") == "bambu"
+
+
+def is_parse_error(info: Optional[dict]) -> bool:
+    """Return True if the info dict represents a detection-only result or parse error.
+
+    parse_tag() returns a dict with an ``"error"`` key when a tag is detected
+    but cannot be fully decoded (e.g. a Bambu Lab raw byte dump without hardware
+    authentication support).  Use this helper to distinguish such partial results
+    from a successful parse that contains actionable filament data.
+    """
+    return isinstance(info, dict) and bool(info.get("error"))
 
