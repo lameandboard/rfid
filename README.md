@@ -330,7 +330,18 @@ Bambu Lab spools use **MIFARE Classic 1K** tags with **per-UID derived encryptio
    ```
 2. The tag is within RF range when `RFID_CHECK_TAG` is issued.
 
-**Write-back is not possible** for Bambu tags — they are RSA-signed and read-only. Instead, the `uid → spoolman_id` mapping is stored in the persistent UID cache (`rfid_uid_cache.json`) so subsequent scans resolve the spool ID instantly without re-reading the tag blocks.
+**Reading:** Keys are HKDF-SHA256 derived (UID as IKM, static Bambu master key as salt, `RFID-A\x00` context). Each sector is authenticated with its derived Key A before data blocks are read. The full labeled summary (Tray UID, material, color, temperatures, weight, production date, etc.) is printed both to the log and to the Klipper console via `RFID_CHECK_TAG`.
+
+**Writing (custom / blank tags):** Use `RFID_BAMBU_WRITE` to write a Tray UID (spool identifier) to block 9 of a blank MIFARE Classic 1K tag. Key B is derived with the same HKDF procedure but with the `RFID-B\x00` context. This command is **completely separate** from the existing `RFID_WRITE` and scan/read paths — it only runs when explicitly called.
+
+```
+RFID_BAMBU_WRITE LANE=1
+RFID_BAMBU_WRITE LANE=1 TRAY_UID=5F390A603AAB4B8FB1524EA53B16FA77
+```
+
+> **Note on factory Bambu tags:** Factory spools carry an RSA-2048 signature that the Bambu printer firmware validates. Writing to factory tags will succeed at the MIFARE level but the printer will reject the tag as unsigned. `RFID_BAMBU_WRITE` is designed for **blank MIFARE Classic 1K tags** being programmed from scratch.
+
+The `uid → spoolman_id` mapping is stored in the persistent UID cache (`rfid_uid_cache.json`) so subsequent scans resolve the spool ID instantly without re-reading the tag blocks.
 
 If `pycryptodome` is not installed, Bambu tag content decryption is skipped and a log message is emitted indicating that `pycryptodome` is missing. The UID is still readable and can be associated with a Spoolman spool via the UID cache.
 

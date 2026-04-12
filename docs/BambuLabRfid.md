@@ -162,5 +162,56 @@ When a Bambu tag is successfully scanned, `rfid.py` logs at INFO level:
 ## Key B
 
 Key B is **not needed for reading** Bambu tags.  All sector data is protected
-by Key A alone.  Key B would only be required for write operations, which are
-not supported (Bambu tags are RSA-2048 signed and effectively read-only).
+by Key A alone.
+
+### Key B derivation (for writing)
+
+Key B is derived using the same HKDF-SHA256 procedure as Key A, with the
+context string changed to `b"RFID-B\x00"`:
+
+| HKDF parameter | Value |
+|---|---|
+| IKM (input key material) | 4-byte tag UID (same as Key A) |
+| Salt | Static 16-byte Bambu master key (same as Key A) |
+| Info / context | `b"RFID-B\x00"` (7 bytes incl. null terminator) |
+| Output length | 96 bytes → 16 × 6-byte sector Key B values |
+
+Use `rfid_tag_parser._bambu_derive_keys_b(uid_bytes)` to obtain Key B values.
+
+### Writing Tray UID (block 9) — `RFID_BAMBU_WRITE`
+
+The `RFID_BAMBU_WRITE` GCode command writes a Tray UID to block 9 using Key B
+authentication.  It is **completely separate** from the scan / read flow and
+from the existing `RFID_WRITE` command — issuing it has no effect on any read
+or non-Bambu write path.
+
+```
+RFID_BAMBU_WRITE LANE=1
+RFID_BAMBU_WRITE LANE=1 TRAY_UID=5F390A603AAB4B8FB1524EA53B16FA77
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `LANE` / `SLOT` | Yes | Reader lane to use |
+| `TRAY_UID` | No | 32-char hex string to write as Tray UID.  A random value is generated if omitted. |
+
+The command:
+
+1. Scans to detect the tag and read its hardware UID.
+2. Derives Key B from the hardware UID via HKDF (`RFID-B\x00` context).
+3. Authenticates sector 2 (which contains block 9) with Key B.
+4. Writes the 32-char ASCII hex Tray UID into block 9.
+5. Falls back to the default MIFARE key (`FFFFFFFFFFFF`) if HKDF Key B auth
+   fails (useful for blank / factory-default tags).
+6. Reports the hardware UID and written Tray UID — use the Tray UID as the
+   spool identifier in Spoolman.
+
+### Note on factory Bambu tags
+
+Factory-programmed Bambu spool tags carry an RSA-2048 signature that the Bambu
+printer firmware validates before accepting the tag.  Official Bambu firmware
+will **reject reprogrammed tags** even if all data blocks are correctly written.
+
+Writing is intended for **custom (blank) MIFARE Classic 1K tags** that are
+being programmed from scratch as Bambu-compatible spools (e.g. for refills or
+third-party filament tracking).

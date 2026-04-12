@@ -568,5 +568,193 @@ class TestAuthFailCache(unittest.TestCase):
         self.rfid._try_bambu_read_with_fallback.assert_called_once_with("F29CDAEF", round_num=1)
 
 
+# ---------------------------------------------------------------------------
+# Tests: Key B derivation
+# ---------------------------------------------------------------------------
+
+class TestBambuKeyDerivationB(unittest.TestCase):
+    """_bambu_derive_keys_b() must return 16 × 6-byte Key B values distinct from Key A."""
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_b_returns_16_keys(self):
+        """Key B list must have exactly 16 entries."""
+        uid = bytes.fromhex("C2C304EB")
+        keys = _rtp._bambu_derive_keys_b(uid)
+        self.assertEqual(len(keys), 16)
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_b_each_6_bytes(self):
+        """Each Key B must be exactly 6 bytes."""
+        uid = bytes.fromhex("F29CDAEF")
+        keys = _rtp._bambu_derive_keys_b(uid)
+        for i, k in enumerate(keys):
+            self.assertIsInstance(k, (bytes, bytearray), f"Key B {i} is not bytes")
+            self.assertEqual(len(k), 6, f"Key B {i} has wrong length {len(k)}")
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_b_differs_from_key_a(self):
+        """Key B values must differ from Key A values for the same UID."""
+        uid = bytes.fromhex("C2C304EB")
+        keys_a = _rtp._bambu_derive_keys(uid)
+        keys_b = _rtp._bambu_derive_keys_b(uid)
+        self.assertNotEqual(keys_a, keys_b,
+                            "Key B must differ from Key A (different HKDF context)")
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_b_deterministic(self):
+        """Same UID must always yield the same Key B values."""
+        uid = bytes.fromhex("C2C304EB")
+        self.assertEqual(_rtp._bambu_derive_keys_b(uid), _rtp._bambu_derive_keys_b(uid))
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_b_different_uids_differ(self):
+        """Different UIDs must produce different Key B lists."""
+        kb1 = _rtp._bambu_derive_keys_b(bytes.fromhex("C2C304EB"))
+        kb2 = _rtp._bambu_derive_keys_b(bytes.fromhex("F29CDAEF"))
+        self.assertNotEqual(kb1, kb2)
+
+    def test_derive_keys_b_import_error_when_no_pycryptodome(self):
+        """_bambu_derive_keys_b raises ImportError when pycryptodome is unavailable."""
+        orig = _rtp._PYCRYPTODOME_OK
+        try:
+            _rtp._PYCRYPTODOME_OK = False
+            with self.assertRaises(ImportError):
+                _rtp._bambu_derive_keys_b(bytes.fromhex("C2C304EB"))
+        finally:
+            _rtp._PYCRYPTODOME_OK = orig
+
+
+# ---------------------------------------------------------------------------
+# Tests: RFID_CHECK_TAG NameError regression (result vs scan_result)
+# ---------------------------------------------------------------------------
+
+class TestCheckTagScanResultReference(unittest.TestCase):
+    """cmd_RFID_CHECK_TAG must use scan_result (not 'result') — regression for NameError bug."""
+
+    def setUp(self):
+        self.rfid = _make_rfid(lanes="lane1")
+        _rfid_module._UID_SPOOL_CACHE.clear()
+
+    def test_check_tag_uses_scan_result_not_result(self):
+        """cmd_RFID_CHECK_TAG must not raise NameError when tag has no cached spoolman_id.
+
+        Previously line 3374 used the undefined name 'result' instead of 'scan_result',
+        causing a NameError every time RFID_CHECK_TAG was called on an uncached tag.
+        """
+        # Wire a scan result with a valid uid but no spoolman_id, no filament_info
+        fake_scan = {
+            "uid_hex": "AABBCCDD",
+            "raw_bytes": b"",
+            "raw_len": 0,
+            "tag_text": "",
+            "spoolman_id": None,
+            "filament_info": None,
+            "ts": 0.0,
+        }
+        self.rfid._run_scan_window_sync = MagicMock(return_value=fake_scan)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
+        self.rfid._resolve_port_param = MagicMock(return_value="lane1")
+        self.rfid._find_reader_for_port = MagicMock(return_value=(self.rfid, "lane1"))
+
+        gcmd = MagicMock()
+        gcmd.get_int = MagicMock(side_effect=lambda key, default: default)
+        gcmd.get = MagicMock(return_value=None)
+        gcmd.error = lambda msg: Exception(msg)
+
+        # Must NOT raise NameError
+        try:
+            self.rfid.cmd_RFID_CHECK_TAG(gcmd)
+        except NameError as exc:
+            self.fail(f"cmd_RFID_CHECK_TAG raised NameError: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Tests: write_mifare_classic_authenticated_blocks (mfrc522.py)
+# ---------------------------------------------------------------------------
+
+class TestWriteMifareClassicAuthBlocks(unittest.TestCase):
+    """write_mifare_classic_authenticated_blocks must skip block 0 and trailers,
+    authenticate the correct sector, and call _write_mifare_block for each data block."""
+
+    def _make_device(self):
+        dev = _make_device()
+        dev._auth_mifare_block = MagicMock(return_value=True)
+        dev._write_mifare_block = MagicMock(return_value=True)
+        dev._clear_mask = MagicMock()
+        return dev
+
+    def test_writes_block_9(self):
+        """Block 9 (sector 2 data block 1) must be written after authenticating sector 2."""
+        dev = self._make_device()
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        data = b"\xAA" * 16
+        ok = dev.write_mifare_classic_authenticated_blocks(uid, keys, {9: data}, use_key_b=True)
+        self.assertTrue(ok)
+        # Sector 2 trailer = block 11
+        dev._auth_mifare_block.assert_called_once_with(
+            dev.PICC_AUTHENT1B, 11, keys[2], uid[:4]
+        )
+        dev._write_mifare_block.assert_called_once_with(9, data)
+
+    def test_skips_block_0(self):
+        """Block 0 (manufacturer block) must be silently skipped."""
+        dev = self._make_device()
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        ok = dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {0: b"\x00" * 16}, use_key_b=True
+        )
+        self.assertTrue(ok)
+        dev._auth_mifare_block.assert_not_called()
+        dev._write_mifare_block.assert_not_called()
+
+    def test_skips_sector_trailer(self):
+        """Sector trailer blocks (3, 7, 11, …) must be silently skipped."""
+        dev = self._make_device()
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        # Block 7 is the trailer of sector 1
+        ok = dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {7: b"\x00" * 16}, use_key_b=True
+        )
+        self.assertTrue(ok)
+        dev._write_mifare_block.assert_not_called()
+
+    def test_auth_failure_returns_false(self):
+        """Returns False if sector authentication fails."""
+        dev = self._make_device()
+        dev._auth_mifare_block = MagicMock(return_value=False)
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        ok = dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {9: b"\xBB" * 16}, use_key_b=True
+        )
+        self.assertFalse(ok)
+        dev._write_mifare_block.assert_not_called()
+
+    def test_write_failure_returns_false(self):
+        """Returns False if _write_mifare_block fails."""
+        dev = self._make_device()
+        dev._write_mifare_block = MagicMock(return_value=False)
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        ok = dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {9: b"\xCC" * 16}, use_key_b=True
+        )
+        self.assertFalse(ok)
+
+    def test_uses_key_a_when_flag_false(self):
+        """use_key_b=False must pass PICC_AUTHENT1A to _auth_mifare_block."""
+        dev = self._make_device()
+        uid = b"\xC2\xC3\x04\xEB"
+        keys = [b"\x01\x02\x03\x04\x05\x06"] * 16
+        dev.write_mifare_classic_authenticated_blocks(
+            uid, keys, {9: b"\xDD" * 16}, use_key_b=False
+        )
+        args = dev._auth_mifare_block.call_args[0]
+        self.assertEqual(args[0], dev.PICC_AUTHENT1A)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
