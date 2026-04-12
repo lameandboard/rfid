@@ -644,7 +644,7 @@ import sys
 
 path = Path(sys.argv[1])
 lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-lines = [l for l in lines if '[include rfid/*.cfg]' not in l]
+lines = [l for l in lines if l.strip() != '[include rfid/*.cfg]']
 path.write_text("".join(lines), encoding="utf-8")
 print('[INFO] Removed [include rfid/*.cfg] from printer.cfg')
 PYEOF
@@ -704,6 +704,11 @@ EOF
     else
         warn "About to permanently delete: ${REPO_DIR}"
         warn "Press Ctrl-C within 5 seconds to abort."
+        # Safety checks: refuse to delete if the path looks wrong
+        [[ -n "${REPO_DIR}" ]] || fail "REPO_DIR is empty; aborting repo deletion"
+        [[ "${REPO_DIR}" != "/" ]] || fail "REPO_DIR is /; aborting repo deletion"
+        [[ -f "${REPO_DIR}/install.sh" ]] || fail "Safety check failed: ${REPO_DIR}/install.sh not found; aborting repo deletion"
+        [[ -f "${REPO_DIR}/extras/rfid.py" ]] || fail "Safety check failed: ${REPO_DIR}/extras/rfid.py not found; aborting repo deletion"
         sleep 5
         rm -rf "${REPO_DIR}"
         # The script has just deleted itself; exit cleanly without further file access.
@@ -712,6 +717,7 @@ EOF
 }
 
 
+ORIGINAL_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --klipper-dir)
