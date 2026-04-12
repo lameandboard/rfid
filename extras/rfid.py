@@ -179,11 +179,10 @@ _SPOOLMAN_RETRY_DELAY_S = 3.0
 # load cycle that happens to use the same lane.
 _DEFERRED_UID_TTL_S = 120.0
 
-# Maximum number of Key A → Key B authentication rounds to attempt per tag UID
-# per scan window.  One round = one Key A attempt followed by one Key B attempt
-# if Key A does not produce the required blocks.  After _BAMBU_MAX_ROUNDS, the
-# UID is marked exhausted for the remainder of the window to prevent hammering.
-_BAMBU_MAX_ROUNDS = 2
+# Maximum authentication rounds per tag UID per scan window.  Set to 1 so
+# each Bambu tag gets exactly one authenticated Key A read attempt before being
+# marked exhausted for the remainder of the window, preventing repeated hammering.
+_BAMBU_MAX_ROUNDS = 1
 
 # UID → spoolman_id cache: populated on every successful full read so that
 # a subsequent pass that only yields a UID (no NDEF payload) can still
@@ -858,34 +857,34 @@ class Rfid:
 
     @staticmethod
     def _bambu_blocks_ok(result: Optional[dict]) -> bool:
-        """Return True only when required Bambu metadata blocks (1 and 4) are present.
+        """Return True only when required Bambu metadata blocks (2 and 5) are present.
 
-        Blocks 1 and 4 contain the material string and color/diameter/weight
-        respectively; without both we cannot parse meaningful filament info.
+        Block 2 contains the basic filament type string; block 5 contains color,
+        spool weight, and diameter.  Without both we cannot parse meaningful
+        filament info.  (Block numbering per BambuLabRfid.md.)
         """
         if result is None:
             return False
         blocks = result.get("blocks") or {}
-        b1 = blocks.get(1)
-        b4 = blocks.get(4)
+        b2 = blocks.get(2)
+        b5 = blocks.get(5)
         return (
-            isinstance(b1, (bytes, bytearray)) and len(b1) == 16
-            and isinstance(b4, (bytes, bytearray)) and len(b4) == 16
+            isinstance(b2, (bytes, bytearray)) and len(b2) == 16
+            and isinstance(b5, (bytes, bytearray)) and len(b5) == 16
         )
 
     def _try_bambu_read(
         self,
         uid_hex: str,
-        use_key_b: bool = False,
         attempt_num: int = 1,
     ) -> Optional[dict]:
-        """Attempt a Bambu Lab MIFARE Classic authenticated read.
+        """Attempt a Bambu Lab MIFARE Classic authenticated read using Key A only.
 
         Derives the 16 sector keys from the UID via HKDF (pycryptodome required),
         then authenticates and reads all sectors via the reader driver.
 
-        use_key_b  : When True, authenticate with Key B instead of Key A.
-        attempt_num: Human-readable attempt counter for debug logging only.
+        Bambu Lab tags use HKDF-derived Key A keys exclusively (RFID-A\\0 context).
+        Key B is not used — a single Key A attempt is made per call.
 
         Returns a dict ``{"uid_bytes": ..., "blocks": {...}}`` suitable for
         ``parse_tag()``, or None on failure.
@@ -926,16 +925,18 @@ class Rfid:
                 self.name,
             )
             return None
-        auth_label = "Key B" if use_key_b else "Key A"
         self._debug(
-            f"rfid[{self.name}]: Bambu read attempt={attempt_num} auth={auth_label} uid={uid_hex}"
+            f"rfid[{self.name}]: Bambu read attempt={attempt_num} uid={uid_hex}"
         )
         try:
-            return read_method(key_list, use_key_b=use_key_b)
+            # Always use Key A (the default); Bambu tags are encrypted with
+            # HKDF-derived Key A only.  Do not pass use_key_b so the call is
+            # compatible with all reader drivers (mfrc522, pn532, etc.).
+            return read_method(key_list)
         except Exception as exc:
             self._log.warning(
-                "rfid[%s]: Bambu MIFARE read failed uid=%s attempt=%d auth=%s: %s",
-                self.name, uid_hex, attempt_num, auth_label, exc,
+                "rfid[%s]: Bambu MIFARE read failed uid=%s attempt=%d: %s",
+                self.name, uid_hex, attempt_num, exc,
             )
             return None
 
@@ -944,25 +945,16 @@ class Rfid:
         uid_hex: str,
         round_num: int = 1,
     ) -> Optional[dict]:
-        """Try Key A then Key B for a Bambu MIFARE Classic read.
+        """Attempt a single Bambu MIFARE Classic authenticated read (Key A only).
 
-        Attempts Key A first (attempt 2*round_num-1).  If the result does not
-        contain the required blocks (1 and 4), immediately retries with Key B
-        (attempt 2*round_num).  Returns the first result that passes
-        _bambu_blocks_ok, or the Key B result (which may be None) if both fail.
+        Bambu Lab tags use HKDF-derived Key A keys exclusively — no Key B
+        fallback is attempted.  Each call makes exactly one read attempt.
 
         round_num is a human-readable counter used only in debug log messages.
         """
-        attempt_a = (round_num - 1) * 2 + 1
-        attempt_b = attempt_a + 1
-        result_a = self._try_bambu_read(uid_hex, use_key_b=False, attempt_num=attempt_a)
-        if self._bambu_blocks_ok(result_a):
-            return result_a
-        result_b = self._try_bambu_read(uid_hex, use_key_b=True, attempt_num=attempt_b)
-        if self._bambu_blocks_ok(result_b):
-            return result_b
-        # Return whichever gave partial data (Key B preferred to distinguish from None).
-        return result_b if result_b is not None else result_a
+        # Single attempt per call; Key A only.  The caller (_scan_once) enforces
+        # the per-scan-window limit via _BAMBU_MAX_ROUNDS and _auth_fail_uids.
+        return self._try_bambu_read(uid_hex, attempt_num=round_num)
 
     def _apply_tag_parser(
         self,
@@ -2871,16 +2863,17 @@ class Rfid:
             if self.auto_create_spool and uid != "unknown" and _tag_parser is not None:
                 raw_bytes = result.get("raw_bytes") or b""
                 # Use filament_info already parsed in _scan_once if available (e.g. Bambu),
-                # otherwise try to parse from raw bytes.  As a last resort use the Key A→B
-                # fallback authenticated read so this path also benefits from Key B.
+                # otherwise try to parse from raw bytes.
                 filament_info = result.get("filament_info")
                 if filament_info is None:
                     filament_info = self._apply_tag_parser(uid, raw_bytes, result.get("tag_text"))
-                if filament_info is None:
+                # If parse_tag detected a Bambu tag in raw bytes but could not decrypt it
+                # (returns an error dict), attempt a fresh authenticated read as a fallback.
+                if filament_info is None or _tag_parser.is_parse_error(filament_info):
                     bambu_blocks = self._try_bambu_read_with_fallback(uid)
                     if bambu_blocks is not None:
                         filament_info = self._apply_tag_parser(uid, bambu_blocks)
-                if filament_info:
+                if filament_info and filament_info.get("material"):
                     self._debug(
                         f"rfid[{self.name}]: auto_create_spool: parsed tag"
                         f" uid={uid} format={filament_info.get('tag_format')}"
@@ -3149,12 +3142,14 @@ class Rfid:
             filament_info = result.get("filament_info") if isinstance(result, dict) else None
             if filament_info is None:
                 filament_info = reader._apply_tag_parser(uid_hex, raw_bytes, tag_text)
-            if filament_info is None and uid_hex != "unknown":
+            # If raw bytes parse detected a Bambu tag but could not decrypt it
+            # (returns an error dict), still attempt authenticated read as a fallback.
+            if (filament_info is None or _tag_parser.is_parse_error(filament_info)) and uid_hex != "unknown":
                 bambu_blocks = reader._try_bambu_read_with_fallback(uid_hex)
                 if bambu_blocks is not None:
                     filament_info = reader._apply_tag_parser(uid_hex, bambu_blocks)
 
-        if filament_info:
+        if filament_info and filament_info.get("material"):
             fmt = filament_info.get("tag_format", "?")
             mat = filament_info.get("material", "?")
             color = filament_info.get("color_hex", "?")

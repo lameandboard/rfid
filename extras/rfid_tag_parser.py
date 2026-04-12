@@ -16,9 +16,10 @@
 """
 RFID tag format parser for the rfid Klipper extra.
 
-Provides a single entry point:
+Provides two public entry points:
 
     parse_tag(raw, uid_hex: str | None = None) -> dict | None
+    is_parse_error(info: dict | None) -> bool
 
 ``raw`` may be:
   * ``bytes`` / ``bytearray`` — raw user-memory dump (starting at page 4 for
@@ -44,7 +45,7 @@ Optional dependencies
 ---------------------
 - pycryptodome (``pip3 install pycryptodome``) — required for Bambu Lab tag
   decryption via HKDF key derivation.  Without it, Bambu detection still works
-  but parse_tag() returns None for Bambu tags instead of a filament dict.
+  but parse_tag() returns an error dict (not a full filament dict) for Bambu tags.
 - cbor2 (``pip3 install cbor2``) — required for OpenPrintTag CBOR payloads.
 
 Known limitations
@@ -487,76 +488,176 @@ def _parse_bambu_blocks(blocks: dict) -> Optional[dict]:
 
     blocks: dict mapping absolute block index → 16-byte data bytes,
             produced by read_authenticated_blocks() after key auth.
-    Returns filament info dict or None if essential blocks are missing.
+    Returns filament info dict or None if the essential material block is missing.
 
-    Block layout per BambuLabRfid.md:
-      Block 1  (sec 0, blk 1): Material type, ASCII null-padded
-      Block 2  (sec 0, blk 2): Spool serial, ASCII null-padded
-      Block 4  (sec 1, blk 0): RGBA color (4B), diameter×100 uint16 LE,
-                                weight g uint16 LE, spool-weight uint16 LE
-      Block 5  (sec 1, blk 1): min_temp, max_temp, bed_temp (int16 LE each)
-      Block 6  (sec 1, blk 2): Brand / vendor, ASCII null-padded
+    Block layout from Bambu-Research-Group/RFID-Tag-Guide/BambuLabRfid.md
+    (all multi-byte numbers are Little Endian):
+
+      Block 1  (sec 0, blk 1): Tray Info Index
+                                  bytes  0-7:  Material Variant ID (ASCII)
+                                  bytes  8-15: Material ID (ASCII, e.g. "GFA50")
+      Block 2  (sec 0, blk 2): Filament Type — basic type string (e.g. "PLA")
+      Block 4  (sec 1, blk 0): Detailed Filament Type (e.g. "PLA Basic")
+      Block 5  (sec 1, blk 1): Color / Weight / Diameter
+                                  bytes  0-3:  RGBA color
+                                  bytes  4-5:  Spool weight uint16 (grams)
+                                  bytes  8-11: Filament diameter float32 (mm)
+      Block 6  (sec 1, blk 2): Temperatures and Drying Info
+                                  bytes  0-1:  Drying temperature uint16 (°C)
+                                  bytes  2-3:  Drying time uint16 (hours)
+                                  bytes  4-5:  Bed temperature type uint16
+                                  bytes  6-7:  Bed temperature uint16 (°C)
+                                  bytes  8-9:  Max hotend temperature uint16 (°C)
+                                  bytes 10-11: Min hotend temperature uint16 (°C)
+      Block 9  (sec 2, blk 1): Tray UID — 16-byte ASCII hex string
+      Block 12 (sec 3, blk 0): Production date — ASCII "yyyy_MM_dd_HH_mm"
+      Block 14 (sec 3, blk 2): Filament length — uint16 at offset 4 (meters)
+      Block 16 (sec 4, blk 0): Extra color info
+                                  bytes  0-1:  Format ID uint16 (0x0002 = color present)
+                                  bytes  2-3:  Color count uint16
+                                  bytes  4-7:  Second color ABGR (note: reversed order)
+
+    Blocks 3, 7, 11, 15, 19, … are MIFARE sector trailers (encryption keys)
+    and are never present in the authenticated block dict.
     """
-    def _ascii_block(blk_idx):
+    def _read_str(blk_idx, offset=0, length=16):
+        """Read a null-terminated ASCII string from a block."""
         b = blocks.get(blk_idx)
-        if not b:
+        if not b or len(b) < offset + length:
             return None
         try:
-            return b.rstrip(b"\x00").decode("ascii", errors="ignore").strip() or None
+            return b[offset:offset + length].rstrip(b"\x00").decode("ascii", errors="ignore").strip() or None
         except Exception:
             return None
 
-    material = _ascii_block(1)
+    def _read_u16(blk_idx, offset):
+        """Read a uint16 LE from a block at the given byte offset."""
+        b = blocks.get(blk_idx)
+        if not b or len(b) < offset + 2:
+            return None
+        return struct.unpack_from("<H", b, offset)[0]
+
+    def _read_f32(blk_idx, offset):
+        """Read a float32 LE from a block at the given byte offset."""
+        b = blocks.get(blk_idx)
+        if not b or len(b) < offset + 4:
+            return None
+        return struct.unpack_from("<f", b, offset)[0]
+
+    # --- Block 2: basic filament type (required) ---
+    material = _read_str(2)
     if not material:
         return None
 
-    spool_serial = _ascii_block(2)
-    brand = _ascii_block(6)
+    # --- Block 1: tray info index ---
+    # bytes 0-7 = material variant ID, bytes 8-15 = material ID
+    material_variant_id = _read_str(1, offset=0, length=8)
+    material_id = _read_str(1, offset=8, length=8)
 
+    # --- Block 4: detailed filament type ---
+    material_detail = _read_str(4)
+
+    # --- Block 5: RGBA color, spool weight, filament diameter ---
     color_hex = None
     color_rgba = None
-    diameter_mm = None
     weight_g = None
-    if 4 in blocks and len(blocks[4]) >= 8:
-        b4 = blocks[4]
-        color_rgba = (b4[0], b4[1], b4[2], b4[3])
-        # Use 6-digit RGB for color_hex; keep alpha only in color_rgba
-        color_hex = "%02X%02X%02X" % color_rgba[:3]
-        raw_diam = struct.unpack_from("<H", b4, 4)[0]
-        if raw_diam > 0:
-            diameter_mm = round(raw_diam / 100.0, 2)
-        raw_weight = struct.unpack_from("<H", b4, 6)[0]
-        if raw_weight > 0:
-            weight_g = float(raw_weight)
+    diameter_mm = None
+    b5 = blocks.get(5)
+    if b5 and len(b5) >= 12:
+        r, g, b_val, a = b5[0], b5[1], b5[2], b5[3]
+        color_rgba = (r, g, b_val, a)
+        color_hex = "%02X%02X%02X" % (r, g, b_val)  # 6-digit RGB; alpha kept in color_rgba
 
-    min_temp = None
-    max_temp = None
+        raw_weight = _read_u16(5, 4)
+        if raw_weight and raw_weight > 0:
+            weight_g = int(raw_weight)
+
+        raw_diam = _read_f32(5, 8)
+        if raw_diam and 0.5 < raw_diam < 5.0:  # sanity: 0.5–5 mm
+            diameter_mm = round(float(raw_diam), 2)
+
+    # --- Block 6: temperatures and drying info ---
+    drying_temp = None
+    drying_time_h = None
     bed_temp = None
-    if 5 in blocks and len(blocks[5]) >= 6:
-        b5 = blocks[5]
-        v_min, v_max, v_bed = struct.unpack_from("<hhh", b5, 0)
-        if 0 < v_min < 500:
-            min_temp = int(v_min)
-        if 0 < v_max < 500:
-            max_temp = int(v_max)
-        if 0 < v_bed < 200:
-            bed_temp = int(v_bed)
+    max_temp = None
+    min_temp = None
+    b6 = blocks.get(6)
+    if b6 and len(b6) >= 12:
+        v_dry_temp = _read_u16(6, 0)
+        v_dry_time = _read_u16(6, 2)
+        # offset 4-5: bed temp type (ignored — types not publicly documented)
+        v_bed_temp = _read_u16(6, 6)
+        v_max_temp = _read_u16(6, 8)
+        v_min_temp = _read_u16(6, 10)
 
-    return {
+        if v_dry_temp and 0 < v_dry_temp < 200:
+            drying_temp = int(v_dry_temp)
+        if v_dry_time and 0 < v_dry_time < 100:
+            drying_time_h = int(v_dry_time)
+        if v_bed_temp and 0 < v_bed_temp < 200:
+            bed_temp = int(v_bed_temp)
+        if v_max_temp and 0 < v_max_temp < 500:
+            max_temp = int(v_max_temp)
+        if v_min_temp and 0 < v_min_temp < 500:
+            min_temp = int(v_min_temp)
+
+    # --- Block 9: tray UID (16-byte ASCII hex string) ---
+    tray_uid = _read_str(9)
+
+    # --- Block 12: production date "yyyy_MM_dd_HH_mm" ---
+    production_date = _read_str(12)
+
+    # --- Block 14: filament length in meters (uint16 at offset 4) ---
+    filament_length_m = None
+    v_len = _read_u16(14, 4)
+    if v_len and v_len > 0:
+        filament_length_m = int(v_len)
+
+    # --- Block 16: extra color info (second color for multi-colour filaments) ---
+    # Format ID 0x0002 signals that extra color data is present.
+    # Second color is stored as ABGR (reversed), so we swap to RGBA for consistency.
+    second_color_hex = None
+    b16 = blocks.get(16)
+    if b16 and len(b16) >= 8:
+        fmt_id = struct.unpack_from("<H", b16, 0)[0]
+        if fmt_id == 0x0002:
+            # bytes 4-7: ABGR — index 0=A, 1=B, 2=G, 3=R
+            a2, b2, g2, r2 = b16[4], b16[5], b16[6], b16[7]
+            second_color_hex = "%02X%02X%02X" % (r2, g2, b2)
+
+    info: dict = {
         "material": material,
-        "brand": brand or "Bambu Lab",
+        "brand": "Bambu Lab",
         "color_hex": color_hex,
         "color_rgba": color_rgba,
-        "diameter_mm": diameter_mm or 1.75,
+        "diameter_mm": diameter_mm if diameter_mm is not None else 1.75,
         "weight_g": weight_g,
         "min_temp": min_temp,
         "max_temp": max_temp,
         "bed_temp": bed_temp,
-        "spool_serial": spool_serial,
+        "drying_temp": drying_temp,
+        "drying_time_h": drying_time_h,
         "spoolman_id": None,
         "writable": False,
         "tag_format": "bambu",
     }
+    # Optional fields — only include when present so callers can check ``if key in info``
+    if material_detail:
+        info["material_detail"] = material_detail
+    if material_id:
+        info["material_id"] = material_id
+    if material_variant_id:
+        info["material_variant_id"] = material_variant_id
+    if tray_uid:
+        info["tray_uid"] = tray_uid
+    if production_date:
+        info["production_date"] = production_date
+    if filament_length_m is not None:
+        info["filament_length_m"] = filament_length_m
+    if second_color_hex:
+        info["second_color_hex"] = second_color_hex
+    return info
 
 
 _ANYCUBIC_MAGIC = b"\x7B\x00"
@@ -1202,6 +1303,8 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
         return None
 
     # --- Raw bytes path ---
+    # Each format is tried exactly once in priority order; the first successful
+    # parse is returned immediately.  No format is re-attempted or double-decoded.
     if not raw:
         return None
 
@@ -1266,12 +1369,23 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
         return result
 
     # 6 — Bambu Lab (encrypted raw dump — only detectable, cannot decrypt without auth)
+    # Return a clear error dict instead of None so callers can surface a helpful
+    # message.  Full decryption requires an authenticated MIFARE Classic read with
+    # HKDF-derived Key A keys; a raw byte dump cannot be decrypted here.
+    # Use is_parse_error() to distinguish this from a successful parse.
     if _detect_bambu(raw):
         _log.debug(
             "rfid: Bambu Lab tag detected in raw dump%s — "
             "use authenticated read for full data", uid_info
         )
-        return None
+        return {
+            "error": (
+                "Detected Bambu Lab tag but decryption/authentication not available; "
+                "see README for hardware requirements"
+            ),
+            "tag_format": "bambu",
+            "brand": "Bambu Lab",
+        }
 
     # 7 — Fallback: try raw bytes as UTF-8 text for JSON / URL formats
     try:
@@ -1299,4 +1413,15 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
 def is_bambu_tag(info: Optional[dict]) -> bool:
     """Return True if the parsed info dict originated from a Bambu Lab tag."""
     return isinstance(info, dict) and info.get("tag_format") == "bambu"
+
+
+def is_parse_error(info: Optional[dict]) -> bool:
+    """Return True if the info dict represents a detection-only result or parse error.
+
+    parse_tag() returns a dict with an ``"error"`` key when a tag is detected
+    but cannot be fully decoded (e.g. a Bambu Lab raw byte dump without hardware
+    authentication support).  Use this helper to distinguish such partial results
+    from a successful parse that contains actionable filament data.
+    """
+    return isinstance(info, dict) and bool(info.get("error"))
 

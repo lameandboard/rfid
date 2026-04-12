@@ -509,7 +509,7 @@ class TestAuthFailCache(unittest.TestCase):
 
     def test_different_uids_cached_independently(self):
         """Failure cache must track UIDs independently — failing one UID must not block another."""
-        # First scan: UID A fails (round 1, not yet exhausted with _BAMBU_MAX_ROUNDS=2)
+        # First scan: UID A fails — with _BAMBU_MAX_ROUNDS=1 it is immediately exhausted.
         self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
         self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
         self.rfid._auth_fail_uids[self.lane] = {}
