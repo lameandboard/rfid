@@ -731,10 +731,17 @@ class MFRC522Device:
         Returns a dict suitable for rfid_tag_parser.parse_tag():
           {"uid_bytes": bytes, "uid_hex": str, "blocks": {abs_block: bytes}}
         Returns None if no tag is present.
+
+        Uses REQA first (finds IDLE tags); falls back to WUPA so that tags left
+        in HALT state by a preceding read_all_tags() call can still be reached.
         """
         self.initialize()
         with self.antenna_enabled():
             st, _ = self.request(self.PICC_REQA)
+            if st != self.MI_OK:
+                # REQA only wakes IDLE tags; WUPA also wakes HALT-state tags.
+                self._dbg("mfrc522.read_mifare_classic reqa_miss — trying wupa")
+                st, _ = self.request(self.PICC_WUPA)
             if st != self.MI_OK:
                 return None
             uid = self._anticoll_and_select()
@@ -1076,12 +1083,13 @@ class MFRC522Device:
 
                 # --- retry anticollision/select up to 3 times ---
                 uid = None
+                sak = 0
                 for attempt in range(3):
-                    uid = self._anticoll_and_select()
+                    uid, sak = self._anticoll_and_select_with_sak()
                     self._dbg(
-                        lambda _p=pass_num, _a=attempt, _u=uid: (
-                            "mfrc522.read_all_tags pass=%d attempt=%d uid=%s"
-                            % (_p, _a, "".join("%02X" % b for b in _u) if _u else "None")
+                        lambda _p=pass_num, _a=attempt, _u=uid, _s=sak: (
+                            "mfrc522.read_all_tags pass=%d attempt=%d uid=%s sak=0x%02X"
+                            % (_p, _a, "".join("%02X" % b for b in _u) if _u else "None", _s)
                         )
                     )
                     if uid is not None:
@@ -1131,6 +1139,35 @@ class MFRC522Device:
                         "raw_len": 0,
                         "spoolman_id": None,
                         "tag_text": "",
+                        "sak": sak,
+                    })
+                    continue
+
+                # --- MIFARE Classic detection (SAK bit 3 set) ---
+                # SAK 0x08 = MIFARE Classic 1K, SAK 0x18 = MIFARE Classic 4K.
+                # These tags require sector authentication before any data read.
+                # The Type-2 READ command (0x30) used by read_4pages() will return
+                # only a 4-bit NAK from a Classic tag, producing the symptom:
+                #   "back_bits=4 len=1" with status=MI_OK.
+                # Return a UID-only entry so the caller (_scan_once in rfid.py)
+                # can attempt the correct authenticated-read path (e.g. Bambu HKDF).
+                if sak & 0x08:
+                    self._dbg(
+                        "mfrc522.read_all_tags uid=%s sak=0x%02X MIFARE Classic detected"
+                        " — skipping Type2 page reads; caller should use authenticated read",
+                        uid_hex, sak,
+                    )
+                    self.halt_tag()
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    self._write_reg(self.BitFramingReg, 0x00)
+                    tags.append({
+                        "uid": uid,
+                        "uid_hex": uid_hex,
+                        "raw_bytes": None,
+                        "raw_len": 0,
+                        "spoolman_id": None,
+                        "tag_text": "",
+                        "sak": sak,
                     })
                     continue
 
@@ -1186,6 +1223,7 @@ class MFRC522Device:
                     "raw_len": len(raw) if raw else 0,
                     "spoolman_id": spoolman_id,
                     "tag_text": text or "",
+                    "sak": sak,
                 })
                 self._dbg(
                     "mfrc522.read_all_tags tag_appended uid=%s raw_len=%d spoolman_id=%s",

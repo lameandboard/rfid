@@ -1076,6 +1076,43 @@ class Rfid:
                             self._debug_verbose(
                                 f"rfid[{self.name}]: DBG _scan_once cache_hit uid={uid_hex} sid={sid}"
                             )
+                    # --- MIFARE Classic / Bambu fallback ---
+                    # When read_all_tags detects a MIFARE Classic tag (SAK & 0x08)
+                    # it skips the Type-2 page reads and returns a uid-only entry.
+                    # Attempt the Bambu HKDF-derived authenticated read here so the
+                    # tag can be decoded without any extra caller-side changes.
+                    tag_sak = tag.get("sak", 0)
+                    if (
+                        sid is None
+                        and tag.get("raw_len", 0) == 0
+                        and tag.get("raw_bytes") is None
+                        and tag_sak & 0x08
+                        and uid_hex is not None
+                    ):
+                        self._debug(
+                            f"rfid[{self.name}]: MIFARE Classic uid={uid_hex}"
+                            f" sak=0x{tag_sak:02X} — attempting Bambu authenticated read"
+                        )
+                        bambu_blocks = self._try_bambu_read(uid_hex)
+                        if bambu_blocks is not None:
+                            self._debug(
+                                f"rfid[{self.name}]: Bambu authenticated read succeeded uid={uid_hex}"
+                            )
+                            filament_info = self._apply_tag_parser(uid_hex, bambu_blocks)
+                            tag["raw_bytes"] = bambu_blocks
+                            # raw_len: use block-count × 16 as byte-count estimate;
+                            # fall back to 1 as a non-zero sentinel so the result is
+                            # not treated as "no data read".
+                            _blocks = (bambu_blocks.get("blocks") or {}) if isinstance(bambu_blocks, dict) else {}
+                            tag["raw_len"] = len(_blocks) * 16 or 1
+                            if filament_info is not None:
+                                sid = filament_info.get("spoolman_id")
+                                tag["spoolman_id"] = sid
+                        else:
+                            self._debug(
+                                f"rfid[{self.name}]: Bambu authenticated read failed uid={uid_hex}"
+                                " (pycryptodome missing, key derivation error, or RF/auth failure)"
+                            )
                     # Cache update: store plain int sid.
                     if uid_hex and sid is not None:
                         existing = _UID_SPOOL_CACHE.get(uid_hex)
