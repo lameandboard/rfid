@@ -1039,7 +1039,11 @@ class MFRC522Device:
         REQA.  Set to True when fast_mode=False (safe/two-read mode) so the
         second confirmation tick can find the same tag again.
 
-        Returns a list of tag-info dicts (same schema as read_tag_info()).
+        Returns a list of tag-info dicts.  Each dict contains:
+          uid, uid_hex, raw_bytes, raw_len, spoolman_id, tag_text, sak.
+        MIFARE Classic tags (sak & 0x08) are returned as UID-only entries
+        (raw_bytes=None, raw_len=0) so the caller can apply an authenticated
+        read (e.g. Bambu HKDF) without re-selecting the tag.
         Returns [] if no tags are found.
         """
         self.initialize()
