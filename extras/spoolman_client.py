@@ -669,7 +669,7 @@ class SpoolmanClient:
         body = {"name": name, "vendor_id": int(vendor_id), "material": material}
         # density and diameter are required by the Spoolman API; always send them.
         body["density"] = float(density) if density is not None else _DENSITY_DEFAULT
-        body["diameter"] = float(diameter) if diameter else 1.75
+        body["diameter"] = float(diameter) if diameter is not None else 1.75
         if color_hex:
             body["color_hex"] = str(color_hex).lstrip("#").upper()
         return self._req("POST", "/api/v1/filament", body)
@@ -731,17 +731,18 @@ class SpoolmanClient:
 
         Returns the new Spoolman spool ID on success, or None on failure.
 
-        Bare-minimum metadata required before creating anything:
+        Required before creating anything:
           * material  — filament type (e.g. "PLA", "PETG")
-          * color_hex — 6-digit hex color string; cannot be deduced from context
-          * weight_g  — spool weight in grams; defaults to 1000 g if not supplied
 
-        Additional fields that can be deduced when absent:
-          * brand     — inferred from tag_format, falls back to "Generic"
+        Optional but used when present:
+          * color_hex   — 6-digit hex color string; omitted from filament if absent
+          * weight_g    — spool weight in grams; defaults to 1000 g if not supplied
+          * brand       — inferred from tag_format, falls back to "Generic"
           * diameter_mm — defaults to 1.75 mm
 
         The optional uid_hex argument (hardware RFID UID) is stored in the
-        spool's extra field (rfid_uid_1) at creation time when provided.
+        spool's extra field (rfid_uid_1) at creation time when provided, after
+        ensuring the extra-field schema exists in Spoolman.
 
         Steps:
         1. Determine density via SpoolmanDB (Bambu DB or materials.json) or fallback table.

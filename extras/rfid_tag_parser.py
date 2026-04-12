@@ -758,6 +758,8 @@ def _parse_bambu_blocks(blocks: dict) -> Optional[dict]:
     # --- Block 9: tray UID (16 raw bytes → 32-char uppercase hex string) ---
     # The tag stores the Tray UID as 16 raw binary bytes (not ASCII text).
     # When displayed it is shown as the 32-character hex representation.
+    # An all-zero block means the UID slot has not been written; treat it
+    # as absent so callers don't see a false "0000…" tray UID.
     tray_uid = None
     b9 = blocks.get(9)
     if b9 and len(b9) >= 16:
