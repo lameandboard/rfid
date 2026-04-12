@@ -184,6 +184,10 @@ _DEFERRED_UID_TTL_S = 120.0
 # marked exhausted for the remainder of the window, preventing repeated hammering.
 _BAMBU_MAX_ROUNDS = 1
 
+# Default factory MIFARE Classic Key A used on tags that have not had their
+# sector keys personalised.  Used as a fallback when HKDF-derived keys fail.
+_DEFAULT_MIFARE_KEY = b"\xff\xff\xff\xff\xff\xff"
+
 # UID → spoolman_id cache: populated on every successful full read so that
 # a subsequent pass that only yields a UID (no NDEF payload) can still
 # resolve the spool ID.  Shared across all Rfid instances in this process.
@@ -956,15 +960,14 @@ class Rfid:
 
         round_num is a human-readable counter used only in debug log messages.
         """
-        _DEFAULT_MIFARE_KEY = b"\xff\xff\xff\xff\xff\xff"
-
         # First attempt: Bambu HKDF-derived keys.
         result = self._try_bambu_read(uid_hex, attempt_num=round_num)
         if self._bambu_blocks_ok(result):
             return result
 
-        # HKDF authentication did not yield the required blocks.
-        # Fall back to the default MIFARE key (FFFFFFFFFFFF).
+        # HKDF attempt did not succeed — determine whether it returned None
+        # (e.g. pycryptodome missing, reader doesn't support Classic, tag gone)
+        # or returned partial/empty blocks (auth attempted but blocks missing).
         read_method = getattr(self.reader, "read_mifare_classic_tag", None)
         if read_method is None:
             self._debug(
@@ -973,11 +976,18 @@ class Rfid:
             )
             return result
 
-        self._log.warning(
-            "rfid[%s]: Bambu HKDF auth did not yield required blocks uid=%s"
-            " — retrying with default key FFFFFFFFFFFF",
-            self.name, uid_hex,
-        )
+        if result is None:
+            self._debug(
+                f"rfid[{self.name}]: HKDF read returned None uid={uid_hex}"
+                " — retrying with default key FFFFFFFFFFFF"
+            )
+        else:
+            self._log.warning(
+                "rfid[%s]: Bambu HKDF auth did not yield required blocks uid=%s"
+                " — retrying with default key FFFFFFFFFFFF",
+                self.name, uid_hex,
+            )
+
         try:
             fallback_result = read_method([_DEFAULT_MIFARE_KEY] * 16)
         except Exception as exc:
@@ -986,6 +996,19 @@ class Rfid:
                 self.name, uid_hex, exc,
             )
             return result
+
+        # Verify the fallback selected the same tag (re-select may pick a
+        # different tag if multiple are in field or the tag changed between
+        # attempts).
+        if fallback_result is not None:
+            fb_uid = fallback_result.get("uid_hex")
+            if fb_uid is not None and fb_uid != uid_hex:
+                self._log.warning(
+                    "rfid[%s]: default key fallback selected different tag"
+                    " uid=%s (expected %s) — discarding",
+                    self.name, fb_uid, uid_hex,
+                )
+                return result
 
         if self._bambu_blocks_ok(fallback_result):
             self._debug(
