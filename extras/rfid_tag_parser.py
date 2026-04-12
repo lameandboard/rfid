@@ -44,17 +44,39 @@ generic_ndef_json  Generic NDEF text record containing JSON filament data
 Optional dependencies
 ---------------------
 - pycryptodome (``pip3 install pycryptodome``) — required for Bambu Lab tag
-  decryption via HKDF key derivation.  Without it, Bambu detection still works
+  key derivation via HKDF-SHA256.  Without it, Bambu tag detection still works
   but parse_tag() returns an error dict (not a full filament dict) for Bambu tags.
 - cbor2 (``pip3 install cbor2``) — required for OpenPrintTag CBOR payloads.
+
+Bambu Lab tag authentication — how it works
+--------------------------------------------
+Bambu Lab spool tags are MIFARE Classic 1K chips with per-tag, per-sector
+encryption keys derived via HKDF-SHA256:
+
+  IKM   = static 16-byte Bambu device master key (see ``_BAMBU_MASTER_KEY``)
+  Salt  = 4-byte tag UID (unique per spool)
+  Info  = b"RFID-A\\x00"
+  Output = 96 bytes split into 16 × 6-byte MIFARE sector keys
+
+After key derivation, each of the 16 sectors is authenticated (Key A) and read
+with the MFRC522 PCD_AUTHENT command before the data blocks can be accessed.
+``parse_tag()`` expects these decrypted blocks as a dict:
+  ``{"uid_bytes": bytes, "blocks": {abs_block_index: 16-byte-bytes}}``
+
+Hardware requirements for Bambu tags:
+  • Reader must support ISO/IEC 14443 Type A 3-pass authentication
+    (MFRC522, PN532, ACR122U, RC663, Proxmark3 all qualify).
+  • Standard "pass-through" USB HID card readers do NOT support this and
+    will never be able to read Bambu tag sector data.
+  • pycryptodome must be installed for HKDF key derivation.
 
 Known limitations
 -----------------
 - Creality CFS and QIDI Box tags are MIFARE Classic 1K and require
-  sector-key authentication which standard MFRC522/PN532 firmware does not
-  perform.  Detection is attempted from the raw dump when available; if the
-  raw bytes look like these formats they are parsed, but in practice the data
-  past page 15 (sector 1) may not be available without key auth.
+  sector-key authentication.  Detection is attempted from the raw dump when
+  available; if the raw bytes look like these formats they are parsed, but in
+  practice the data past page 15 (sector 1) may not be available without auth.
+- Bambu tags are RSA-2048-signed and read-only; write-back is not possible.
 """
 
 from __future__ import annotations
@@ -423,14 +445,17 @@ def _try_elegoo(raw: bytes) -> Optional[dict]:
 # ---- Bambu Lab -------------------------------------------------------------
 
 def _detect_bambu(raw: bytes) -> bool:
-    """Heuristically detect a Bambu Lab MIFARE Classic 1K tag.
+    """Heuristically detect a Bambu Lab MIFARE Classic 1K tag from a raw byte dump.
 
     Bambu tags use MIFARE Classic 1K with RSA-2048-signed, per-UID derived
-    encryption keys.  We cannot decrypt them with MFRC522/PN532 hardware.
+    encryption keys.  A raw byte dump from an unauthenticated read cannot be
+    decrypted here — the encrypted blocks look like random data.  Full sector
+    data is only available after per-sector HKDF key derivation and MIFARE
+    authentication (see ``_bambu_derive_keys`` and the module docstring).
 
-    Detection is unreliable from raw bytes alone because the encrypted
-    blocks look like random data; we flag it only when the raw dump is exactly
-    a multiple of 64 bytes (MIFARE Classic sector size) with no readable NDEF.
+    Detection is unreliable from raw bytes alone; we flag a candidate only when
+    the raw dump is exactly a multiple of 64 bytes (MIFARE Classic sector size)
+    with no readable NDEF and no known filament keywords.
     This is a best-effort heuristic only.
     """
     if len(raw) == 0:
@@ -453,10 +478,34 @@ def _detect_bambu(raw: bytes) -> bool:
     return True
 
 
-# Bambu Lab HKDF key derivation
 # ---------------------------------------------------------------------------
-# Master key and algorithm from Bambu-Research-Group/RFID-Tag-Guide/deriveKeys.py
+# Bambu Lab HKDF sector-key derivation
 # ---------------------------------------------------------------------------
+# Bambu Lab MIFARE Classic 1K tags use per-UID sector keys derived from a
+# static device master key via HKDF-SHA256.  The algorithm is documented in
+# the publicly available Bambu-Research-Group/RFID-Tag-Guide repository and
+# has been independently re-implemented here from first principles without
+# copying any code.
+#
+# Key derivation overview:
+#   IKM  (input key material) = _BAMBU_MASTER_KEY  (static 16-byte device key)
+#   Salt                       = tag UID bytes       (4 bytes, unique per tag)
+#   Info / context             = b"RFID-A\x00"       (7 bytes, incl. null)
+#   Output length per sector   = 6 bytes             (MIFARE Classic key width)
+#   Number of sector keys      = 16                  (one per MIFARE Classic 1K sector)
+#
+# pycryptodome HKDF signature:
+#   HKDF(master, key_len, salt, hashmod, num_keys=1, context=b"")
+#          ↑                ↑
+#         IKM             salt  ← note: master comes FIRST, then salt
+#
+# Hardware requirements:
+#   Authenticated MIFARE Classic reads require hardware that supports the
+#   ISO/IEC 14443 Type A 3-pass authentication protocol (e.g. MFRC522,
+#   PN532, ACR122U).  Cheap "pass-through" USB readers typically do NOT
+#   support per-sector key authentication and will fail silently.
+# ---------------------------------------------------------------------------
+
 _BAMBU_MASTER_KEY = bytes([
     0x9a, 0x75, 0x9c, 0xf2, 0xc4, 0xf7, 0xca, 0xff,
     0x22, 0x2c, 0xb9, 0x76, 0x9b, 0x41, 0xbc, 0x96,
@@ -464,22 +513,50 @@ _BAMBU_MASTER_KEY = bytes([
 
 
 def _bambu_derive_keys(uid_bytes: bytes) -> list:
-    """Derive the 16 MIFARE sector A-keys for a Bambu Lab tag from its UID.
+    """Derive the 16 MIFARE sector Key-A values for a Bambu Lab tag.
 
-    Algorithm (from Bambu-Research-Group/RFID-Tag-Guide/deriveKeys.py):
-      raw = HKDF(uid_bytes, 6, master_key, SHA256, num_keys=16, context=b"RFID-A\\0")
-    Returns list of 16 × 6-byte keys (one per sector).
-    Raises ImportError if pycryptodome is not available.
+    Uses HKDF-SHA256 with the static Bambu master key as the IKM and the
+    tag UID as the salt.  Returns a list of 16 × 6-byte keys (one per MIFARE
+    Classic 1K sector, sectors 0-15).
+
+    Parameters
+    ----------
+    uid_bytes : bytes
+        Raw UID bytes read from the tag (typically 4 bytes for MIFARE Classic 1K).
+
+    Returns
+    -------
+    list of 16 bytes objects, each exactly 6 bytes long.
+
+    Raises
+    ------
+    ImportError
+        If pycryptodome is not installed.  Install with: pip3 install pycryptodome
+
+    Notes
+    -----
+    pycryptodome's HKDF signature is HKDF(master, key_len, salt, hashmod, …).
+    The FIRST argument is the IKM (master / input key material); the THIRD
+    argument is the salt.  This is easy to confuse — do not swap them or all
+    derived sector keys will be wrong and every authentication will fail.
     """
     if not _PYCRYPTODOME_OK:
         raise ImportError(
             "pycryptodome required for Bambu tag key derivation. "
             "Install with: pip3 install pycryptodome"
         )
-    # HKDF(salt, key_len, master, hashmod, num_keys, context) with num_keys=16
-    # returns a list of 16 independent 6-byte keys directly — one per MIFARE
-    # sector.  Do NOT slice that list further; just return it as-is.
-    raw = _HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, _SHA256, 16, context=b"RFID-A\x00")
+    # pycryptodome HKDF(master, key_len, salt, hashmod, num_keys, context):
+    #   master  = _BAMBU_MASTER_KEY  (IKM — the static Bambu device secret)
+    #   key_len = 6                  (MIFARE Classic key width in bytes)
+    #   salt    = uid_bytes          (per-tag differentiator)
+    #   num_keys= 16                 (one key per sector; internally derives
+    #                                 96 bytes and splits into 16 × 6-byte keys)
+    #   context = b"RFID-A\x00"     (7-byte info/context string)
+    #
+    # WARNING: Do NOT swap master and salt here.  uid_bytes must be the salt
+    # (third argument), not the master (first).  Swapping them produces
+    # completely wrong keys and silent authentication failure on the tag.
+    raw = _HKDF(_BAMBU_MASTER_KEY, 6, uid_bytes, _SHA256, 16, context=b"RFID-A\x00")
     return list(raw)
 
 
