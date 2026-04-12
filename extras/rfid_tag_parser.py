@@ -59,8 +59,23 @@ published procedure.
 
   IKM   = 4-byte tag UID (unique per spool) — uid is the HKDF input key material
   Salt  = static 16-byte Bambu device master key (see ``_BAMBU_MASTER_KEY``)
-  Info  = b"RFID-A\\x00"
+  Info  = b"RFID-A\\x00"  (Key A, used for all authenticated reads)
   Output = 96 bytes split into 16 × 6-byte MIFARE sector keys
+
+Key B derivation (for write access)
+------------------------------------
+Key B is derived identically to Key A but with the context b"RFID-B\\x00".
+This convention follows community tooling (e.g. open Bambu tag programmers).
+On factory-programmed Bambu tags Key B is typically all-zeros; on custom/blank
+MIFARE Classic tags programmed with this toolchain Key B is HKDF-derived.
+
+  IKM   = 4-byte tag UID (same as Key A)
+  Salt  = _BAMBU_MASTER_KEY (same as Key A)
+  Info  = b"RFID-B\\x00"  (Key B, used for write authentication)
+  Output = 96 bytes split into 16 × 6-byte sector Key B values
+
+Use ``_bambu_derive_keys_b()`` to obtain Key B values.  Pass them with
+``use_key_b=True`` to the reader's write method.
 
 After key derivation, each of the 16 sectors is authenticated (Key A) and read
 with the MFRC522 PCD_AUTHENT command before the data blocks can be accessed.
@@ -80,7 +95,10 @@ Known limitations
   sector-key authentication.  Detection is attempted from the raw dump when
   available; if the raw bytes look like these formats they are parsed, but in
   practice the data past page 15 (sector 1) may not be available without auth.
-- Bambu tags are RSA-2048-signed and read-only; write-back is not possible.
+- Factory Bambu tags carry an RSA-2048 signature; the Bambu printer firmware
+  validates this signature so official firmware will reject reprogrammed tags.
+  Writing Tray UID / spool metadata to custom (blank) MIFARE Classic tags
+  programmed with this toolchain is fully supported via Key B authentication.
 """
 
 from __future__ import annotations
@@ -573,8 +591,48 @@ def _bambu_derive_keys(uid_bytes: bytes) -> list:
     #   salt    = _BAMBU_MASTER_KEY  (static Bambu device secret, used as salt)
     #   num_keys= 16                 (one key per sector; internally derives
     #                                 96 bytes and splits into 16 × 6-byte keys)
-    #   context = b"RFID-A\x00"     (7-byte info/context string)
+    #   context = b"RFID-A\x00"     (7-byte info/context string for Key A)
     raw = _HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, _SHA256, 16, context=b"RFID-A\x00")
+    return list(raw)
+
+
+def _bambu_derive_keys_b(uid_bytes: bytes) -> list:
+    """Derive the 16 MIFARE sector Key-B values for a Bambu Lab tag.
+
+    Identical to ``_bambu_derive_keys()`` except the HKDF context is
+    ``b"RFID-B\\x00"`` instead of ``b"RFID-A\\x00"``.  Key B is used to
+    authenticate sectors before writing data blocks.
+
+    This convention is followed by community Bambu tag programming tools.
+    On factory-programmed Bambu spools Key B is typically all-zeros (unused);
+    on custom MIFARE Classic tags programmed with this toolchain the derived
+    Key B values are written into the sector trailers at programming time so
+    that subsequent writes always authenticate with the correct key.
+
+    Parameters
+    ----------
+    uid_bytes : bytes
+        Raw UID bytes from the tag (same bytes used for Key A derivation).
+        The UID must be in the byte order returned by the RFID reader —
+        do NOT reverse or hexify these bytes before passing them here.
+
+    Returns
+    -------
+    list of 16 bytes objects, each exactly 6 bytes long.
+
+    Raises
+    ------
+    ImportError
+        If pycryptodome is not installed.  Install with: pip3 install pycryptodome
+    """
+    if not _PYCRYPTODOME_OK:
+        raise ImportError(
+            "pycryptodome required for Bambu tag key derivation. "
+            "Install with: pip3 install pycryptodome"
+        )
+    # Same HKDF call as _bambu_derive_keys() but with context b"RFID-B\x00"
+    # (Key B context) instead of b"RFID-A\x00" (Key A context).
+    raw = _HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, _SHA256, 16, context=b"RFID-B\x00")
     return list(raw)
 
 

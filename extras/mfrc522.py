@@ -1449,6 +1449,152 @@ class MFRC522Device:
         self._dbg("mfrc522._write_mifare_block block=%d ok=%s" % (block_addr, ok))
         return ok
 
+    def write_mifare_classic_authenticated_blocks(
+        self,
+        uid: bytes,
+        key_list: list,
+        block_data: dict,
+        use_key_b: bool = True,
+    ) -> bool:
+        """Write specific data blocks to a MIFARE Classic tag after per-sector authentication.
+
+        The tag must already be selected (anticollision + select completed) when this
+        method is called.  Call :meth:`write_authenticated_bambu_blocks` for a fully
+        self-contained version that handles REQA, anticollision, select, and halt.
+
+        Parameters
+        ----------
+        uid : bytes
+            Tag UID bytes (from anticollision; only first 4 bytes are used).
+        key_list : list
+            16 × 6-byte sector keys.  For write operations pass Key B keys
+            (derived with ``rfid_tag_parser._bambu_derive_keys_b()`` or the
+            HKDF default-key list for blank tags).
+        block_data : dict
+            Mapping of absolute block index → 16-byte ``bytes`` to write.
+            Block 0 (manufacturer block) and sector trailer blocks (3, 7, 11, …)
+            are silently skipped — they cannot be written with this method.
+        use_key_b : bool
+            When ``True`` (default), authenticate each sector with Key B
+            (``PICC_AUTHENT1B``).  Set ``False`` to use Key A instead.
+
+        Returns
+        -------
+        bool
+            ``True`` if every requested block was written successfully.
+            ``False`` on any authentication or write failure (the method stops
+            at the first failure).
+        """
+        auth_cmd = self.PICC_AUTHENT1B if use_key_b else self.PICC_AUTHENT1A
+        uid_bytes = bytes(uid[:4])
+
+        # Group block addresses by sector so we only authenticate each sector once.
+        sectors_needed: dict = {}
+        for block_addr in block_data:
+            # Skip block 0 (manufacturer / UID block — permanently locked).
+            if block_addr == 0:
+                self._dbg(
+                    "mfrc522.write_auth_blocks: skipping block 0 (manufacturer block)"
+                )
+                continue
+            sector = block_addr // 4
+            # Skip sector trailer blocks (block 3 of each sector).
+            if block_addr == sector * 4 + 3:
+                self._dbg(
+                    "mfrc522.write_auth_blocks: skipping trailer block=%d" % block_addr
+                )
+                continue
+            sectors_needed.setdefault(sector, []).append(block_addr)
+
+        for sector, blocks in sorted(sectors_needed.items()):
+            key = key_list[sector] if sector < len(key_list) else bytes(6)
+            trailer_block = sector * 4 + 3
+            self._dbg(
+                "mfrc522.write_auth_blocks sector=%d trailer=%d key_b=%s key=%s"
+                % (sector, trailer_block, use_key_b, bytes(key).hex())
+            )
+            if not self._auth_mifare_block(auth_cmd, trailer_block, key, uid_bytes):
+                self._dbg(
+                    "mfrc522.write_auth_blocks: auth failed sector=%d" % sector
+                )
+                self._clear_mask(self.Status2Reg, 0x08)
+                return False
+            for block_addr in sorted(blocks):
+                data = block_data[block_addr]
+                if not self._write_mifare_block(block_addr, bytes(data)):
+                    self._dbg(
+                        "mfrc522.write_auth_blocks: write failed block=%d" % block_addr
+                    )
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    return False
+            self._clear_mask(self.Status2Reg, 0x08)
+
+        return True
+
+    def write_authenticated_bambu_blocks(
+        self,
+        key_list: list,
+        block_data: dict,
+        use_key_b: bool = True,
+    ) -> Optional[dict]:
+        """Write specific MIFARE Classic blocks using per-sector authenticated keys.
+
+        Fully self-contained write cycle:
+          REQA (→ WUPA on miss) → anticollision → select → authenticate each
+          needed sector → write blocks → halt.
+
+        Intended for Bambu-compatible MIFARE Classic tags.  Pass Key B keys
+        (from ``rfid_tag_parser._bambu_derive_keys_b()``) with the default
+        ``use_key_b=True`` to write with Key B authentication.
+
+        This method is separate from the scan/read path and is only called
+        when an explicit write command (``RFID_WRITE`` / ``RFID_BAMBU_WRITE``)
+        is issued.
+
+        Parameters
+        ----------
+        key_list : list
+            16 × 6-byte sector keys for the tag.
+        block_data : dict
+            Mapping of absolute block index → 16-byte ``bytes`` to write.
+        use_key_b : bool
+            ``True`` (default) to authenticate with Key B; ``False`` for Key A.
+
+        Returns
+        -------
+        dict or None
+            ``{"uid_bytes": bytes, "uid_hex": str}`` on success, ``None`` on failure
+            (no tag present, authentication failure, or write error).
+        """
+        self.initialize()
+        with self.antenna_enabled():
+            self._rf_reset()
+            st, _ = self.request(self.PICC_REQA)
+            if st != self.MI_OK:
+                # WUPA wakes halted tags left over from a preceding read cycle.
+                self._dbg(
+                    "mfrc522.write_auth_bambu_blocks reqa_miss — trying wupa"
+                )
+                st, _ = self.request(self.PICC_WUPA)
+            if st != self.MI_OK:
+                return None
+            uid = self._anticoll_and_select()
+            if uid is None:
+                return None
+            uid_bytes = bytes(uid)
+            uid_hex = "".join("%02X" % b for b in uid)
+            self._dbg(
+                "mfrc522.write_auth_bambu_blocks uid=%s key_b=%s blocks=%s"
+                % (uid_hex, use_key_b, sorted(block_data.keys()))
+            )
+            ok = self.write_mifare_classic_authenticated_blocks(
+                uid_bytes, key_list, block_data, use_key_b=use_key_b
+            )
+            self.halt_tag()
+        if ok:
+            return {"uid_bytes": uid_bytes, "uid_hex": uid_hex}
+        return None
+
     def _write_mifare_classic_json(self, uid: list, text: str) -> bool:
         """Write JSON *text* to MIFARE Classic data blocks using the default key A (0xFF×6).
 

@@ -583,6 +583,15 @@ class Rfid:
                 ),
             )
             self.gcode.register_command(
+                "RFID_BAMBU_WRITE",
+                self.cmd_RFID_BAMBU_WRITE,
+                desc=(
+                    "Write a Tray UID (SPOOLID) to block 9 of a Bambu-compatible "
+                    "MIFARE Classic tag using Key B authentication. "
+                    "Params: LANE=<n>|SLOT=<n> [TRAY_UID=<32-char hex>]"
+                ),
+            )
+            self.gcode.register_command(
                 "RFID_ERASE",
                 self.cmd_RFID_ERASE,
                 desc=(
@@ -1039,6 +1048,159 @@ class Rfid:
                 "rfid[%s]: rfid_tag_parser.parse_tag failed for uid=%s", self.name, uid_hex
             )
             return None
+
+    # ------------------------------------------------------------------
+    # Bambu Lab tag write support (Key B, RFID_BAMBU_WRITE command only)
+    # ------------------------------------------------------------------
+    # This code path is NEVER triggered by the scan / read flow.
+    # It is invoked exclusively when the user issues RFID_BAMBU_WRITE.
+    # All existing write helpers (_write_spoolman_id_to_tag, write_tag,
+    # _write_mifare_classic_json, etc.) are completely unmodified.
+    # ------------------------------------------------------------------
+
+    def _try_bambu_write(
+        self,
+        uid_hex: str,
+        block_data: dict,
+    ) -> bool:
+        """Write specific MIFARE Classic blocks to a Bambu-compatible tag using Key B.
+
+        Derives Key B for every sector via HKDF-SHA256 with the ``RFID-B\\x00``
+        context (same IKM/salt as Key A, different info string).  Falls back to
+        the default MIFARE key (``FFFFFFFFFFFF``) on any per-sector auth failure so
+        that blank tags whose Key B has not yet been personalised can still be written.
+
+        This method is **only** called by ``cmd_RFID_BAMBU_WRITE``.  It is completely
+        separate from the scan / read path and from the existing ``RFID_WRITE`` /
+        ``write_tag`` flow.
+
+        Parameters
+        ----------
+        uid_hex : str
+            Hardware UID of the tag as a hex string (e.g. ``"62F0E76B"``).
+            Must be in the byte order reported by the reader — do NOT reverse.
+        block_data : dict
+            Mapping of absolute block index → 16-byte ``bytes`` to write.
+
+        Returns
+        -------
+        bool
+            ``True`` if all requested blocks were written successfully.
+        """
+        if _tag_parser is None:
+            self._log.warning(
+                "rfid[%s]: Bambu write skipped uid=%s — rfid_tag_parser not loaded",
+                self.name, uid_hex,
+            )
+            return False
+
+        # Convert uid hex string to raw bytes.
+        # The UID bytes must be passed to HKDF in the same order as the reader
+        # returned them (e.g. for uid_hex="62F0E76B" → b'\x62\xf0\xe7\x6b').
+        # Do NOT reverse these bytes — the Android reference uses the same order.
+        try:
+            uid_bytes = bytes.fromhex(uid_hex)
+        except Exception:
+            self._log.warning(
+                "rfid[%s]: Bambu write: invalid uid_hex=%s", self.name, uid_hex
+            )
+            return False
+
+        # Derive Key B using the RFID-B\x00 HKDF context.
+        try:
+            key_list_b = _tag_parser._bambu_derive_keys_b(uid_bytes)
+        except ImportError as exc:
+            self._log.warning(
+                "rfid[%s]: pycryptodome not available — Bambu Key B derivation skipped"
+                " uid=%s. Install with: pip3 install pycryptodome. (%s)",
+                self.name, uid_hex, exc,
+            )
+            return False
+        except Exception as exc:
+            self._log.warning(
+                "rfid[%s]: Bambu Key B derivation failed uid=%s: %s",
+                self.name, uid_hex, exc,
+            )
+            return False
+
+        self._debug(
+            f"rfid[{self.name}]: Bambu write uid={uid_hex}"
+            f" blocks={sorted(block_data.keys())} key_b=derived"
+        )
+
+        write_method = getattr(self.reader, "write_authenticated_bambu_blocks", None)
+        if write_method is None:
+            self._log.warning(
+                "rfid[%s]: reader has no write_authenticated_bambu_blocks"
+                " — Bambu block write not supported",
+                self.name,
+            )
+            return False
+
+        # First attempt: HKDF-derived Key B (correct for tags programmed with
+        # this toolchain or with RFID-B\x00 sector keys set).
+        try:
+            result = write_method(key_list_b, block_data, use_key_b=True)
+        except Exception as exc:
+            self._log.warning(
+                "rfid[%s]: Bambu Key B write failed uid=%s: %s",
+                self.name, uid_hex, exc,
+            )
+            result = None
+
+        if result is not None:
+            actual_uid = result.get("uid_hex")
+            if actual_uid is not None and actual_uid != uid_hex:
+                self._log.warning(
+                    "rfid[%s]: HKDF Key B write selected different tag"
+                    " uid=%s (expected %s) — discarding",
+                    self.name, actual_uid, uid_hex,
+                )
+            else:
+                self._debug(
+                    f"rfid[{self.name}]: Bambu write succeeded uid={uid_hex} (HKDF Key B)"
+                )
+                return True
+
+        # Second attempt: fall back to the default MIFARE key (0xFF×6) as Key B.
+        # Blank / factory-default MIFARE Classic tags that have not yet been
+        # personalised will have Key B = FFFFFFFFFFFF.
+        self._log.warning(
+            "rfid[%s]: Bambu HKDF Key B write failed uid=%s"
+            " — retrying with default key FFFFFFFFFFFF",
+            self.name, uid_hex,
+        )
+        default_key = b"\xFF\xFF\xFF\xFF\xFF\xFF"
+        fallback_keys = [default_key] * 16
+        try:
+            result = write_method(fallback_keys, block_data, use_key_b=True)
+        except Exception as exc:
+            self._log.warning(
+                "rfid[%s]: Bambu default Key B fallback failed uid=%s: %s",
+                self.name, uid_hex, exc,
+            )
+            result = None
+
+        if result is not None:
+            actual_uid = result.get("uid_hex")
+            if actual_uid is not None and actual_uid != uid_hex:
+                self._log.warning(
+                    "rfid[%s]: default Key B fallback selected different tag"
+                    " uid=%s (expected %s) — discarding",
+                    self.name, actual_uid, uid_hex,
+                )
+            else:
+                self._debug(
+                    f"rfid[{self.name}]: Bambu write succeeded uid={uid_hex}"
+                    " (default Key B fallback)"
+                )
+                return True
+
+        self._log.error(
+            "rfid[%s]: all Bambu Key B write attempts failed uid=%s",
+            self.name, uid_hex,
+        )
+        return False
 
     def _write_spoolman_id_to_tag(self, spoolman_id: int, uid_hex: str, is_bambu: bool = False) -> bool:
         """Merge ``{"spoolman_id": N}`` into the tag's NDEF JSON payload and write it back.
@@ -3225,7 +3387,7 @@ class Rfid:
         fmt = "?"
         if _tag_parser is not None:
             # Use filament_info from scan result if already parsed (e.g. Bambu via _scan_once).
-            filament_info = result.get("filament_info") if isinstance(result, dict) else None
+            filament_info = scan_result.get("filament_info") if isinstance(scan_result, dict) else None
             if filament_info is None:
                 filament_info = reader._apply_tag_parser(uid_hex, raw_bytes, tag_text)
             # If raw bytes parse detected a Bambu tag but could not decrypt it
@@ -3240,14 +3402,21 @@ class Rfid:
             mat = filament_info.get("material", "?")
             color = filament_info.get("color_hex", "?")
             brand = filament_info.get("brand", "?")
-            gcmd.respond_info(
-                f"RFID_CHECK_TAG: format={fmt} material={mat}"
-                f" color=#{color} brand={brand}"
-            )
-            for key in ("min_temp", "max_temp", "bed_temp", "diameter_mm", "weight_g"):
-                val = filament_info.get(key)
-                if val is not None:
-                    gcmd.respond_info(f"RFID_CHECK_TAG:   {key}={val}")
+
+            # For Bambu tags: emit the full labeled summary (matching the Android app view)
+            # so the user sees tray UID, all temperatures, weight, dates, etc. in one place.
+            if fmt == "bambu" and hasattr(_tag_parser, "format_bambu_info"):
+                summary = _tag_parser.format_bambu_info(filament_info, uid_hex=uid_hex)
+                gcmd.respond_info(summary)
+            else:
+                gcmd.respond_info(
+                    f"RFID_CHECK_TAG: format={fmt} material={mat}"
+                    f" color=#{color} brand={brand}"
+                )
+                for key in ("min_temp", "max_temp", "bed_temp", "diameter_mm", "weight_g"):
+                    val = filament_info.get(key)
+                    if val is not None:
+                        gcmd.respond_info(f"RFID_CHECK_TAG:   {key}={val}")
 
             spoolman_id_from_tag = filament_info.get("spoolman_id")
             if spoolman_id_from_tag is not None:
@@ -3403,6 +3572,125 @@ class Rfid:
                 "— check that the tag is writable and within range"
             )
 
+    def cmd_RFID_BAMBU_WRITE(self, gcmd):
+        """RFID_BAMBU_WRITE LANE=<n>|SLOT=<n> [TRAY_UID=<32-char hex>]
+
+        Write a Tray UID (spool identifier) to block 9 of a Bambu-compatible
+        MIFARE Classic 1K tag using HKDF-derived Key B authentication.
+
+        This command is completely separate from RFID_WRITE — it does not
+        touch any existing write path and does not affect non-Bambu tags.
+
+        Block 9 (sector 2, block 1) stores a 32-character ASCII hex string that
+        Bambu printers and Spoolman identify as the "Tray UID" / spool identifier.
+
+        Parameters
+        ----------
+        LANE / SLOT:
+            Which lane or slot reader to use.
+        TRAY_UID (optional):
+            32-character hex string to write as the Tray UID.
+            If omitted, a random 16-byte value is generated and used.
+
+        Workflow
+        --------
+        1. Detect the tag and obtain its hardware UID (4-byte MIFARE anti-coll UID).
+        2. Derive Key B from the hardware UID using HKDF-SHA256 with the
+           ``RFID-B\\x00`` context (same IKM/salt as Key A reads).
+        3. Authenticate sector 2 with Key B and write TRAY_UID to block 9.
+        4. Falls back to default Key B (0xFF×6) for blank / factory-default tags.
+        5. Print the hardware UID and the written Tray UID for use in Spoolman.
+
+        Example
+        -------
+        RFID_BAMBU_WRITE LANE=1
+        RFID_BAMBU_WRITE LANE=1 TRAY_UID=5F390A603AAB4B8FB1524EA53B16FA77
+        """
+        raw = self._resolve_port_param(gcmd, "RFID_BAMBU_WRITE")
+        reader, port = self._find_reader_for_port(raw)
+        if reader is None:
+            raise gcmd.error(f"RFID_BAMBU_WRITE: no rfid reader is mapped to {port}")
+
+        tray_uid_param = gcmd.get("TRAY_UID", None)
+
+        # Validate or generate the Tray UID.
+        if tray_uid_param is not None:
+            tray_uid_param = tray_uid_param.strip().upper()
+            if len(tray_uid_param) != 32 or not all(
+                c in "0123456789ABCDEF" for c in tray_uid_param
+            ):
+                raise gcmd.error(
+                    "RFID_BAMBU_WRITE: TRAY_UID must be a 32-character hex string "
+                    "(e.g. 5F390A603AAB4B8FB1524EA53B16FA77)"
+                )
+            tray_uid = tray_uid_param
+        else:
+            # Generate a random 128-bit (16-byte) value — same length as a UUID.
+            tray_uid = os.urandom(16).hex().upper()
+            gcmd.respond_info(
+                f"RFID_BAMBU_WRITE: no TRAY_UID provided — generated {tray_uid}"
+            )
+
+        reader._debug(
+            f"rfid[{reader.name}]: RFID_BAMBU_WRITE port={port} tray_uid={tray_uid}"
+        )
+
+        # Scan to detect the tag and get its hardware UID.
+        # Use _scan_once with minimal pages — we only need the UID, not NDEF data.
+        scan_result = reader._scan_once(port, max_pages=4)
+        if scan_result is None or not scan_result.get("uid_hex"):
+            gcmd.respond_info(f"RFID_BAMBU_WRITE: no tag detected on {port}")
+            return
+
+        uid_hex = scan_result.get("uid_hex") or "unknown"
+        gcmd.respond_info(
+            f"RFID_BAMBU_WRITE: detected tag uid={uid_hex} on {port}"
+        )
+
+        if uid_hex == "unknown":
+            gcmd.respond_info(
+                "RFID_BAMBU_WRITE: could not determine tag UID — aborting"
+            )
+            return
+
+        # Block 9 (sector 2, block 1) = Tray UID.
+        # TRAY_UID is a 32-character hex string representing 16 raw bytes,
+        # which fit exactly in one MIFARE Classic block.
+        try:
+            tray_uid_bytes = bytes.fromhex(tray_uid)
+        except ValueError:
+            gcmd.respond_info(
+                "RFID_BAMBU_WRITE: invalid TRAY_UID — expected a 32-character hex string"
+            )
+            return
+        if len(tray_uid_bytes) != 16:
+            gcmd.respond_info(
+                "RFID_BAMBU_WRITE: invalid TRAY_UID length — expected 16 bytes (32 hex characters)"
+            )
+            return
+        block_data = {9: tray_uid_bytes}
+
+        gcmd.respond_info(
+            f"RFID_BAMBU_WRITE: writing Tray UID {tray_uid} to block 9 ..."
+        )
+
+        ok = reader._try_bambu_write(uid_hex, block_data)
+
+        if ok:
+            gcmd.respond_info(
+                f"RFID_BAMBU_WRITE: success — Tray UID written to tag uid={uid_hex}\n"
+                f"  Hardware UID (for key derivation) : {uid_hex}\n"
+                f"  Tray UID (block 9, Spoolman ID)   : {tray_uid}\n"
+                "  Use the Tray UID above as the spool identifier in Spoolman."
+            )
+        else:
+            gcmd.respond_info(
+                f"RFID_BAMBU_WRITE: write failed for tag uid={uid_hex}\n"
+                "  Check that:\n"
+                "    - The tag is a MIFARE Classic 1K within reader range\n"
+                "    - pycryptodome is installed (pip3 install pycryptodome)\n"
+                "    - The reader supports ISO 14443-A 3-pass authentication"
+            )
 
     def cmd_RFID_ERASE(self, gcmd):
         """Erase the NDEF payload on the tag currently at LANE=<n> and evict its UID from cache."""
