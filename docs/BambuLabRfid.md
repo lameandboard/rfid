@@ -193,18 +193,19 @@ RFID_BAMBU_WRITE LANE=1 TRAY_UID=5F390A603AAB4B8FB1524EA53B16FA77
 | Parameter | Required | Description |
 |---|---|---|
 | `LANE` / `SLOT` | Yes | Reader lane to use |
-| `TRAY_UID` | No | 32-char hex string to write as Tray UID.  A random value is generated if omitted. |
+| `TRAY_UID` | No | 32-char hex string (representing 16 bytes) to use as the Tray UID.  A random value is generated if omitted. |
 
 The command:
 
 1. Scans to detect the tag and read its hardware UID.
 2. Derives Key B from the hardware UID via HKDF (`RFID-B\x00` context).
 3. Authenticates sector 2 (which contains block 9) with Key B.
-4. Writes the 32-char ASCII hex Tray UID into block 9.
+4. Hex-decodes the 32-char `TRAY_UID` value and writes the resulting 16 raw
+   bytes into block 9.
 5. Falls back to the default MIFARE key (`FFFFFFFFFFFF`) if HKDF Key B auth
    fails (useful for blank / factory-default tags).
-6. Reports the hardware UID and written Tray UID — use the Tray UID as the
-   spool identifier in Spoolman.
+6. Reports the hardware UID and written Tray UID in hex form — use the Tray
+   UID as the spool identifier in Spoolman.
 
 ### Note on factory Bambu tags
 

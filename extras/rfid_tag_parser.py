@@ -556,7 +556,7 @@ def _bambu_derive_keys(uid_bytes: bytes) -> list:
 
     Returns
     -------
-    list of 16 byte objects, each exactly 6 bytes long.
+    list of 16 bytes objects, each exactly 6 bytes long.
 
     Raises
     ------
@@ -618,7 +618,7 @@ def _bambu_derive_keys_b(uid_bytes: bytes) -> list:
 
     Returns
     -------
-    list of 16 byte objects, each exactly 6 bytes long.
+    list of 16 bytes objects, each exactly 6 bytes long.
 
     Raises
     ------

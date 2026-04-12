@@ -1149,10 +1149,18 @@ class Rfid:
             result = None
 
         if result is not None:
-            self._debug(
-                f"rfid[{self.name}]: Bambu write succeeded uid={uid_hex} (HKDF Key B)"
-            )
-            return True
+            actual_uid = result.get("uid_hex")
+            if actual_uid is not None and actual_uid != uid_hex:
+                self._log.warning(
+                    "rfid[%s]: HKDF Key B write selected different tag"
+                    " uid=%s (expected %s) — discarding",
+                    self.name, actual_uid, uid_hex,
+                )
+            else:
+                self._debug(
+                    f"rfid[{self.name}]: Bambu write succeeded uid={uid_hex} (HKDF Key B)"
+                )
+                return True
 
         # Second attempt: fall back to the default MIFARE key (0xFF×6) as Key B.
         # Blank / factory-default MIFARE Classic tags that have not yet been
@@ -1174,11 +1182,19 @@ class Rfid:
             result = None
 
         if result is not None:
-            self._debug(
-                f"rfid[{self.name}]: Bambu write succeeded uid={uid_hex}"
-                " (default Key B fallback)"
-            )
-            return True
+            actual_uid = result.get("uid_hex")
+            if actual_uid is not None and actual_uid != uid_hex:
+                self._log.warning(
+                    "rfid[%s]: default Key B fallback selected different tag"
+                    " uid=%s (expected %s) — discarding",
+                    self.name, actual_uid, uid_hex,
+                )
+            else:
+                self._debug(
+                    f"rfid[{self.name}]: Bambu write succeeded uid={uid_hex}"
+                    " (default Key B fallback)"
+                )
+                return True
 
         self._log.error(
             "rfid[%s]: all Bambu Key B write attempts failed uid=%s",
@@ -3638,8 +3654,20 @@ class Rfid:
             return
 
         # Block 9 (sector 2, block 1) = Tray UID.
-        # Encoded as a 32-character ASCII hex string, zero-padded to 16 bytes.
-        tray_uid_bytes = tray_uid.encode("ascii").ljust(16, b"\x00")[:16]
+        # TRAY_UID is a 32-character hex string representing 16 raw bytes,
+        # which fit exactly in one MIFARE Classic block.
+        try:
+            tray_uid_bytes = bytes.fromhex(tray_uid)
+        except ValueError:
+            gcmd.respond_info(
+                "RFID_BAMBU_WRITE: invalid TRAY_UID — expected a 32-character hex string"
+            )
+            return
+        if len(tray_uid_bytes) != 16:
+            gcmd.respond_info(
+                "RFID_BAMBU_WRITE: invalid TRAY_UID length — expected 16 bytes (32 hex characters)"
+            )
+            return
         block_data = {9: tray_uid_bytes}
 
         gcmd.respond_info(
