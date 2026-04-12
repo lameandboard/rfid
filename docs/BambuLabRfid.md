@@ -93,8 +93,8 @@ bits; they are never included in the parsed block dict.
 | Block | Byte offset | Field | Type | Notes |
 |---|---|---|---|---|
 | 16 | 0–1 | Format ID | uint16 LE | `0x0002` = extra colour data present |
-| 16 | 2–3 | Colour count | uint16 LE | Number of extra colours |
-| 16 | 4–7 | Second colour | uint8 × 4 (ABGR) | Alpha, Blue, Green, Red (reversed order) |
+| 16 | 2–3 | Color count | uint16 LE | Number of extra colors |
+| 16 | 4–7 | Second color | uint8 × 4 (ABGR) | Alpha, Blue, Green, Red (reversed order) |
 
 Sectors 5–15 are not currently parsed.
 
@@ -150,9 +150,9 @@ When a Bambu tag is successfully scanned, `rfid.py` logs at INFO level:
   Weight             : 1000 g
   Filament Length    : 330 m
   Production Date    : 2024_03_15_10_30
-  Drying             : 55 °C × 8 h
+  Drying             : 55 °C x 8 h
   Bed Temperature    : 60 °C
-  Hotend Range       : 190–220 °C
+  Hotend Range       : 190-220 °C
 ```
 
 ---

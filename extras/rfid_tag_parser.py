@@ -1610,7 +1610,7 @@ def format_bambu_info(info: dict, uid_hex: Optional[str] = None) -> str:
     drying_temp = info.get("drying_temp")
     drying_time_h = info.get("drying_time_h")
     if drying_temp is not None and drying_time_h is not None:
-        lines.append(f"  Drying             : {drying_temp} \u00b0C \u00d7 {drying_time_h} h")
+        lines.append(f"  Drying             : {drying_temp} \u00b0C x {drying_time_h} h")
     elif drying_temp is not None:
         lines.append(f"  Drying Temp        : {drying_temp} \u00b0C")
 
@@ -1623,7 +1623,7 @@ def format_bambu_info(info: dict, uid_hex: Optional[str] = None) -> str:
     min_temp = info.get("min_temp")
     max_temp = info.get("max_temp")
     if min_temp is not None and max_temp is not None:
-        lines.append(f"  Hotend Range       : {min_temp}\u2013{max_temp} \u00b0C")
+        lines.append(f"  Hotend Range       : {min_temp}-{max_temp} \u00b0C")
     elif max_temp is not None:
         lines.append(f"  Hotend Max         : {max_temp} \u00b0C")
     elif min_temp is not None:
