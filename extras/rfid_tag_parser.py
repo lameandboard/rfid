@@ -445,14 +445,17 @@ def _try_elegoo(raw: bytes) -> Optional[dict]:
 # ---- Bambu Lab -------------------------------------------------------------
 
 def _detect_bambu(raw: bytes) -> bool:
-    """Heuristically detect a Bambu Lab MIFARE Classic 1K tag.
+    """Heuristically detect a Bambu Lab MIFARE Classic 1K tag from a raw byte dump.
 
     Bambu tags use MIFARE Classic 1K with RSA-2048-signed, per-UID derived
-    encryption keys.  We cannot decrypt them with MFRC522/PN532 hardware.
+    encryption keys.  A raw byte dump from an unauthenticated read cannot be
+    decrypted here — the encrypted blocks look like random data.  Full sector
+    data is only available after per-sector HKDF key derivation and MIFARE
+    authentication (see ``_bambu_derive_keys`` and the module docstring).
 
-    Detection is unreliable from raw bytes alone because the encrypted
-    blocks look like random data; we flag it only when the raw dump is exactly
-    a multiple of 64 bytes (MIFARE Classic sector size) with no readable NDEF.
+    Detection is unreliable from raw bytes alone; we flag a candidate only when
+    the raw dump is exactly a multiple of 64 bytes (MIFARE Classic sector size)
+    with no readable NDEF and no known filament keywords.
     This is a best-effort heuristic only.
     """
     if len(raw) == 0:

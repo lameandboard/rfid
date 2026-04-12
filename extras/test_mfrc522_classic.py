@@ -424,8 +424,11 @@ class TestBambuKeyDerivation(unittest.TestCase):
         This test guards against the regression where uid_bytes was accidentally
         passed as the first (master/IKM) argument and _BAMBU_MASTER_KEY as salt.
         """
-        from Crypto.Protocol.KDF import HKDF as _HKDF_direct
-        from Crypto.Hash import SHA256 as _SHA256_direct
+        # Use the same _HKDF and _SHA256 that rfid_tag_parser.py resolved at
+        # import time (either Cryptodome.* or Crypto.*) so this test works under
+        # both pycryptodomex and pycryptodome installations.
+        _HKDF_direct = _rtp._HKDF
+        _SHA256_direct = _rtp._SHA256
 
         uid = bytes.fromhex("C2C304EB")
         master = _rtp._BAMBU_MASTER_KEY
@@ -447,7 +450,7 @@ class TestBambuKeyDerivation(unittest.TestCase):
         self.assertNotEqual(actual_keys, swapped_keys,
                             "Keys must NOT match the swapped (wrong) derivation")
 
-
+    def test_derive_keys_import_error_when_no_pycryptodome(self):
         """_bambu_derive_keys raises ImportError when pycryptodome is unavailable."""
         orig = _rtp._PYCRYPTODOME_OK
         try:
