@@ -53,11 +53,17 @@ MOONRAKER_URL="${MOONRAKER_URL:-http://localhost:7125}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 
+# Marker embedded in every git hook written by this installer.
+# Uninstall uses it to confirm ownership before removing a hook.
+HOOK_MARKER="# RFID installer hook"
+
 NO_RESTART=0
 NO_HOOKS=0
 NO_AFC=0
 UPDATE=0
 FORCE=0
+UNINSTALL=0
+PURGE_REPO=0
 BRANCH=""
 
 info()  { printf '[INFO] %s\n' "$*"; }
@@ -81,6 +87,8 @@ Options:
   --no-restart            do not restart klipper/moonraker
   --no-hooks              do not install AFC repo git hooks
   --no-afc                skip all AFC integration steps
+  --uninstall             reverse what install.sh did (preserves logs and repo dir)
+  --purge-repo            used with --uninstall: also delete the RFID repo dir after uninstall
   -h, --help              show help
 EOF
 }
@@ -446,6 +454,7 @@ install_git_hooks() {
 
     cat > "${hook_dir}/post-merge" <<EOF
 #!/usr/bin/env bash
+${HOOK_MARKER}
 set -e
 LOG_FILE="${HOOK_LOG}"
 {
@@ -486,6 +495,7 @@ EOF
 
     cat > "${hook_dir}/post-checkout" <<EOF
 #!/usr/bin/env bash
+${HOOK_MARKER}
 set -e
 LOG_FILE="${HOOK_LOG}"
 {
@@ -522,7 +532,185 @@ EOF
     info "Installed AFC git hooks in ${hook_dir}"
 }
 
-ORIGINAL_ARGS=("$@")
+do_uninstall() {
+    info "=== Uninstall step 1: RFID extras symlinks ==="
+    local spoolman_live="${KLIPPER_EXTRAS}/spoolman_client.py"
+    for live_path in "${LIVE_RFID}" "${LIVE_MFRC}" "${LIVE_PN532}" "${LIVE_PARSER}" "${spoolman_live}"; do
+        local base
+        base="$(basename "${live_path}")"
+        local repo_src="${REPO_EXTRAS}/${base}"
+        if [[ -L "${live_path}" ]]; then
+            local target
+            target="$(readlink -f "${live_path}" 2>/dev/null || true)"
+            local expected
+            expected="$(readlink -f "${repo_src}" 2>/dev/null || true)"
+            if [[ -n "${expected}" && "${target}" == "${expected}" ]]; then
+                rm -f "${live_path}"
+                info "Removed symlink: ${live_path}"
+            else
+                warn "Skipping ${live_path} — symlink points elsewhere (${target}); leaving untouched"
+            fi
+        elif [[ -e "${live_path}" ]]; then
+            warn "Skipping ${live_path} — exists but is not a symlink; remove manually if needed"
+        else
+            info "Not present (already removed): ${live_path}"
+        fi
+    done
+
+    info "=== Uninstall step 2: AFC_lane.py symlink ==="
+    if [[ -L "${LIVE_LANE}" ]]; then
+        local target
+        target="$(readlink -f "${LIVE_LANE}" 2>/dev/null || true)"
+        local expected
+        expected="$(readlink -f "${LOCAL_LANE}" 2>/dev/null || true)"
+        if [[ -n "${expected}" && "${target}" == "${expected}" ]]; then
+            rm -f "${LIVE_LANE}"
+            info "Removed symlink: ${LIVE_LANE}"
+            if [[ -f "${UPSTREAM_LANE}" ]]; then
+                cp "${UPSTREAM_LANE}" "${LIVE_LANE}"
+                info "Restored ${LIVE_LANE} from upstream: ${UPSTREAM_LANE}"
+            else
+                warn "Upstream AFC_lane.py not found at ${UPSTREAM_LANE}; symlink removed but not restored"
+            fi
+        else
+            warn "Skipping ${LIVE_LANE} — symlink points elsewhere (${target}); leaving untouched"
+        fi
+    elif [[ -e "${LIVE_LANE}" ]]; then
+        warn "Skipping ${LIVE_LANE} — exists but is not a symlink; remove manually if needed"
+    else
+        info "Not present (already removed): ${LIVE_LANE}"
+    fi
+
+    info "=== Uninstall step 3: AFC git hooks ==="
+    local hook_dir="${AFC_DIR}/.git/hooks"
+    if [[ -d "${hook_dir}" ]]; then
+        for hook in post-merge post-checkout; do
+            local hf="${hook_dir}/${hook}"
+            if [[ -f "${hf}" ]]; then
+                if grep -qF "${HOOK_MARKER}" "${hf}"; then
+                    rm -f "${hf}"
+                    info "Removed AFC git hook: ${hf}"
+                else
+                    warn "Skipping ${hf} — RFID hook marker not found; may belong to another tool"
+                fi
+            else
+                info "Hook not present (already removed): ${hf}"
+            fi
+        done
+    else
+        info "AFC hook dir not found (${hook_dir}); skipping hook removal"
+    fi
+
+    info "=== Uninstall step 4: Moonraker update_manager block ==="
+    if [[ -f "${MOONRAKER_CONF}" ]]; then
+        if grep -qF '[update_manager RFID]' "${MOONRAKER_CONF}"; then
+            backup_file "${MOONRAKER_CONF}"
+            python3 - "${MOONRAKER_CONF}" <<'PYEOF'
+import re
+import sys
+from pathlib import Path
+
+conf_path = Path(sys.argv[1])
+text = conf_path.read_text(encoding="utf-8")
+
+# Remove the [update_manager RFID] block and the blank line that typically
+# precedes it, leaving the rest of the file intact.
+pattern = re.compile(
+    r'\n?\[update_manager RFID\]\n.*?(?=\n\[|\Z)',
+    flags=re.MULTILINE | re.DOTALL,
+)
+text = pattern.sub('', text)
+
+# Collapse any runs of 3+ newlines down to two (one blank line).
+text = re.sub(r'\n{3,}', '\n\n', text)
+
+conf_path.write_text(text, encoding="utf-8")
+print('[INFO] Removed [update_manager RFID] block from moonraker.conf')
+PYEOF
+        else
+            info "moonraker.conf: [update_manager RFID] block not found; skipping"
+        fi
+    else
+        info "Moonraker config not found: ${MOONRAKER_CONF}; skipping"
+    fi
+
+    info "=== Uninstall step 5: printer.cfg include line ==="
+    if [[ -f "${PRINTER_CFG}" ]]; then
+        if grep -qF '[include rfid/*.cfg]' "${PRINTER_CFG}"; then
+            backup_file "${PRINTER_CFG}"
+            python3 - "${PRINTER_CFG}" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+lines = [l for l in lines if '[include rfid/*.cfg]' not in l]
+path.write_text("".join(lines), encoding="utf-8")
+print('[INFO] Removed [include rfid/*.cfg] from printer.cfg')
+PYEOF
+        else
+            info "printer.cfg: [include rfid/*.cfg] not found; skipping"
+        fi
+    else
+        info "printer.cfg not found: ${PRINTER_CFG}; skipping"
+    fi
+
+    info "=== Uninstall step 6: RFID config directory ==="
+    if [[ -d "${LIVE_RFID_CFG_DIR}" ]]; then
+        rm -rf "${LIVE_RFID_CFG_DIR}"
+        info "Removed RFID config dir: ${LIVE_RFID_CFG_DIR}"
+    else
+        info "RFID config dir not found (already removed): ${LIVE_RFID_CFG_DIR}"
+    fi
+
+    info "=== Uninstall step 7: UID cache ==="
+    local cache_file="${HOME}/RFID/cache/rfid_uid_cache.json"
+    if [[ -f "${cache_file}" ]]; then
+        rm -f "${cache_file}"
+        info "Removed cache file: ${cache_file}"
+    else
+        info "Cache file not found (already removed): ${cache_file}"
+    fi
+    for d in "${HOME}/RFID/cache" "${HOME}/RFID"; do
+        if [[ -d "$d" && -z "$(ls -A "$d" 2>/dev/null)" ]]; then
+            rmdir "$d"
+            info "Removed empty directory: $d"
+        fi
+    done
+
+    cat <<EOF
+
+===== RFID uninstall complete =====
+
+Removed (where present):
+  Klipper extra symlinks: rfid.py, mfrc522.py, pn532.py, rfid_tag_parser.py, spoolman_client.py
+  AFC_lane.py symlink (restored from upstream AFC if available)
+  AFC git hooks (only if owned by this installer)
+  [update_manager RFID] block from moonraker.conf
+  [include rfid/*.cfg] line from printer.cfg
+  RFID config directory: ${LIVE_RFID_CFG_DIR}
+  UID cache: ${HOME}/RFID/cache/rfid_uid_cache.json
+
+Preserved (not touched):
+  Log files (rfid.log, rfid_hook.log and any rotated backups)
+  Python packages (pycryptodome, cbor2)
+  RFID repo: ${REPO_DIR}
+    -> re-run with --purge-repo to delete it too
+
+EOF
+
+    if [[ "${PURGE_REPO}" -eq 1 ]]; then
+        info "=== Uninstall step 8: purging repo directory ==="
+        warn "About to permanently delete: ${REPO_DIR}"
+        warn "Press Ctrl-C within 5 seconds to abort."
+        sleep 5
+        rm -rf "${REPO_DIR}"
+        # The script has just deleted itself; exit cleanly without further file access.
+        exit 0
+    fi
+}
+
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --klipper-dir)
@@ -576,6 +764,14 @@ while [[ $# -gt 0 ]]; do
             FORCE=1
             shift
             ;;
+        --uninstall)
+            UNINSTALL=1
+            shift
+            ;;
+        --purge-repo)
+            PURGE_REPO=1
+            shift
+            ;;
         --no-restart)
             NO_RESTART=1
             shift
@@ -602,6 +798,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "${UNINSTALL}" -eq 1 ]]; then
+    # Detect AFC for uninstall (same logic used during install).
+    AFC_AVAILABLE=0
+    if [[ "${NO_AFC}" -ne 1 && -d "${AFC_DIR}" && -f "${UPSTREAM_LANE}" ]]; then
+        AFC_AVAILABLE=1
+    fi
+    do_uninstall
+    exit 0
+fi
 
 if [[ "${FORCE}" -eq 1 ]]; then
     repo_url="https://github.com/lameandboard/rfid.git"

@@ -43,7 +43,7 @@ lanes: 1,2
 - Prints scan results to the console when `messages: True`
 - Prints step-by-step scan progress to the console when `debug: True`
 - Keeps a managed local copy of `AFC_lane.py` inside this repo and symlinks Klipper to that copy
-- Writes a **rotating log** to `~/printer_data/logs/rfid.log` (1 MB, 5 backups)
+- Writes a **rotating log** to `~/printer_data/logs/rfid.log` (5 MB, 5 backups)
 - **Auto-injects** `[include rfid/*.cfg]` into `printer.cfg`
 - **Symlinks** `config/` into `~/printer_data/config/rfid/` — drop new `.cfg` files there to be picked up automatically
 - Installs **AFC git hooks** (`post-merge` / `post-checkout`) so `AFC_lane.py` is re-patched whenever AFC updates (only when AFC is installed)
@@ -101,6 +101,61 @@ cd RFID
 | `--no-restart` | Skip service restart after install |
 | `--no-hooks` | Skip installing AFC git hooks |
 | `--no-afc` | Skip all AFC integration steps |
+| `--uninstall` | Reverse everything the installer did (preserves logs and repo) |
+| `--purge-repo` | Used with `--uninstall`: also delete the RFID repo directory at the end |
+
+---
+
+## Uninstall
+
+To remove the RFID integration while keeping log files:
+
+```bash
+cd ~/RFID
+bash install.sh --uninstall
+```
+
+The same path-override flags (`--klipper-dir`, `--afc-dir`, `--config-dir`, `--moonraker-conf`) are accepted so the uninstaller finds everything in the same non-default locations used during install.
+
+### What uninstall removes
+
+| Item | Notes |
+|---|---|
+| Klipper extra symlinks (`rfid.py`, `mfrc522.py`, `pn532.py`, `rfid_tag_parser.py`, `spoolman_client.py`) | Only removed if the symlink points to this repo; a symlink pointing elsewhere is left untouched with a warning |
+| `AFC_lane.py` symlink in Klipper extras | Removed if it points to this repo's copy; the upstream AFC file is then copied back in its place. If AFC is not installed the symlink is simply removed |
+| AFC `post-merge` / `post-checkout` git hooks | Removed only if they contain the RFID installer marker line (`# RFID installer hook`); hooks belonging to other tools are left alone |
+| `[update_manager RFID]` block in `moonraker.conf` | Removed cleanly; the rest of the file is unchanged |
+| `[include rfid/*.cfg]` line in `printer.cfg` | Only the exact injected line is removed; the rest of the file is unchanged |
+| `~/printer_data/config/rfid/` directory | Entire directory removed |
+| `~/RFID/cache/rfid_uid_cache.json` | Cache file removed; `~/RFID/` and `~/RFID/cache/` are removed if they become empty |
+
+### What uninstall preserves
+
+- `~/printer_data/logs/rfid.log` and rotated backups
+- `~/printer_data/logs/rfid_hook.log`
+- Python packages (`pycryptodome`, `cbor2`) — may be used by other tools
+- The cloned RFID repo directory (`~/RFID`)
+
+### Also delete the repo directory
+
+If you want to remove the repo too, add `--purge-repo`:
+
+```bash
+bash install.sh --uninstall --purge-repo
+```
+
+This prints a 5-second warning before deleting `~/RFID`. You can press Ctrl-C to abort.
+
+### Re-installing after uninstall
+
+Running `install.sh` again after a successful uninstall restores everything from scratch — it is safe to install → uninstall → install in any sequence.
+
+### Verification checklist
+
+- Install then uninstall then install again should succeed without errors.
+- Log files (`rfid.log`, `rfid_hook.log`) must not be deleted by uninstall.
+- Symlinks that do not point to this repo must not be removed.
+- `moonraker.conf` and `printer.cfg` edits must leave all other sections / lines untouched.
 
 ---
 
@@ -566,7 +621,7 @@ Once you have identified the issue, set `debug: False` again — verbose logging
 - `debug: True` is meant for detailed live trace output while scanning.
 - Because `AFC_lane.py` is now managed locally in this repo, you do not need to directly patch the AFC repo by hand.
 - If Klipper or Moonraker does not restart automatically after install, restart them manually.
-- All RFID activity is also written to `~/printer_data/logs/rfid.log` (rotating, 1 MB max, 5 backups).
+- All RFID activity is also written to `~/printer_data/logs/rfid.log` (rotating, 5 MB max, 5 backups).
 
 ---
 
