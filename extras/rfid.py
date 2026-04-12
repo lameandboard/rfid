@@ -1774,6 +1774,8 @@ class Rfid:
                 "rfid: auto_create_spool: failed lane=%s uid=%s: %s",
                 lane, uid_hex, exc,
             )
+            # Freeze the lane on the reactor thread so no further reads re-trigger creation.
+            self._freeze_lane_async(lane, reason="auto_create_spool_exception")
             return
 
         if spool_id is None:
@@ -1782,6 +1784,8 @@ class Rfid:
                 " — check material/OpenSpool type data and Spoolman API/logs",
                 lane, uid_hex,
             )
+            # Freeze the lane on the reactor thread so no further reads re-trigger creation.
+            self._freeze_lane_async(lane, reason="auto_create_spool_none")
             return
 
         self._log.info(
@@ -2027,6 +2031,21 @@ class Rfid:
         if existing is not None:
             self.reactor.unregister_timer(existing)
         self._clear_scan_state(lane, reason)
+
+    def _freeze_lane_async(self, lane: str, reason: str = "") -> None:
+        """Thread-safe: freeze a lane from a background thread via reactor callback.
+
+        Sets ``_commit_in_progress[lane]`` and calls ``_end_scan_session`` on
+        the reactor thread, preventing any further scan timer ticks or tag reads
+        for the lane until a new scan window is started.  Safe to call from any
+        background (non-reactor) thread.
+        """
+        _lane = lane
+        _reason = reason
+        def _do_freeze(event_time):
+            self._commit_in_progress[_lane] = True
+            self._end_scan_session(_lane, reason=_reason)
+        self.reactor.register_async_callback(_do_freeze)
 
     # ---------- timer engine ----------
 

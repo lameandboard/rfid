@@ -1625,6 +1625,9 @@ def format_bambu_info(info: dict, uid_hex: Optional[str] = None) -> str:
     # same as the MIFARE anti-collision UID above.
     tray_uid = info.get("tray_uid")
     if tray_uid:
+        # Ensure tray_uid is shown as a hex string even if bytes slipped through.
+        if isinstance(tray_uid, (bytes, bytearray)):
+            tray_uid = tray_uid.hex().upper()
         lines.append(f"  Tray UID           : {tray_uid}")
 
     # Detailed filament type (e.g. "PLA Basic") comes from block 4.

@@ -15,13 +15,14 @@
 
 import json
 import logging
+import re
 import time
 from typing import Optional
 from urllib import error as url_error
 from urllib import parse as url_parse
 from urllib import request
 
-LOG = logging.getLogger(__name__)
+LOG = logging.getLogger("rfid.spoolman_client")
 
 # ---------------------------------------------------------------------------
 # SpoolmanDB fetch caches — populated at most once per process.
@@ -188,9 +189,10 @@ class SpoolmanClient:
             curl_parts.append(f"-d '{safe_body}'")
         curl_cmd = " ".join(curl_parts)
 
-        LOG.debug("spoolman: → %s %s%s", method, url,
-                  f"  body={body_str[:400]}{'...' if len(body_str) > 400 else ''}"
-                  if body_str else "")
+        _log_fn = LOG.info if method in ("POST", "PUT", "PATCH") else LOG.debug
+        _log_fn("spoolman: → %s %s%s", method, url,
+                f"  body={body_str[:800]}{'...' if len(body_str) > 800 else ''}"
+                if body_str else "")
         LOG.debug("spoolman:   %s", curl_cmd)
 
         req = request.Request(url, data=data, headers=self.headers, method=method)
@@ -801,7 +803,23 @@ class SpoolmanClient:
         # material_id (e.g. "GFA50", "GFG02") is the Bambu external filament DB id.
         # Used as Spoolman external_id to look up an existing matching filament entry.
         material_id = str(filament_info.get("material_id") or "").strip() or None
-        tray_uid = str(filament_info.get("tray_uid") or "").strip() or None
+        _raw_tray_uid = str(filament_info.get("tray_uid") or "").strip()
+        # Validate tray_uid: must be a non-empty even-length hex string (e.g. 32 hex chars
+        # for a 16-byte Bambu Tray UID).  If bytes slipped through, convert; if garbled, discard.
+        tray_uid: Optional[str] = None
+        if _raw_tray_uid:
+            if isinstance(filament_info.get("tray_uid"), (bytes, bytearray)):
+                # Raw bytes — convert to uppercase hex string.
+                tray_uid = filament_info["tray_uid"].hex().upper()
+                LOG.debug("auto_create_spool: tray_uid converted from bytes → %s", tray_uid)
+            elif re.fullmatch(r"[0-9A-Fa-f]+", _raw_tray_uid) and len(_raw_tray_uid) % 2 == 0:
+                tray_uid = _raw_tray_uid.upper()
+            else:
+                LOG.warning(
+                    "auto_create_spool: tray_uid %r is not a valid hex string"
+                    " — discarding to avoid Spoolman 422 error",
+                    _raw_tray_uid,
+                )
 
         # ------------------------------------------------------------------
         # 1. Determine density (required by Spoolman POST /api/v1/filament)
@@ -972,6 +990,10 @@ class SpoolmanClient:
             if bed_temp is not None:
                 filament_body["settings_bed_temp"] = int(bed_temp)
             try:
+                LOG.info(
+                    "auto_create_spool: creating filament — payload: %s",
+                    json.dumps(filament_body, default=str),
+                )
                 created = self._req("POST", "/api/v1/filament", filament_body)
                 if not isinstance(created, dict) or created.get("id") is None:
                     LOG.warning(
@@ -980,12 +1002,12 @@ class SpoolmanClient:
                     )
                     return None
                 filament_id = int(created["id"])
-                LOG.debug(
+                LOG.info(
                     "auto_create_spool: created filament id=%s name=%r density=%s",
                     filament_id, filament_name, density,
                 )
             except url_error.URLError as exc:
-                LOG.debug("auto_create_spool: filament create failed: %s", exc)
+                LOG.warning("auto_create_spool: filament create failed: %s", exc)
                 return None
             except Exception:
                 LOG.exception("auto_create_spool: filament create error")
@@ -1011,6 +1033,17 @@ class SpoolmanClient:
                     " — creating spool without extra UID field", exc
                 )
         try:
+            _spool_log = {
+                "filament_id": filament_id,
+                "remaining_weight": float(weight_g),
+                "spool_weight": spool_weight_g,
+                "lot_nr": tray_uid,
+                "extra": spool_extra,
+            }
+            LOG.info(
+                "auto_create_spool: creating spool — payload: %s",
+                json.dumps(_spool_log, default=str),
+            )
             created_spool = self.create_spool(
                 filament_id,
                 remaining_weight=float(weight_g),
@@ -1025,10 +1058,10 @@ class SpoolmanClient:
                 )
                 return None
             new_spool_id = int(created_spool["id"])
-            LOG.debug("auto_create_spool: created spool id=%s", new_spool_id)
+            LOG.info("auto_create_spool: created spool id=%s", new_spool_id)
             return new_spool_id
         except url_error.URLError as exc:
-            LOG.debug("auto_create_spool: spool create failed: %s", exc)
+            LOG.warning("auto_create_spool: spool create failed: %s", exc)
             return None
         except Exception:
             LOG.exception("auto_create_spool: spool create error")
