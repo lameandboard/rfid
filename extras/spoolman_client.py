@@ -664,20 +664,24 @@ class SpoolmanClient:
                 return f
         return None
 
-    def create_filament(self, name, vendor_id, material, density=None, color_hex=None):
+    def create_filament(self, name, vendor_id, material, density=None, color_hex=None, diameter=1.75):
         """Create a new filament and return the filament dict."""
         body = {"name": name, "vendor_id": int(vendor_id), "material": material}
-        if density is not None:
-            try:
-                body["density"] = float(density)
-            except (ValueError, TypeError):
-                pass
+        # density and diameter are required by the Spoolman API; always send them.
+        try:
+            body["density"] = float(density) if density is not None else _DENSITY_DEFAULT
+        except (TypeError, ValueError):
+            body["density"] = _DENSITY_DEFAULT
+        try:
+            body["diameter"] = float(diameter) if diameter is not None else 1.75
+        except (TypeError, ValueError):
+            body["diameter"] = 1.75
         if color_hex:
             body["color_hex"] = str(color_hex).lstrip("#").upper()
         return self._req("POST", "/api/v1/filament", body)
 
     def find_or_create_filament(self, name, vendor_id, material,
-                                density=None, color_hex=None):
+                                density=None, color_hex=None, diameter=1.75):
         """Return the filament_id for *name*+*vendor_id*, creating it if necessary.
 
         Raises ``ValueError`` when both the lookup and the create call return an
@@ -685,7 +689,7 @@ class SpoolmanClient:
         """
         fil = self.find_filament(name, vendor_id)
         if fil is None:
-            fil = self.create_filament(name, vendor_id, material, density, color_hex)
+            fil = self.create_filament(name, vendor_id, material, density, color_hex, diameter)
         if not isinstance(fil, dict) or fil.get("id") is None:
             raise ValueError(
                 f"Spoolman filament find/create for {name!r} returned unexpected response: {fil!r}"
@@ -695,7 +699,7 @@ class SpoolmanClient:
     # --- Spool helpers ---
 
     def create_spool(self, filament_id, initial_weight=None, remaining_weight=None,
-                     spool_weight=None):
+                     spool_weight=None, lot_nr=None, extra=None):
         """Create a new spool and return the spool dict.
 
         Args:
@@ -703,6 +707,8 @@ class SpoolmanClient:
             initial_weight:   weight of the filament on a brand-new full spool (grams).
             remaining_weight: current remaining filament weight (grams).
             spool_weight:     weight of the empty spool holder (grams).
+            lot_nr:           lot / tray UID string for identifying this spool.
+            extra:            dict of extra field key→value pairs to store on the spool.
         """
         body = {"filament_id": int(filament_id)}
         if initial_weight is not None:
@@ -720,28 +726,37 @@ class SpoolmanClient:
                 body["spool_weight"] = float(spool_weight)
             except (ValueError, TypeError):
                 pass
+        if lot_nr:
+            body["lot_nr"] = str(lot_nr)
+        if extra and isinstance(extra, dict):
+            body["extra"] = {str(k): str(v) for k, v in extra.items() if v is not None}
         return self._req("POST", "/api/v1/spool", body)
 
-    def auto_create_spool(self, filament_info: dict) -> Optional[int]:
+    def auto_create_spool(self, filament_info: dict, uid_hex: Optional[str] = None) -> Optional[int]:
         """Find or create a Spoolman vendor/filament/spool from tag filament data.
 
         Returns the new Spoolman spool ID on success, or None on failure.
 
-        Bare-minimum metadata required before creating anything:
+        Required before creating anything:
           * material  — filament type (e.g. "PLA", "PETG")
-          * color_hex — 6-digit hex color string; cannot be deduced from context
-          * weight_g  — spool weight in grams; defaults to 1000 g if not supplied
 
-        Additional fields that can be deduced when absent:
-          * brand     — inferred from tag_format, falls back to "Generic"
+        Optional but used when present:
+          * color_hex   — 6-digit hex color string; omitted from filament if absent
+          * weight_g    — spool weight in grams; defaults to 1000 g if not supplied
+          * brand       — inferred from tag_format, falls back to "Generic"
           * diameter_mm — defaults to 1.75 mm
+
+        The optional uid_hex argument (hardware RFID UID) is stored in the
+        spool's extra field (rfid_uid_1) at creation time when provided, after
+        ensuring the extra-field schema exists in Spoolman.
 
         Steps:
         1. Determine density via SpoolmanDB (Bambu DB or materials.json) or fallback table.
         2. Resolve vendor_id: find or create, with Generic fallback if brand fails.
-        3. Search for existing filament by material + vendor (prefer color_hex match).
+        3. Search for existing filament by external_id, then material + vendor (prefer color_hex match).
         4. If no match: POST /api/v1/filament — create the filament.
-        5. POST /api/v1/spool — create the spool referencing the filament.
+        5. POST /api/v1/spool — create the spool referencing the filament,
+           including lot_nr (tray_uid) and uid_hex in extra fields.
         """
         material = str(filament_info.get("material") or "").strip()
         if not material:
@@ -751,10 +766,8 @@ class SpoolmanClient:
         color_hex = str(filament_info.get("color_hex") or "").strip().lstrip("#").upper()
         if not color_hex:
             LOG.debug(
-                "auto_create_spool: skipped — no color_hex in tag data"
-                " (bare minimum: material + color_hex + weight)"
+                "auto_create_spool: no color_hex in tag data — proceeding without color"
             )
-            return None
 
         weight_g = filament_info.get("weight_g")
         if weight_g is None:
@@ -767,11 +780,11 @@ class SpoolmanClient:
             try:
                 weight_g = float(weight_g)
             except (TypeError, ValueError):
+                weight_g = _DEFAULT_SPOOL_WEIGHT_G
                 LOG.debug(
-                    "auto_create_spool: skipped — invalid weight_g in tag data: %r",
-                    weight_g,
+                    "auto_create_spool: invalid weight_g in tag data: %r, defaulting to %d g",
+                    filament_info.get("weight_g"), _DEFAULT_SPOOL_WEIGHT_G,
                 )
-                return None
 
         brand = str(filament_info.get("brand") or "").strip()
         if not brand:
@@ -784,6 +797,11 @@ class SpoolmanClient:
 
         diameter_mm = filament_info.get("diameter_mm") or 1.75
         is_bambu = bool(filament_info.get("is_bambu")) or "bambu" in brand.lower()
+
+        # material_id (e.g. "GFA50", "GFG02") is the Bambu external filament DB id.
+        # Used as Spoolman external_id to look up an existing matching filament entry.
+        material_id = str(filament_info.get("material_id") or "").strip() or None
+        tray_uid = str(filament_info.get("tray_uid") or "").strip() or None
 
         # ------------------------------------------------------------------
         # 1. Determine density (required by Spoolman POST /api/v1/filament)
@@ -874,29 +892,46 @@ class SpoolmanClient:
             )
 
         # ------------------------------------------------------------------
-        # 3. Search for an existing matching filament
+        # 3. Search for an existing matching filament.
+        #    First try by external_id (Bambu material_id like "GFA50"), then
+        #    fall back to material + vendor search with color_hex preference.
         # ------------------------------------------------------------------
         filament_id: Optional[int] = None
         search_ok = True
         try:
-            params: dict = {"material": material}
-            if vendor_id is not None:
-                params["vendor_name"] = resolved_vendor_name
-            filaments = self._req(
-                "GET", "/api/v1/filament?" + url_parse.urlencode(params)
-            )
-            if isinstance(filaments, list) and filaments:
-                if color_hex:
-                    for f in filaments:
-                        if str(f.get("color_hex") or "").upper() == color_hex:
-                            filament_id = int(f["id"])
-                            break
-                if filament_id is None:
-                    filament_id = int(filaments[0]["id"])
-                LOG.debug(
-                    "auto_create_spool: found filament id=%s material=%s",
-                    filament_id, material,
+            # 3a. Search by external_id when a Bambu material_id is available.
+            if material_id:
+                ext_results = self._req(
+                    "GET",
+                    "/api/v1/filament?" + url_parse.urlencode({"external_id": material_id}),
                 )
+                if isinstance(ext_results, list) and ext_results:
+                    filament_id = int(ext_results[0]["id"])
+                    LOG.debug(
+                        "auto_create_spool: found filament id=%s by external_id=%s",
+                        filament_id, material_id,
+                    )
+
+            # 3b. Fall back to material + vendor search.
+            if filament_id is None:
+                params: dict = {"material": material}
+                if vendor_id is not None:
+                    params["vendor_name"] = resolved_vendor_name
+                filaments = self._req(
+                    "GET", "/api/v1/filament?" + url_parse.urlencode(params)
+                )
+                if isinstance(filaments, list) and filaments:
+                    if color_hex:
+                        for f in filaments:
+                            if str(f.get("color_hex") or "").upper() == color_hex:
+                                filament_id = int(f["id"])
+                                break
+                    if filament_id is None:
+                        filament_id = int(filaments[0]["id"])
+                    LOG.debug(
+                        "auto_create_spool: found filament id=%s material=%s",
+                        filament_id, material,
+                    )
         except url_error.URLError as exc:
             LOG.debug("auto_create_spool: filament search failed: %s", exc)
             search_ok = False
@@ -917,18 +952,23 @@ class SpoolmanClient:
                 "material": material,
                 "density": density,
                 "diameter": float(diameter_mm),
-                "color_hex": color_hex,
                 "weight": float(weight_g),
             }
+            if color_hex:
+                filament_body["color_hex"] = color_hex
             if vendor_id is not None:
                 filament_body["vendor_id"] = vendor_id
+            if material_id:
+                filament_body["external_id"] = material_id
             min_temp = filament_info.get("min_temp")
             max_temp = filament_info.get("max_temp")
             bed_temp = filament_info.get("bed_temp")
+            # settings_extruder_temp: use min_temp (lower hotend bound) as the
+            # recommended extruder temperature; max_temp is not a separate Spoolman field.
             if min_temp is not None:
                 filament_body["settings_extruder_temp"] = int(min_temp)
-            if max_temp is not None:
-                filament_body["settings_extruder_temp_max"] = int(max_temp)
+            elif max_temp is not None:
+                filament_body["settings_extruder_temp"] = int(max_temp)
             if bed_temp is not None:
                 filament_body["settings_bed_temp"] = int(bed_temp)
             try:
@@ -952,14 +992,31 @@ class SpoolmanClient:
                 return None
 
         # ------------------------------------------------------------------
-        # 5. Create spool
+        # 5. Create spool, including lot_nr (tray_uid) and uid_hex extra field.
+        #    The rfid_uid_1 extra field must be registered in Spoolman before
+        #    it can be set on the spool.  Attempt to ensure it exists first;
+        #    if that fails, create the spool without the extra UID field (the
+        #    caller's add_uid_to_spool call will register it on the next scan).
         # ------------------------------------------------------------------
         spool_weight_g = filament_info.get("spool_weight_g")
+        spool_extra: Optional[dict] = None
+        if uid_hex:
+            try:
+                ok, _ = self.ensure_rfid_uid_fields(1)
+                if ok:
+                    spool_extra = {self.uid_field_name(1): uid_hex}
+            except Exception as exc:
+                LOG.debug(
+                    "auto_create_spool: ensure_rfid_uid_fields failed: %s"
+                    " — creating spool without extra UID field", exc
+                )
         try:
             created_spool = self.create_spool(
                 filament_id,
                 remaining_weight=float(weight_g),
                 spool_weight=spool_weight_g,
+                lot_nr=tray_uid,
+                extra=spool_extra,
             )
             if not isinstance(created_spool, dict) or created_spool.get("id") is None:
                 LOG.warning(
