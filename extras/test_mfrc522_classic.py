@@ -39,7 +39,10 @@ _BUS_MOD.MCU_SPI_from_config = MagicMock(return_value=MagicMock())
 sys.modules["extras.bus"] = _BUS_MOD
 
 import extras.rfid as _rfid_module  # noqa: E402
+import extras.rfid_tag_parser as _rtp  # noqa: E402
 from extras.mfrc522 import MFRC522Device  # noqa: E402
+
+_PYCRYPTODOME_OK = _rtp._PYCRYPTODOME_OK
 
 # ---------------------------------------------------------------------------
 # MFRC522Device test helpers
@@ -369,57 +372,56 @@ class TestScanOnceClassicFallback(unittest.TestCase):
 class TestBambuKeyDerivation(unittest.TestCase):
     """_bambu_derive_keys() must return 16 × 6-byte keys for any UID."""
 
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
     def test_derive_keys_returns_16_keys(self):
         """Key list must have exactly 16 entries (one per MIFARE Classic sector)."""
-        import extras.rfid_tag_parser as rtp
         uid = bytes.fromhex("C2C304EB")
-        keys = rtp._bambu_derive_keys(uid)
+        keys = _rtp._bambu_derive_keys(uid)
         self.assertEqual(len(keys), 16, "Expected 16 sector keys")
 
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
     def test_derive_keys_each_6_bytes(self):
         """Each derived key must be exactly 6 bytes (MIFARE key width)."""
-        import extras.rfid_tag_parser as rtp
         uid = bytes.fromhex("F29CDAEF")
-        keys = rtp._bambu_derive_keys(uid)
+        keys = _rtp._bambu_derive_keys(uid)
         for i, k in enumerate(keys):
             self.assertIsInstance(k, (bytes, bytearray),
                                   f"Key {i} is not bytes")
             self.assertEqual(len(k), 6,
                              f"Key {i} has wrong length {len(k)}, expected 6")
 
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
     def test_derive_keys_are_bytes_not_list(self):
         """Keys must be bytes-like objects, not lists of ints."""
-        import extras.rfid_tag_parser as rtp
         uid = bytes.fromhex("AABBCCDD")
-        keys = rtp._bambu_derive_keys(uid)
+        keys = _rtp._bambu_derive_keys(uid)
         for i, k in enumerate(keys):
             self.assertIsInstance(k, (bytes, bytearray),
                                   f"Key {i} type {type(k)} is not bytes/bytearray")
 
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
     def test_derive_keys_different_uids_give_different_keys(self):
         """Different UIDs must produce different key lists."""
-        import extras.rfid_tag_parser as rtp
-        keys_a = rtp._bambu_derive_keys(bytes.fromhex("C2C304EB"))
-        keys_b = rtp._bambu_derive_keys(bytes.fromhex("F29CDAEF"))
+        keys_a = _rtp._bambu_derive_keys(bytes.fromhex("C2C304EB"))
+        keys_b = _rtp._bambu_derive_keys(bytes.fromhex("F29CDAEF"))
         self.assertNotEqual(keys_a, keys_b,
                             "Different UIDs must produce different keys")
 
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
     def test_derive_keys_same_uid_deterministic(self):
         """Same UID must always yield the same keys (deterministic HKDF)."""
-        import extras.rfid_tag_parser as rtp
         uid = bytes.fromhex("C2C304EB")
-        self.assertEqual(rtp._bambu_derive_keys(uid), rtp._bambu_derive_keys(uid))
+        self.assertEqual(_rtp._bambu_derive_keys(uid), _rtp._bambu_derive_keys(uid))
 
     def test_derive_keys_import_error_when_no_pycryptodome(self):
         """_bambu_derive_keys raises ImportError when pycryptodome is unavailable."""
-        import extras.rfid_tag_parser as rtp
-        orig = rtp._PYCRYPTODOME_OK
+        orig = _rtp._PYCRYPTODOME_OK
         try:
-            rtp._PYCRYPTODOME_OK = False
+            _rtp._PYCRYPTODOME_OK = False
             with self.assertRaises(ImportError):
-                rtp._bambu_derive_keys(bytes.fromhex("C2C304EB"))
+                _rtp._bambu_derive_keys(bytes.fromhex("C2C304EB"))
         finally:
-            rtp._PYCRYPTODOME_OK = orig
+            _rtp._PYCRYPTODOME_OK = orig
 
 
 # ---------------------------------------------------------------------------
