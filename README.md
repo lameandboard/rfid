@@ -101,19 +101,21 @@ cd RFID
 | `--no-restart` | Skip service restart after install |
 | `--no-hooks` | Skip installing AFC git hooks |
 | `--no-afc` | Skip all AFC integration steps |
-| `--uninstall` | Reverse everything the installer did (preserves logs and repo) |
-| `--purge-repo` | Used with `--uninstall`: also delete the RFID repo directory at the end |
+| `--uninstall` | Reverse everything the installer did and delete the RFID repo (preserves logs) |
+| `--keep-repo` | Used with `--uninstall`: skip deleting the RFID repo directory |
 
 ---
 
 ## Uninstall
 
-To remove the RFID integration while keeping log files:
+To fully remove the RFID integration including the repo directory:
 
 ```bash
 cd ~/RFID
 bash install.sh --uninstall
 ```
+
+This will remove all installed files and then delete `~/RFID` itself (with a 5-second warning so you can Ctrl-C if you change your mind).
 
 The same path-override flags (`--klipper-dir`, `--afc-dir`, `--config-dir`, `--moonraker-conf`) are accepted so the uninstaller finds everything in the same non-default locations used during install.
 
@@ -128,27 +130,25 @@ The same path-override flags (`--klipper-dir`, `--afc-dir`, `--config-dir`, `--m
 | `[include rfid/*.cfg]` line in `printer.cfg` | Only the exact injected line is removed; the rest of the file is unchanged |
 | `~/printer_data/config/rfid/` directory | Entire directory removed |
 | `~/RFID/cache/rfid_uid_cache.json` | Cache file removed; `~/RFID/` and `~/RFID/cache/` are removed if they become empty |
+| The RFID repo directory (`~/RFID`) | Deleted last, after everything else is cleaned up |
 
 ### What uninstall preserves
 
 - `~/printer_data/logs/rfid.log` and rotated backups
 - `~/printer_data/logs/rfid_hook.log`
 - Python packages (`pycryptodome`, `cbor2`) — may be used by other tools
-- The cloned RFID repo directory (`~/RFID`)
 
-### Also delete the repo directory
+### Keep the repo directory
 
-If you want to remove the repo too, add `--purge-repo`:
+If you want to remove the integration but keep the repo (e.g. to reinstall later), add `--keep-repo`:
 
 ```bash
-bash install.sh --uninstall --purge-repo
+bash install.sh --uninstall --keep-repo
 ```
-
-This prints a 5-second warning before deleting `~/RFID`. You can press Ctrl-C to abort.
 
 ### Re-installing after uninstall
 
-Running `install.sh` again after a successful uninstall restores everything from scratch — it is safe to install → uninstall → install in any sequence.
+If you used `--keep-repo` or if you re-clone, running `install.sh` again restores everything from scratch — it is safe to install → uninstall → install in any sequence.
 
 ### Verification checklist
 

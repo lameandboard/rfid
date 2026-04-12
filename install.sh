@@ -63,7 +63,7 @@ NO_AFC=0
 UPDATE=0
 FORCE=0
 UNINSTALL=0
-PURGE_REPO=0
+KEEP_REPO=0
 BRANCH=""
 
 info()  { printf '[INFO] %s\n' "$*"; }
@@ -87,8 +87,8 @@ Options:
   --no-restart            do not restart klipper/moonraker
   --no-hooks              do not install AFC repo git hooks
   --no-afc                skip all AFC integration steps
-  --uninstall             reverse what install.sh did (preserves logs and repo dir)
-  --purge-repo            used with --uninstall: also delete the RFID repo dir after uninstall
+  --uninstall             reverse what install.sh did and delete the RFID repo (preserves logs)
+  --keep-repo             used with --uninstall: skip deleting the RFID repo directory
   -h, --help              show help
 EOF
 }
@@ -694,13 +694,14 @@ Removed (where present):
 Preserved (not touched):
   Log files (rfid.log, rfid_hook.log and any rotated backups)
   Python packages (pycryptodome, cbor2)
-  RFID repo: ${REPO_DIR}
-    -> re-run with --purge-repo to delete it too
 
 EOF
 
-    if [[ "${PURGE_REPO}" -eq 1 ]]; then
-        info "=== Uninstall step 8: purging repo directory ==="
+    info "=== Uninstall step 8: removing repo directory ==="
+    if [[ "${KEEP_REPO}" -eq 1 ]]; then
+        info "Skipping repo deletion (--keep-repo)"
+        printf 'RFID repo preserved at: %s\n\n' "${REPO_DIR}"
+    else
         warn "About to permanently delete: ${REPO_DIR}"
         warn "Press Ctrl-C within 5 seconds to abort."
         sleep 5
@@ -768,8 +769,8 @@ while [[ $# -gt 0 ]]; do
             UNINSTALL=1
             shift
             ;;
-        --purge-repo)
-            PURGE_REPO=1
+        --keep-repo)
+            KEEP_REPO=1
             shift
             ;;
         --no-restart)
