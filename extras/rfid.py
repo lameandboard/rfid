@@ -1745,62 +1745,54 @@ class Rfid:
             )
 
     def _do_auto_create_spool(self, lane: str, uid_hex: str, tag_data: dict) -> None:
-        """Background-thread worker: create a Spoolman spool from OpenSpool tag data.
+        """Background-thread worker: create a Spoolman spool from tag data.
 
         Runs entirely in a background thread.  Uses reactor.register_async_callback
         (which is thread-safe) to update reactor-side state (_pending, cache) and
         issue RFID_SCAN_COMMIT when creation succeeds.
+
+        Delegates the full vendor/filament/spool creation pipeline (including
+        SpoolmanDB density lookup) to SpoolmanClient.auto_create_spool, then
+        registers the hardware UID in the spool's extra fields.
         """
         client = self._spoolman
         if client is None:
             return
 
-        brand = str(tag_data.get("brand") or "Unknown").strip() or "Unknown"
-        # OpenSpool payload uses "type" for material; prefer explicit "material" if present.
-        raw_material = tag_data.get("material") or tag_data.get("type") or "Unknown"
-        material = str(raw_material).strip() or "Unknown"
-        density = tag_data.get("density")
-        color_hex = tag_data.get("color_hex")
-        # OpenSpool payload uses "weight" for remaining weight; prefer "spool_weight" if present.
-        spool_weight = tag_data.get("spool_weight") or tag_data.get("weight")
+        # Normalise OpenSpool payload: it uses "type" for material and "weight"
+        # for remaining weight.  Ensure standard keys are present before delegating.
+        filament_info = dict(tag_data)
+        if "material" not in filament_info or not filament_info.get("material"):
+            filament_info["material"] = tag_data.get("type") or ""
+        if "weight_g" not in filament_info or filament_info.get("weight_g") is None:
+            filament_info["weight_g"] = tag_data.get("spool_weight") or tag_data.get("weight")
 
         try:
-            vendor_id = client.find_or_create_vendor(brand)
+            spool_id = client.auto_create_spool(filament_info, uid_hex=uid_hex)
         except Exception as exc:
             self._log.warning(
-                "rfid: auto_create_spool: vendor find/create failed lane=%s uid=%s: %s",
+                "rfid: auto_create_spool: failed lane=%s uid=%s: %s",
                 lane, uid_hex, exc,
             )
             return
 
-        filament_name = f"{brand} {material}"
-        try:
-            filament_id = client.find_or_create_filament(
-                filament_name, vendor_id, material,
-                density=density, color_hex=color_hex,
-            )
-        except Exception as exc:
+        if spool_id is None:
             self._log.warning(
-                "rfid: auto_create_spool: filament find/create failed lane=%s uid=%s: %s",
-                lane, uid_hex, exc,
+                "rfid: auto_create_spool: spool creation returned None lane=%s uid=%s"
+                " — check material/color_hex fields and Spoolman logs",
+                lane, uid_hex,
             )
             return
 
-        try:
-            spool = client.create_spool(filament_id, initial_weight=spool_weight)
-            spool_id = int(spool["id"])
-            self._log.info(
-                "rfid: auto_create_spool: created spool id=%s lane=%s uid=%s",
-                spool_id, lane, uid_hex,
-            )
-        except Exception as exc:
-            self._log.warning(
-                "rfid: auto_create_spool: spool creation failed lane=%s uid=%s: %s",
-                lane, uid_hex, exc,
-            )
-            return
+        self._log.info(
+            "rfid: auto_create_spool: created spool id=%s lane=%s uid=%s",
+            spool_id, lane, uid_hex,
+        )
 
         # Register UID association via SpoolmanClient UID helpers.
+        # The UID was already included in the spool extra at creation time; this
+        # ensures it is also registered in the numbered rfid_uid_N slot system
+        # so find_spool_by_uid() can locate the spool in future scans.
         # All global cache mutations are deferred to _on_created, which runs on the
         # reactor thread, to avoid data-race on _UID_SPOOL_CACHE/_UID_CACHE_DIRTY.
         try:
@@ -3021,11 +3013,11 @@ class Rfid:
                 self._debug(f"rfid: could not read spoolman URL from moonraker.conf: {exc}")
         return None
 
-    def _auto_create_spool(self, filament_info: dict) -> Optional[int]:
+    def _auto_create_spool(self, filament_info: dict, uid_hex: Optional[str] = None) -> Optional[int]:
         """Delegate to SpoolmanClient.auto_create_spool."""
         if self._spoolman is None:
             return None
-        return self._spoolman.auto_create_spool(filament_info)
+        return self._spoolman.auto_create_spool(filament_info, uid_hex=uid_hex)
 
     def _fetch_spoolman_spool(self, spool_id: int) -> Optional[dict]:
         """Delegate to SpoolmanClient.get_spool."""
@@ -3129,7 +3121,7 @@ class Rfid:
                         f" color=#{filament_info.get('color_hex')}"
                         f" brand={filament_info.get('brand')}"
                     )
-                    new_sid = self._auto_create_spool(filament_info)
+                    new_sid = self._auto_create_spool(filament_info, uid_hex=uid if uid != "unknown" else None)
                     if new_sid is not None:
                         self._debug(
                             f"rfid[{self.name}]: auto_create_spool lane={port} → spoolman_id={new_sid}"
@@ -3437,7 +3429,7 @@ class Rfid:
                         "RFID_CHECK_TAG: auto-create requested but spoolman_url not configured"
                     )
                 else:
-                    new_sid = reader._auto_create_spool(filament_info)
+                    new_sid = reader._auto_create_spool(filament_info, uid_hex=uid_hex if uid_hex != "unknown" else None)
                     if new_sid is not None:
                         spoolman_id = new_sid
                         if uid_hex != "unknown":

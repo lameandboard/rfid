@@ -755,8 +755,15 @@ def _parse_bambu_blocks(blocks: dict) -> Optional[dict]:
         if v_min_temp and 0 < v_min_temp < 500:
             min_temp = int(v_min_temp)
 
-    # --- Block 9: tray UID (16-byte ASCII hex string) ---
-    tray_uid = _read_str(9)
+    # --- Block 9: tray UID (16 raw bytes → 32-char uppercase hex string) ---
+    # The tag stores the Tray UID as 16 raw binary bytes (not ASCII text).
+    # When displayed it is shown as the 32-character hex representation.
+    tray_uid = None
+    b9 = blocks.get(9)
+    if b9 and len(b9) >= 16:
+        uid_bytes = b9[:16]
+        if any(byte != 0 for byte in uid_bytes):
+            tray_uid = uid_bytes.hex().upper()
 
     # --- Block 12: production date "yyyy_MM_dd_HH_mm" ---
     production_date = _read_str(12)
