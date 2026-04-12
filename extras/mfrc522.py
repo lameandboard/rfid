@@ -731,7 +731,12 @@ class MFRC522Device:
             self._clear_mask(self.Status2Reg, 0x08)
         return result
 
-    def read_mifare_classic_tag(self, key_list: list, num_sectors: int = 16) -> Optional[dict]:
+    def read_mifare_classic_tag(
+        self,
+        key_list: list,
+        num_sectors: int = 16,
+        use_key_b: bool = False,
+    ) -> Optional[dict]:
         """Full MIFARE Classic 1K read: REQA → anticoll → select → auth+read all sectors.
 
         Returns a dict suitable for rfid_tag_parser.parse_tag():
@@ -740,6 +745,9 @@ class MFRC522Device:
 
         Uses REQA first (finds IDLE tags); falls back to WUPA so that tags left
         in HALT state by a preceding read_all_tags() call can still be reached.
+
+        use_key_b: When True, authenticate with Key B (PICC_AUTHENT1B) instead of
+                   Key A (PICC_AUTHENT1A).  Pass through to read_authenticated_blocks.
         """
         self.initialize()
         with self.antenna_enabled():
@@ -754,8 +762,10 @@ class MFRC522Device:
             if uid is None:
                 return None
             uid_hex = "".join("%02X" % b for b in uid)
-            self._dbg("mfrc522.read_mifare_classic uid=%s sectors=%d" % (uid_hex, num_sectors))
-            blocks = self.read_authenticated_blocks(uid, key_list, num_sectors=num_sectors)
+            self._dbg("mfrc522.read_mifare_classic uid=%s sectors=%d key_b=%s" % (
+                uid_hex, num_sectors, use_key_b))
+            blocks = self.read_authenticated_blocks(
+                uid, key_list, num_sectors=num_sectors, use_key_b=use_key_b)
             self.halt_tag()
         return {
             "uid_bytes": bytes(uid),
