@@ -39,7 +39,10 @@ _BUS_MOD.MCU_SPI_from_config = MagicMock(return_value=MagicMock())
 sys.modules["extras.bus"] = _BUS_MOD
 
 import extras.rfid as _rfid_module  # noqa: E402
+import extras.rfid_tag_parser as _rtp  # noqa: E402
 from extras.mfrc522 import MFRC522Device  # noqa: E402
+
+_PYCRYPTODOME_OK = _rtp._PYCRYPTODOME_OK
 
 # ---------------------------------------------------------------------------
 # MFRC522Device test helpers
@@ -360,6 +363,154 @@ class TestScanOnceClassicFallback(unittest.TestCase):
 
         self.rfid._try_bambu_read.assert_not_called()
         self.assertIsNone(result.get("uid_hex"))
+
+
+# ---------------------------------------------------------------------------
+# Tests: Bambu key derivation output shape
+# ---------------------------------------------------------------------------
+
+class TestBambuKeyDerivation(unittest.TestCase):
+    """_bambu_derive_keys() must return 16 × 6-byte keys for any UID."""
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_returns_16_keys(self):
+        """Key list must have exactly 16 entries (one per MIFARE Classic sector)."""
+        uid = bytes.fromhex("C2C304EB")
+        keys = _rtp._bambu_derive_keys(uid)
+        self.assertEqual(len(keys), 16, "Expected 16 sector keys")
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_each_6_bytes(self):
+        """Each derived key must be exactly 6 bytes (MIFARE key width)."""
+        uid = bytes.fromhex("F29CDAEF")
+        keys = _rtp._bambu_derive_keys(uid)
+        for i, k in enumerate(keys):
+            self.assertIsInstance(k, (bytes, bytearray),
+                                  f"Key {i} is not bytes")
+            self.assertEqual(len(k), 6,
+                             f"Key {i} has wrong length {len(k)}, expected 6")
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_are_bytes_not_list(self):
+        """Keys must be bytes-like objects, not lists of ints."""
+        uid = bytes.fromhex("AABBCCDD")
+        keys = _rtp._bambu_derive_keys(uid)
+        for i, k in enumerate(keys):
+            self.assertIsInstance(k, (bytes, bytearray),
+                                  f"Key {i} type {type(k)} is not bytes/bytearray")
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_different_uids_give_different_keys(self):
+        """Different UIDs must produce different key lists."""
+        keys_a = _rtp._bambu_derive_keys(bytes.fromhex("C2C304EB"))
+        keys_b = _rtp._bambu_derive_keys(bytes.fromhex("F29CDAEF"))
+        self.assertNotEqual(keys_a, keys_b,
+                            "Different UIDs must produce different keys")
+
+    @unittest.skipUnless(_PYCRYPTODOME_OK, "pycryptodome not installed")
+    def test_derive_keys_same_uid_deterministic(self):
+        """Same UID must always yield the same keys (deterministic HKDF)."""
+        uid = bytes.fromhex("C2C304EB")
+        self.assertEqual(_rtp._bambu_derive_keys(uid), _rtp._bambu_derive_keys(uid))
+
+    def test_derive_keys_import_error_when_no_pycryptodome(self):
+        """_bambu_derive_keys raises ImportError when pycryptodome is unavailable."""
+        orig = _rtp._PYCRYPTODOME_OK
+        try:
+            _rtp._PYCRYPTODOME_OK = False
+            with self.assertRaises(ImportError):
+                _rtp._bambu_derive_keys(bytes.fromhex("C2C304EB"))
+        finally:
+            _rtp._PYCRYPTODOME_OK = orig
+
+
+# ---------------------------------------------------------------------------
+# Tests: Failure cache behavior
+# ---------------------------------------------------------------------------
+
+class TestAuthFailCache(unittest.TestCase):
+    """_auth_fail_uids must suppress repeated Bambu reads within a scan window."""
+
+    def setUp(self):
+        self.rfid = _make_rfid(lanes="lane3")
+        self.lane = "lane3"
+        _rfid_module._UID_SPOOL_CACHE.clear()
+
+    def _wire_reader(self, tags):
+        self.rfid.reader = MagicMock()
+        self.rfid.reader.read_all_tags = MagicMock(return_value=tags)
+        self.rfid.uid_fast_scan = False
+
+    def test_first_failure_populates_cache(self):
+        """After _try_bambu_read fails, uid must appear in _auth_fail_uids[lane]."""
+        self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
+        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        # Ensure the lane cache exists (normally set by _start_scan_timer)
+        self.rfid._auth_fail_uids[self.lane] = {}
+
+        self.rfid._scan_once(self.lane, max_pages=135)
+
+        self.assertIn("C2C304EB", self.rfid._auth_fail_uids.get(self.lane, {}),
+                      "UID should be in _auth_fail_uids after first failure")
+
+    def test_second_attempt_skips_bambu_read(self):
+        """If UID is already in failure cache, _try_bambu_read must NOT be called again."""
+        self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
+        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        # Pre-populate the failure cache (as if a prior tick already failed)
+        self.rfid._auth_fail_uids[self.lane] = {"C2C304EB": 1000.0}
+
+        self.rfid._scan_once(self.lane, max_pages=135)
+
+        self.rfid._try_bambu_read.assert_not_called()
+
+    def test_cache_reset_on_clear_scan_state(self):
+        """_clear_scan_state must remove lane from _auth_fail_uids."""
+        self.rfid._auth_fail_uids[self.lane] = {"C2C304EB": 1000.0}
+
+        self.rfid._clear_scan_state(self.lane, reason="test")
+
+        self.assertNotIn(self.lane, self.rfid._auth_fail_uids,
+                         "_auth_fail_uids lane entry must be removed by _clear_scan_state")
+
+    def test_cache_initialised_on_start_scan_timer(self):
+        """_start_scan_timer must initialise an empty _auth_fail_uids dict for the lane."""
+        # Pre-populate stale state from a previous window
+        self.rfid._auth_fail_uids[self.lane] = {"STALEUID": 999.0}
+
+        self.rfid._start_scan_timer(self.lane)
+
+        fail_cache = self.rfid._auth_fail_uids.get(self.lane)
+        self.assertIsNotNone(fail_cache, "_auth_fail_uids[lane] must be set")
+        self.assertNotIn("STALEUID", fail_cache,
+                         "Stale UID from previous window must not appear in new window cache")
+
+    def test_success_does_not_populate_failure_cache(self):
+        """When _try_bambu_read succeeds, uid must NOT be added to failure cache."""
+        self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
+        self.rfid._try_bambu_read = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
+        self.rfid._apply_tag_parser = MagicMock(return_value=None)
+        self.rfid._auth_fail_uids[self.lane] = {}
+
+        self.rfid._scan_once(self.lane, max_pages=135)
+
+        self.assertNotIn("C2C304EB", self.rfid._auth_fail_uids.get(self.lane, {}),
+                         "Successful read must not populate failure cache")
+
+    def test_different_uids_cached_independently(self):
+        """Failure cache must track UIDs independently — failing one UID must not block another."""
+        # First scan: UID A fails
+        self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
+        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._auth_fail_uids[self.lane] = {}
+        self.rfid._scan_once(self.lane, max_pages=135)
+
+        # Second scan: UID B (different) must still attempt Bambu read
+        self._wire_reader([_classic_tag_entry(uid_hex="F29CDAEF")])
+        self.rfid._try_bambu_read.reset_mock()
+        self.rfid._scan_once(self.lane, max_pages=135)
+
+        self.rfid._try_bambu_read.assert_called_once_with("F29CDAEF")
 
 
 if __name__ == "__main__":

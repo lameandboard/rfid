@@ -475,8 +475,11 @@ def _bambu_derive_keys(uid_bytes: bytes) -> list:
             "pycryptodome required for Bambu tag key derivation. "
             "Install with: pip3 install pycryptodome"
         )
+    # HKDF(salt, key_len, master, hashmod, num_keys, context) with num_keys=16
+    # returns a list of 16 independent 6-byte keys directly — one per MIFARE
+    # sector.  Do NOT slice that list further; just return it as-is.
     raw = _HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, _SHA256, 16, context=b"RFID-A\x00")
-    return [raw[i * 6:(i + 1) * 6] for i in range(16)]
+    return list(raw)
 
 
 def _parse_bambu_blocks(blocks: dict) -> Optional[dict]:

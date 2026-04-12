@@ -709,8 +709,11 @@ class MFRC522Device:
             key = key_list[sector] if sector < len(key_list) else bytes(6)
             # Trailer block = sector * 4 + 3
             trailer_block = sector * 4 + 3
+            self._dbg("mfrc522.read_auth_blocks sector=%d trailer=%d key=%s" % (
+                sector, trailer_block, key.hex()))
             if not self._auth_mifare_block(auth_cmd, trailer_block, key, uid):
-                self._dbg("mfrc522.read_auth_blocks sector=%d auth_failed" % sector)
+                self._dbg("mfrc522.read_auth_blocks sector=%d auth_failed trailer=%d" % (
+                    sector, trailer_block))
                 # Clear crypto state before next sector
                 self._clear_mask(self.Status2Reg, 0x08)
                 # Pre-fill None for the three data blocks so callers get a consistent index map
@@ -720,6 +723,9 @@ class MFRC522Device:
             for blk_in_sector in range(3):  # 3 data blocks per sector
                 abs_block = sector * 4 + blk_in_sector
                 data = self._read_mifare_block(abs_block)
+                if data is None:
+                    self._dbg("mfrc522.read_auth_blocks sector=%d block=%d read_failed" % (
+                        sector, abs_block))
                 result[abs_block] = data
             # Clear MFCrypto1On before authenticating next sector
             self._clear_mask(self.Status2Reg, 0x08)

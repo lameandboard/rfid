@@ -453,6 +453,11 @@ class Rfid:
         # when the scan window timer expired before the lane_loaded event arrived.
         # Format: lane -> {"last_uid": str|None, "seen_uids": set, "ts": float}
         self._deferred_uid: dict[str, dict] = {}
+        # Per-window failure cache for Classic authenticated reads.
+        # Prevents repeated attempts for the same UID when auth/read already
+        # failed earlier in the same scan window.
+        # Format: lane -> {uid_hex: monotonic_timestamp_of_failure}
+        self._auth_fail_uids: dict[str, dict[str, float]] = {}
 
         self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
 
@@ -860,27 +865,42 @@ class Rfid:
             uid_bytes = bytes.fromhex(uid_hex)
         except Exception:
             return None
+        self._debug(
+            f"rfid[{self.name}]: Bambu key derivation starting uid={uid_hex}"
+            f" uid_len={len(uid_bytes)}B"
+        )
         try:
             key_list = _tag_parser._bambu_derive_keys(uid_bytes)
-        except ImportError:
-            self._log.info(
-                "rfid[%s]: pycryptodome not available — Bambu key derivation skipped. "
-                "Install with: pip3 install pycryptodome", self.name
+        except ImportError as exc:
+            self._log.warning(
+                "rfid[%s]: pycryptodome not available — Bambu key derivation skipped"
+                " uid=%s. Install with: pip3 install pycryptodome. (%s)",
+                self.name, uid_hex, exc,
             )
             return None
-        except Exception:
-            self._log.debug(
-                "rfid[%s]: Bambu key derivation failed for uid=%s", self.name, uid_hex
+        except Exception as exc:
+            self._log.warning(
+                "rfid[%s]: Bambu key derivation failed uid=%s: %s",
+                self.name, uid_hex, exc,
             )
             return None
+        self._debug(
+            f"rfid[{self.name}]: Bambu key derivation succeeded uid={uid_hex}"
+            f" keys={len(key_list)} each={len(key_list[0]) if key_list else 0}B"
+        )
         read_method = getattr(self.reader, "read_mifare_classic_tag", None)
         if read_method is None:
+            self._log.warning(
+                "rfid[%s]: reader has no read_mifare_classic_tag — Classic read not supported",
+                self.name,
+            )
             return None
         try:
             return read_method(key_list)
-        except Exception:
-            self._log.debug(
-                "rfid[%s]: Bambu MIFARE read failed for uid=%s", self.name, uid_hex
+        except Exception as exc:
+            self._log.warning(
+                "rfid[%s]: Bambu MIFARE read failed uid=%s: %s",
+                self.name, uid_hex, exc,
             )
             return None
 
@@ -1089,34 +1109,42 @@ class Rfid:
                         and tag_sak & 0x08
                         and uid_hex is not None
                     ):
-                        self._debug(
-                            f"rfid[{self.name}]: MIFARE Classic uid={uid_hex}"
-                            f" sak=0x{tag_sak:02X} — attempting Bambu authenticated read"
-                        )
-                        bambu_blocks = self._try_bambu_read(uid_hex)
-                        if bambu_blocks is not None:
+                        # Skip if we already failed for this UID in the current scan window.
+                        _lane_fail_cache = self._auth_fail_uids.get(lane, {})
+                        if uid_hex in _lane_fail_cache:
                             self._debug(
-                                f"rfid[{self.name}]: Bambu authenticated read succeeded uid={uid_hex}"
+                                f"rfid[{self.name}]: Bambu authenticated read skipped uid={uid_hex}"
+                                " (already failed this scan window)"
                             )
-                            filament_info = self._apply_tag_parser(uid_hex, bambu_blocks)
-                            tag["raw_bytes"] = bambu_blocks
-                            # raw_len: report the number of successfully-read
-                            # MIFARE blocks times the fixed 16-byte block size.
-                            # If the blocks mapping is missing or empty, report 0.
-                            _MIFARE_BLOCK_SIZE = 16
-                            if isinstance(bambu_blocks, dict):
-                                _block_count = len(bambu_blocks.get("blocks") or {})
-                            else:
-                                _block_count = 0
-                            tag["raw_len"] = _block_count * _MIFARE_BLOCK_SIZE
-                            if filament_info is not None:
-                                sid = filament_info.get("spoolman_id")
-                                tag["spoolman_id"] = sid
                         else:
                             self._debug(
-                                f"rfid[{self.name}]: Bambu authenticated read failed uid={uid_hex}"
-                                " (pycryptodome missing, key derivation error, or RF/auth failure)"
+                                f"rfid[{self.name}]: MIFARE Classic uid={uid_hex}"
+                                f" sak=0x{tag_sak:02X} — attempting Bambu authenticated read"
                             )
+                            bambu_blocks = self._try_bambu_read(uid_hex)
+                            if bambu_blocks is not None:
+                                self._debug(
+                                    f"rfid[{self.name}]: Bambu authenticated read succeeded uid={uid_hex}"
+                                )
+                                filament_info = self._apply_tag_parser(uid_hex, bambu_blocks)
+                                tag["raw_bytes"] = bambu_blocks
+                                # raw_len: report the number of successfully-read
+                                # MIFARE blocks times the fixed 16-byte block size.
+                                # If the blocks mapping is missing or empty, report 0.
+                                _MIFARE_BLOCK_SIZE = 16
+                                if isinstance(bambu_blocks, dict):
+                                    _block_count = len(bambu_blocks.get("blocks") or {})
+                                else:
+                                    _block_count = 0
+                                tag["raw_len"] = _block_count * _MIFARE_BLOCK_SIZE
+                                if filament_info is not None:
+                                    sid = filament_info.get("spoolman_id")
+                                    tag["spoolman_id"] = sid
+                            else:
+                                # Cache this failure for the rest of the scan window.
+                                self._auth_fail_uids.setdefault(lane, {})[uid_hex] = (
+                                    self.reactor.monotonic()
+                                )
                     # Cache update: store plain int sid.
                     if uid_hex and sid is not None:
                         existing = _UID_SPOOL_CACHE.get(uid_hex)
@@ -1647,6 +1675,7 @@ class Rfid:
         self._scan_last_uid.pop(lane, None)
         self._scan_no_tag_streak.pop(lane, None)
         self._scan_tick_count.pop(lane, None)
+        self._auth_fail_uids.pop(lane, None)
         self._scan_gen[lane] = self._scan_gen.get(lane, 0) + 1
         if reason:
             self._debug(
@@ -1695,6 +1724,7 @@ class Rfid:
         self._scan_last_uid[lane] = None
         self._scan_no_tag_streak[lane] = 0
         self._scan_tick_count[lane] = 0
+        self._auth_fail_uids[lane] = {}
         # Capture current generation so the timer callback can detect staleness.
         gen = self._scan_gen.get(lane, 0)
 
