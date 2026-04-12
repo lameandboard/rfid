@@ -282,18 +282,18 @@ class TestScanOnceClassicFallback(unittest.TestCase):
         self.rfid.uid_fast_scan = False
 
     def test_classic_tag_triggers_bambu_read(self):
-        """_scan_once must call _try_bambu_read for a MIFARE Classic uid-only entry."""
+        """_scan_once must call _try_bambu_read_with_fallback for a MIFARE Classic uid-only entry."""
         self._wire_reader([_classic_tag_entry()])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
 
         self.rfid._scan_once(self.lane, max_pages=135)
 
-        self.rfid._try_bambu_read.assert_called_once_with("C2C304EB")
+        self.rfid._try_bambu_read_with_fallback.assert_called_once_with("C2C304EB", round_num=1)
 
     def test_classic_tag_bambu_read_succeeds_returns_uid_and_raw(self):
         """When Bambu read succeeds, result must include uid_hex and non-zero raw_len."""
         self._wire_reader([_classic_tag_entry()])
-        self.rfid._try_bambu_read = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
         self.rfid._apply_tag_parser = MagicMock(return_value=None)
 
         result = self.rfid._scan_once(self.lane, max_pages=135)
@@ -306,7 +306,7 @@ class TestScanOnceClassicFallback(unittest.TestCase):
     def test_classic_tag_bambu_read_parses_spoolman_id(self):
         """Parsed spoolman_id from Bambu blocks must appear in the scan result."""
         self._wire_reader([_classic_tag_entry()])
-        self.rfid._try_bambu_read = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
         self.rfid._apply_tag_parser = MagicMock(return_value={"spoolman_id": 42, "tag_format": "bambu"})
 
         result = self.rfid._scan_once(self.lane, max_pages=135)
@@ -316,7 +316,7 @@ class TestScanOnceClassicFallback(unittest.TestCase):
     def test_classic_tag_bambu_read_fails_returns_uid_no_crash(self):
         """When Bambu read fails, _scan_once must still return the uid without crashing."""
         self._wire_reader([_classic_tag_entry()])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
 
         result = self.rfid._scan_once(self.lane, max_pages=135)
 
@@ -325,7 +325,7 @@ class TestScanOnceClassicFallback(unittest.TestCase):
         self.assertIsNone(result.get("spoolman_id"))
 
     def test_ntag_tag_does_not_trigger_bambu_read(self):
-        """For NTAG/Ultralight (SAK 0x00), _try_bambu_read must NOT be called."""
+        """For NTAG/Ultralight (SAK 0x00), _try_bambu_read_with_fallback must NOT be called."""
         ntag_entry = {
             "uid": [0x01, 0x02, 0x03, 0x04],
             "uid_hex": "01020304",
@@ -336,11 +336,11 @@ class TestScanOnceClassicFallback(unittest.TestCase):
             "sak": 0x00,
         }
         self._wire_reader([ntag_entry])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
 
         self.rfid._scan_once(self.lane, max_pages=135)
 
-        self.rfid._try_bambu_read.assert_not_called()
+        self.rfid._try_bambu_read_with_fallback.assert_not_called()
 
     def test_classic_tag_with_raw_bytes_already_set_skips_bambu_read(self):
         """If a Classic tag already has raw_bytes (e.g. from a cache hit), skip Bambu read."""
@@ -348,20 +348,20 @@ class TestScanOnceClassicFallback(unittest.TestCase):
         entry["raw_bytes"] = b"\x01" * 16
         entry["raw_len"] = 16
         self._wire_reader([entry])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
 
         self.rfid._scan_once(self.lane, max_pages=135)
 
-        self.rfid._try_bambu_read.assert_not_called()
+        self.rfid._try_bambu_read_with_fallback.assert_not_called()
 
     def test_no_tags_no_bambu_read(self):
-        """When read_all_tags returns [], _try_bambu_read must not be called."""
+        """When read_all_tags returns [], _try_bambu_read_with_fallback must not be called."""
         self._wire_reader([])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
 
         result = self.rfid._scan_once(self.lane, max_pages=135)
 
-        self.rfid._try_bambu_read.assert_not_called()
+        self.rfid._try_bambu_read_with_fallback.assert_not_called()
         self.assertIsNone(result.get("uid_hex"))
 
 
@@ -442,31 +442,39 @@ class TestAuthFailCache(unittest.TestCase):
         self.rfid.uid_fast_scan = False
 
     def test_first_failure_populates_cache(self):
-        """After _try_bambu_read fails, uid must appear in _auth_fail_uids[lane]."""
+        """After a failed round, uid must appear in _auth_fail_uids[lane]."""
         self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
         # Ensure the lane cache exists (normally set by _start_scan_timer)
         self.rfid._auth_fail_uids[self.lane] = {}
 
         self.rfid._scan_once(self.lane, max_pages=135)
 
-        self.assertIn("C2C304EB", self.rfid._auth_fail_uids.get(self.lane, {}),
-                      "UID should be in _auth_fail_uids after first failure")
+        uid_state = self.rfid._auth_fail_uids.get(self.lane, {}).get("C2C304EB")
+        self.assertIsNotNone(uid_state,
+                             "UID should be in _auth_fail_uids after first failure")
+        self.assertIsInstance(uid_state, dict,
+                              "_auth_fail_uids entry must be a dict with round/exhausted state")
+        self.assertEqual(uid_state.get("rounds"), 1)
 
     def test_second_attempt_skips_bambu_read(self):
-        """If UID is already in failure cache, _try_bambu_read must NOT be called again."""
+        """If UID is marked exhausted in failure cache, _try_bambu_read_with_fallback must NOT be called."""
         self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
-        # Pre-populate the failure cache (as if a prior tick already failed)
-        self.rfid._auth_fail_uids[self.lane] = {"C2C304EB": 1000.0}
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
+        # Pre-populate with exhausted state (as if max rounds have already been done)
+        self.rfid._auth_fail_uids[self.lane] = {
+            "C2C304EB": {"rounds": 2, "exhausted": True, "ts": 1000.0}
+        }
 
         self.rfid._scan_once(self.lane, max_pages=135)
 
-        self.rfid._try_bambu_read.assert_not_called()
+        self.rfid._try_bambu_read_with_fallback.assert_not_called()
 
     def test_cache_reset_on_clear_scan_state(self):
         """_clear_scan_state must remove lane from _auth_fail_uids."""
-        self.rfid._auth_fail_uids[self.lane] = {"C2C304EB": 1000.0}
+        self.rfid._auth_fail_uids[self.lane] = {
+            "C2C304EB": {"rounds": 1, "exhausted": False, "ts": 1000.0}
+        }
 
         self.rfid._clear_scan_state(self.lane, reason="test")
 
@@ -476,7 +484,9 @@ class TestAuthFailCache(unittest.TestCase):
     def test_cache_initialised_on_start_scan_timer(self):
         """_start_scan_timer must initialise an empty _auth_fail_uids dict for the lane."""
         # Pre-populate stale state from a previous window
-        self.rfid._auth_fail_uids[self.lane] = {"STALEUID": 999.0}
+        self.rfid._auth_fail_uids[self.lane] = {
+            "STALEUID": {"rounds": 2, "exhausted": True, "ts": 999.0}
+        }
 
         self.rfid._start_scan_timer(self.lane)
 
@@ -486,9 +496,9 @@ class TestAuthFailCache(unittest.TestCase):
                          "Stale UID from previous window must not appear in new window cache")
 
     def test_success_does_not_populate_failure_cache(self):
-        """When _try_bambu_read succeeds, uid must NOT be added to failure cache."""
+        """When Bambu read succeeds with required blocks, uid must NOT be added to failure cache."""
         self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
-        self.rfid._try_bambu_read = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=_FAKE_BAMBU_BLOCKS)
         self.rfid._apply_tag_parser = MagicMock(return_value=None)
         self.rfid._auth_fail_uids[self.lane] = {}
 
@@ -499,18 +509,18 @@ class TestAuthFailCache(unittest.TestCase):
 
     def test_different_uids_cached_independently(self):
         """Failure cache must track UIDs independently — failing one UID must not block another."""
-        # First scan: UID A fails
+        # First scan: UID A fails (round 1, not yet exhausted with _BAMBU_MAX_ROUNDS=2)
         self._wire_reader([_classic_tag_entry(uid_hex="C2C304EB")])
-        self.rfid._try_bambu_read = MagicMock(return_value=None)
+        self.rfid._try_bambu_read_with_fallback = MagicMock(return_value=None)
         self.rfid._auth_fail_uids[self.lane] = {}
         self.rfid._scan_once(self.lane, max_pages=135)
 
         # Second scan: UID B (different) must still attempt Bambu read
         self._wire_reader([_classic_tag_entry(uid_hex="F29CDAEF")])
-        self.rfid._try_bambu_read.reset_mock()
+        self.rfid._try_bambu_read_with_fallback.reset_mock()
         self.rfid._scan_once(self.lane, max_pages=135)
 
-        self.rfid._try_bambu_read.assert_called_once_with("F29CDAEF")
+        self.rfid._try_bambu_read_with_fallback.assert_called_once_with("F29CDAEF", round_num=1)
 
 
 if __name__ == "__main__":
