@@ -2091,9 +2091,11 @@ class Rfid:
         self._commit_in_progress.pop(lane, None)
         self._lane_committed.pop(lane, None)
         self._uid_lookup_in_flight.pop(lane, None)
-        # Reset the lane_loaded flag so the new scan window is not treated as
-        # already loaded from a previous cycle.
-        self._lane_loaded_seen.pop(lane, None)
+        # Explicitly mark lane_loaded as not-yet-seen for this new scan window.
+        # Using False (not pop) means the guard in _handle_lane_prep_start can
+        # distinguish "active AFC cycle, not yet loaded" (False) from "no cycle
+        # tracking present" (key missing), avoiding blocking unrelated commits.
+        self._lane_loaded_seen[lane] = False
         # Discard any deferred UID from a previous scan window so it is never
         # applied to the newly-starting window's lane_loaded event.
         self._deferred_uid.pop(lane, None)
@@ -2697,10 +2699,13 @@ class Rfid:
                 return
             # No-double-scan guard: if this lane was already confirmed (tag read
             # and committed) within the current load cycle — i.e. _lane_committed
-            # is True but lane_loaded has not yet fired — skip starting another
-            # scan window.  This prevents AFC autoload from triggering a redundant
-            # scan after the tag was already validated.
-            if self._lane_committed.get(lane) and not self._lane_loaded_seen.get(lane):
+            # is True and lane_loaded has explicitly not yet fired for this cycle
+            # (value is False, not just missing) — skip starting another scan
+            # window.  Using an explicit `is False` check avoids treating a missing
+            # _lane_loaded_seen entry (no active AFC cycle) as a mid-cycle block,
+            # which would incorrectly prevent a legitimate new scan after an
+            # unrelated commit (e.g. a previous RFID_SCAN on the same lane).
+            if self._lane_committed.get(lane) and self._lane_loaded_seen.get(lane) is False:
                 self._debug(
                     f"rfid[{self.name}]: prep_start: lane {lane} already committed"
                     f" this cycle — skipping redundant scan"
