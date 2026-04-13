@@ -155,6 +155,10 @@ def _fetch_spoolmandb_bambu() -> list:
     global _SPOOLMANDB_BAMBU_CACHE, _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE
     if _SPOOLMANDB_BAMBU_CACHE is not None:
         return _SPOOLMANDB_BAMBU_CACHE
+    # Reset the manufacturer cache now so that any outcome of this fetch
+    # (missing key, list payload, or exception) leaves it in a known state
+    # rather than potentially carrying a stale value from a previous run.
+    _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = None
     try:
         req = request.Request(
             "https://donkie.github.io/SpoolmanDB/filaments/bambulab.json",
@@ -169,7 +173,10 @@ def _fetch_spoolmandb_bambu() -> list:
             _mfr = str(raw.get("manufacturer") or "").strip()
             if _mfr:
                 _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = _mfr
+            # If the key is absent or empty, the cache stays None (already set
+            # above) — no stale name is carried forward.
         elif isinstance(raw, list):
+            # Top-level list: no manufacturer metadata available.
             filaments = raw
         _SPOOLMANDB_BAMBU_CACHE = filaments if isinstance(filaments, list) else []
         LOG.debug(
@@ -184,6 +191,9 @@ def _fetch_spoolmandb_bambu() -> list:
             exc,
         )
         _SPOOLMANDB_BAMBU_CACHE = []
+        # Ensure the manufacturer cache is also cleared on failure so that no
+        # stale name influences vendor resolution on subsequent calls.
+        _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = None
         return []
 
 

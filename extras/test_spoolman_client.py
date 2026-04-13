@@ -181,6 +181,38 @@ class TestFetchSpoolmandbBambuManufacturer(unittest.TestCase):
         result = sc._fetch_spoolmandb_bambu()
         self.assertEqual(result, filaments)
 
+    @patch("spoolman_client.request.urlopen")
+    def test_manufacturer_cache_cleared_on_fetch_failure(self, mock_urlopen):
+        """_SPOOLMANDB_BAMBU_MANUFACTURER_CACHE must be None after a failed fetch."""
+        # Pre-seed a stale manufacturer name to simulate a partially-reset cache.
+        sc._SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = "Stale Name"
+        mock_urlopen.side_effect = OSError("network down")
+
+        sc._fetch_spoolmandb_bambu()
+        self.assertIsNone(
+            sc._SPOOLMANDB_BAMBU_MANUFACTURER_CACHE,
+            "Manufacturer cache must be cleared to None when the fetch fails",
+        )
+
+    @patch("spoolman_client.request.urlopen")
+    def test_manufacturer_cache_cleared_when_payload_is_list(self, mock_urlopen):
+        """When the response is a bare list (no manufacturer key), cache must be None."""
+        # Pre-seed a stale manufacturer name.
+        sc._SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = "Stale Name"
+        filaments = [{"name": "PLA", "material": "PLA", "density": 1.24, "colors": []}]
+        raw = json.dumps(filaments).encode()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = raw
+        mock_urlopen.return_value = mock_resp
+
+        sc._fetch_spoolmandb_bambu()
+        self.assertIsNone(
+            sc._SPOOLMANDB_BAMBU_MANUFACTURER_CACHE,
+            "Manufacturer cache must be None when payload is a list (no manufacturer key)",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: auto_create_spool — SpoolmanDB SKU-based lookup
