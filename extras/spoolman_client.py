@@ -34,9 +34,13 @@ LOG = logging.getLogger("rfid.spoolman_client")
 #   None = not yet attempted
 #   []   = attempted but failed (so we don't retry on every scan)
 #   list = successfully populated
+# _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE (str|None):
+#   None  = not yet populated (or not available)
+#   str   = manufacturer name from the top-level "manufacturer" key in bambulab.json
 # ---------------------------------------------------------------------------
 _SPOOLMANDB_MATERIALS_CACHE: Optional[dict] = None   # material_lower -> density (float)
 _SPOOLMANDB_BAMBU_CACHE: Optional[list] = None        # list of filament dicts from bambulab.json
+_SPOOLMANDB_BAMBU_MANUFACTURER_CACHE: Optional[str] = None  # top-level manufacturer name
 
 # Hardcoded density fallback table (g/cm³) — used when SpoolmanDB is unreachable.
 _DENSITY_FALLBACK: dict = {
@@ -74,6 +78,20 @@ _TAG_FORMAT_BRANDS: dict = {
 
 # Default spool weight (grams) used when the tag does not supply one.
 _DEFAULT_SPOOL_WEIGHT_G: int = 1000
+
+
+def _to_int_safe(val) -> Optional[int]:
+    """Convert *val* to int, returning None on failure.
+
+    Used to safely coerce numeric tag or SpoolmanDB temperature/weight values
+    without raising on invalid or missing data.
+    """
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def _fetch_spoolmandb_materials() -> dict:
@@ -128,10 +146,19 @@ def _fetch_spoolmandb_bambu() -> list:
     Returns a list of filament dicts from filaments/bambulab.json.
     On network failure returns [] so callers fall back to materials lookup.
     Result is cached in _SPOOLMANDB_BAMBU_CACHE for the process lifetime.
+
+    Also populates _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE with the manufacturer
+    name from the top-level "manufacturer" key in the JSON (e.g. "Bambu Lab"),
+    which can be used for vendor name normalisation when creating Spoolman vendor
+    records.  This cache is set to None when the field is absent or on failure.
     """
-    global _SPOOLMANDB_BAMBU_CACHE
+    global _SPOOLMANDB_BAMBU_CACHE, _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE
     if _SPOOLMANDB_BAMBU_CACHE is not None:
         return _SPOOLMANDB_BAMBU_CACHE
+    # Reset the manufacturer cache now so that any outcome of this fetch
+    # (missing key, list payload, or exception) leaves it in a known state
+    # rather than potentially carrying a stale value from a previous run.
+    _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = None
     try:
         req = request.Request(
             "https://donkie.github.io/SpoolmanDB/filaments/bambulab.json",
@@ -142,12 +169,20 @@ def _fetch_spoolmandb_bambu() -> list:
         filaments: list = []
         if isinstance(raw, dict):
             filaments = raw.get("filaments") or []
+            # Capture manufacturer name for vendor normalisation.
+            _mfr = str(raw.get("manufacturer") or "").strip()
+            if _mfr:
+                _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = _mfr
+            # If the key is absent or empty, the cache stays None (already set
+            # above) — no stale name is carried forward.
         elif isinstance(raw, list):
+            # Top-level list: no manufacturer metadata available.
             filaments = raw
         _SPOOLMANDB_BAMBU_CACHE = filaments if isinstance(filaments, list) else []
         LOG.debug(
-            "spoolman: SpoolmanDB Bambu filaments loaded (%d entries)",
+            "spoolman: SpoolmanDB Bambu filaments loaded (%d entries, manufacturer=%r)",
             len(_SPOOLMANDB_BAMBU_CACHE),
+            _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE,
         )
         return _SPOOLMANDB_BAMBU_CACHE
     except Exception as exc:
@@ -156,6 +191,9 @@ def _fetch_spoolmandb_bambu() -> list:
             exc,
         )
         _SPOOLMANDB_BAMBU_CACHE = []
+        # Ensure the manufacturer cache is also cleared on failure so that no
+        # stale name influences vendor resolution on subsequent calls.
+        _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = None
         return []
 
 
@@ -731,7 +769,7 @@ class SpoolmanClient:
         if lot_nr:
             body["lot_nr"] = str(lot_nr)
         if extra and isinstance(extra, dict):
-            body["extra"] = {str(k): str(v) for k, v in extra.items() if v is not None}
+            body["extra"] = {str(k): json.dumps(v) for k, v in extra.items() if v is not None}
         return self._req("POST", "/api/v1/spool", body)
 
     def auto_create_spool(self, filament_info: dict, uid_hex: Optional[str] = None) -> Optional[int]:
@@ -753,10 +791,20 @@ class SpoolmanClient:
         ensuring the extra-field schema exists in Spoolman.
 
         Steps:
-        1. Determine density via SpoolmanDB (Bambu DB or materials.json) or fallback table.
+        1. Determine density via SpoolmanDB (Bambu DB or materials.json) or fallback
+           table.  For Bambu tags the DB is searched first by material_id (Bambu SKU
+           stored in the per-colour ``id`` field, e.g. "GFA50") then by material +
+           color_hex.  This yields a ``bambu_match`` (filament entry) and optional
+           ``bambu_color_match`` (colour entry) which carry richer metadata.
         2. Resolve vendor_id: find or create, with Generic fallback if brand fails.
-        3. Search for existing filament by external_id, then material + vendor (prefer color_hex match).
-        4. If no match: POST /api/v1/filament — create the filament.
+           For Bambu tags the manufacturer name from the SpoolmanDB top-level JSON
+           is preferred over the raw tag brand when resolving the vendor.
+        3. Search for existing filament by external_id, then material + vendor
+           (prefer color_hex match).
+        4. If no match: POST /api/v1/filament — create the filament.  Fields are
+           populated from tag data first, then filled from SpoolmanDB (name,
+           extruder_temp, bed_temp, spool_weight) to ensure Spoolman has complete
+           metadata without requiring complete tag data.
         5. POST /api/v1/spool — create the spool referencing the filament,
            including lot_nr (tray_uid) and uid_hex in extra fields.
         """
@@ -823,24 +871,55 @@ class SpoolmanClient:
 
         # ------------------------------------------------------------------
         # 1. Determine density (required by Spoolman POST /api/v1/filament)
+        #    For Bambu tags, also fetch richer SpoolmanDB metadata (name,
+        #    temperatures, spool weight) to use when creating a new filament.
         # ------------------------------------------------------------------
         density: float = _DENSITY_DEFAULT
         material_lower = material.lower().strip()
+        # bambu_match: the matching filament entry from SpoolmanDB bambulab.json
+        # bambu_color_match: the specific colour entry within bambu_match (may be None)
+        bambu_match: Optional[dict] = None
+        bambu_color_match: Optional[dict] = None
 
         if is_bambu:
             bambu_filaments = _fetch_spoolmandb_bambu()
-            bambu_match = None
-            for entry in bambu_filaments:
-                if str(entry.get("material") or "").lower().strip() == material_lower:
-                    bambu_match = entry
-                    if color_hex:
-                        colors = entry.get("colors") or []
-                        for c in colors:
-                            if str(c.get("hex") or "").upper().lstrip("#") == color_hex:
-                                bambu_match = entry
-                                color_hex = str(c.get("hex") or color_hex).upper().lstrip("#")
-                                break
-                    break
+
+            # 1a. Try to match by Bambu SKU (material_id) via colours[].id — most
+            #     precise, uniquely identifies brand + material + colour variant.
+            if material_id:
+                for entry in bambu_filaments:
+                    for c in (entry.get("colors") or []):
+                        if str(c.get("id") or "").upper() == material_id.upper():
+                            bambu_match = entry
+                            bambu_color_match = c
+                            # Use the SpoolmanDB colour hex when available; it is
+                            # the canonical value for this SKU.
+                            if c.get("hex"):
+                                color_hex = str(c["hex"]).upper().lstrip("#")
+                            break
+                    if bambu_match is not None:
+                        break
+                if bambu_match is not None:
+                    LOG.debug(
+                        "auto_create_spool: SpoolmanDB Bambu match by SKU"
+                        " material_id=%s color=%r",
+                        material_id, bambu_color_match.get("name") if bambu_color_match else None,
+                    )
+
+            # 1b. Fall back to material-type + color_hex matching when no SKU match.
+            if bambu_match is None:
+                for entry in bambu_filaments:
+                    if str(entry.get("material") or "").lower().strip() == material_lower:
+                        bambu_match = entry
+                        if color_hex:
+                            for c in (entry.get("colors") or []):
+                                c_hex = str(c.get("hex") or "").upper().lstrip("#")
+                                if c_hex == color_hex:
+                                    bambu_color_match = c
+                                    color_hex = c_hex
+                                    break
+                        break
+
             if bambu_match is not None:
                 try:
                     density = float(bambu_match["density"])
@@ -877,11 +956,23 @@ class SpoolmanClient:
         # 2. Resolve or create vendor — try brand first, then Generic fallback.
         #    Raises are caught so a failed brand lookup doesn't abort the whole
         #    operation; we fall back to "Generic" instead.
+        #    For Bambu tags, prefer the manufacturer name from SpoolmanDB (the
+        #    canonical name) over the raw tag brand to avoid creating a duplicate
+        #    vendor when the tag uses a slightly different spelling.
         # ------------------------------------------------------------------
         vendor_id: Optional[int] = None
         resolved_vendor_name: Optional[str] = None
         _vendor_candidates: list = []
-        if brand and brand.lower() != "generic":
+        # Use the SpoolmanDB manufacturer name as the primary vendor candidate
+        # for Bambu tags, since it is the canonical name used in the filament DB.
+        if is_bambu and _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE:
+            _spoolmandb_mfr = _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE
+            if _spoolmandb_mfr.lower() != "generic":
+                _vendor_candidates.append(_spoolmandb_mfr)
+            # Also add the tag brand as a fallback (may differ from DB name).
+            if brand and brand.lower() != "generic" and brand != _spoolmandb_mfr:
+                _vendor_candidates.append(brand)
+        elif brand and brand.lower() != "generic":
             _vendor_candidates.append(brand)
         _vendor_candidates.append("Generic")
 
@@ -961,10 +1052,21 @@ class SpoolmanClient:
             return None
 
         # ------------------------------------------------------------------
-        # 4. Create filament if no match found
+        # 4. Create filament if no match found.
+        #    Populate fields from tag data first, then fill gaps from SpoolmanDB
+        #    (bambu_match) so the Spoolman record is as complete as possible even
+        #    when the tag does not carry temperature or weight metadata.
         # ------------------------------------------------------------------
         if filament_id is None:
-            filament_name = f"{brand} {material}" if brand else material
+            # Build a descriptive name.  Prefer the SpoolmanDB filament name
+            # (e.g. "PLA Basic", "PETG HF") over the generic "{brand} {material}"
+            # fallback so the Spoolman UI shows a meaningful label.
+            db_fil_name = str(bambu_match.get("name") or "").strip() if bambu_match else ""
+            if db_fil_name:
+                filament_name = f"{resolved_vendor_name} {db_fil_name}" if resolved_vendor_name else db_fil_name
+            else:
+                filament_name = f"{brand} {material}" if brand else material
+
             filament_body: dict = {
                 "name": filament_name,
                 "material": material,
@@ -978,17 +1080,36 @@ class SpoolmanClient:
                 filament_body["vendor_id"] = vendor_id
             if material_id:
                 filament_body["external_id"] = material_id
+
+            # Temperature settings: use tag data when present, otherwise fall
+            # back to SpoolmanDB values (Bambu only).  SpoolmanDB carries both
+            # min ("extruder_temp") and max ("extruder_temp_max") temps.
             min_temp = filament_info.get("min_temp")
             max_temp = filament_info.get("max_temp")
             bed_temp = filament_info.get("bed_temp")
+            if bambu_match is not None:
+                if min_temp is None:
+                    min_temp = bambu_match.get("extruder_temp")
+                if max_temp is None:
+                    max_temp = bambu_match.get("extruder_temp_max")
+                if bed_temp is None:
+                    bed_temp = bambu_match.get("bed_temp")
+
             # settings_extruder_temp: use min_temp (lower hotend bound) as the
-            # recommended extruder temperature; max_temp is not a separate Spoolman field.
-            if min_temp is not None:
-                filament_body["settings_extruder_temp"] = int(min_temp)
-            elif max_temp is not None:
-                filament_body["settings_extruder_temp"] = int(max_temp)
-            if bed_temp is not None:
-                filament_body["settings_bed_temp"] = int(bed_temp)
+            # recommended extruder temperature; settings_extruder_temp_max for
+            # the upper bound when available.
+            _ext_min = _to_int_safe(min_temp)
+            _ext_max = _to_int_safe(max_temp)
+            _bed = _to_int_safe(bed_temp)
+            if _ext_min is not None:
+                filament_body["settings_extruder_temp"] = _ext_min
+            elif _ext_max is not None:
+                filament_body["settings_extruder_temp"] = _ext_max
+            if _ext_min is not None and _ext_max is not None:
+                filament_body["settings_extruder_temp_max"] = _ext_max
+            if _bed is not None:
+                filament_body["settings_bed_temp"] = _bed
+
             try:
                 LOG.info(
                     "auto_create_spool: creating filament — payload: %s",
@@ -1019,8 +1140,21 @@ class SpoolmanClient:
         #    it can be set on the spool.  Attempt to ensure it exists first;
         #    if that fails, create the spool without the extra UID field (the
         #    caller's add_uid_to_spool call will register it on the next scan).
+        #    spool_weight_g: use tag data when present, otherwise use the
+        #    SpoolmanDB value (Bambu only) so the tare weight is accurate.
         # ------------------------------------------------------------------
         spool_weight_g = filament_info.get("spool_weight_g")
+        if spool_weight_g is None and bambu_match is not None:
+            _db_spool_w = bambu_match.get("spool_weight")
+            if _db_spool_w is not None:
+                try:
+                    spool_weight_g = float(_db_spool_w)
+                    LOG.debug(
+                        "auto_create_spool: spool_weight_g=%s from SpoolmanDB",
+                        spool_weight_g,
+                    )
+                except (TypeError, ValueError):
+                    pass
         spool_extra: Optional[dict] = None
         if uid_hex:
             try:
