@@ -15,12 +15,13 @@ import json
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib import parse as url_parse
 import os
 
 # Ensure extras/ is importable without Klipper present.
-_EXTRAS = os.path.join(os.path.dirname(__file__))
-if _EXTRAS not in sys.path:
-    sys.path.insert(0, _EXTRAS)
+_EXTRAS_DIR = os.path.join(os.path.dirname(__file__))
+if _EXTRAS_DIR not in sys.path:
+    sys.path.insert(0, _EXTRAS_DIR)
 
 import spoolman_client as sc  # noqa: E402
 
@@ -103,8 +104,6 @@ class TestCreateSpoolExtraEncoding(unittest.TestCase):
 
     def test_extra_encoding_matches_find_spool_by_uid_query(self):
         """create_spool encoding must match what find_spool_by_uid queries with."""
-        from urllib import parse as url_parse
-
         uid = "0499D8373A2480"
         # What create_spool now stores:
         stored_value = json.dumps(str(uid))

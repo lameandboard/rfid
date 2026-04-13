@@ -80,6 +80,20 @@ _TAG_FORMAT_BRANDS: dict = {
 _DEFAULT_SPOOL_WEIGHT_G: int = 1000
 
 
+def _to_int_safe(val) -> Optional[int]:
+    """Convert *val* to int, returning None on failure.
+
+    Used to safely coerce numeric tag or SpoolmanDB temperature/weight values
+    without raising on invalid or missing data.
+    """
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def _fetch_spoolmandb_materials() -> dict:
     """Fetch and cache the SpoolmanDB materials.json density table.
 
@@ -745,7 +759,7 @@ class SpoolmanClient:
         if lot_nr:
             body["lot_nr"] = str(lot_nr)
         if extra and isinstance(extra, dict):
-            body["extra"] = {str(k): json.dumps(str(v)) for k, v in extra.items() if v is not None}
+            body["extra"] = {str(k): json.dumps(v) for k, v in extra.items() if v is not None}
         return self._req("POST", "/api/v1/spool", body)
 
     def auto_create_spool(self, filament_info: dict, uid_hex: Optional[str] = None) -> Optional[int]:
@@ -1074,26 +1088,17 @@ class SpoolmanClient:
             # settings_extruder_temp: use min_temp (lower hotend bound) as the
             # recommended extruder temperature; settings_extruder_temp_max for
             # the upper bound when available.
-            if min_temp is not None:
-                try:
-                    filament_body["settings_extruder_temp"] = int(min_temp)
-                except (TypeError, ValueError):
-                    pass
-            elif max_temp is not None:
-                try:
-                    filament_body["settings_extruder_temp"] = int(max_temp)
-                except (TypeError, ValueError):
-                    pass
-            if max_temp is not None and min_temp is not None:
-                try:
-                    filament_body["settings_extruder_temp_max"] = int(max_temp)
-                except (TypeError, ValueError):
-                    pass
-            if bed_temp is not None:
-                try:
-                    filament_body["settings_bed_temp"] = int(bed_temp)
-                except (TypeError, ValueError):
-                    pass
+            _ext_min = _to_int_safe(min_temp)
+            _ext_max = _to_int_safe(max_temp)
+            _bed = _to_int_safe(bed_temp)
+            if _ext_min is not None:
+                filament_body["settings_extruder_temp"] = _ext_min
+            elif _ext_max is not None:
+                filament_body["settings_extruder_temp"] = _ext_max
+            if _ext_min is not None and _ext_max is not None:
+                filament_body["settings_extruder_temp_max"] = _ext_max
+            if _bed is not None:
+                filament_body["settings_bed_temp"] = _bed
 
             try:
                 LOG.info(
