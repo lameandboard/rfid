@@ -458,6 +458,13 @@ class Rfid:
         self._commit_in_progress: dict[str, bool] = {} # lane -> True once a commit has been decided
         self._uid_lookup_in_flight: dict[str, bool] = {} # lane -> True while a deferred Spoolman fallback lookup is running
         self._lane_committed: dict[str, bool] = {}   # lane -> True after _event_scan_commit has succeeded once this session
+        # Tracks whether afc:lane_loaded has been received for a lane in the
+        # current scan session.  Set by _handle_lane_loaded; cleared by
+        # _start_scan_timer so each new load cycle starts with a clean slate.
+        # Used by _on_created (auto_create_spool) to decide whether to commit
+        # immediately (lane already loaded) or leave the spool in _pending and
+        # wait for lane_loaded to trigger the commit.
+        self._lane_loaded_seen: dict[str, bool] = {}
         # Survives _clear_scan_state so lane_loaded can still find a deferred UID even
         # when the scan window timer expired before the lane_loaded event arrived.
         # Format: lane -> {"last_uid": str|None, "seen_uids": set, "ts": float}
@@ -1824,6 +1831,11 @@ class Rfid:
             self._end_scan_session(_lane, reason="auto_create_spool_done")
             _UID_SPOOL_CACHE[_uid] = _sid
             _mark_uid_cache_dirty()
+            # Always store the new spool_id in _pending so that _handle_lane_loaded
+            # can pick it up and call RFID_SCAN_COMMIT when the lane becomes ready.
+            # We do NOT commit here unconditionally — assigning a spool to a lane
+            # before lane_loaded fires causes the AFC system to receive the
+            # spool assignment before the filament has actually finished loading.
             self._pending[_lane] = {
                 "lane": _lane,
                 "spoolman_id": _sid,
@@ -1848,7 +1860,25 @@ class Rfid:
                         self._write_spoolman_id_to_tag(_sid, _uid)
                 except Exception:
                     pass
-            self.gcode.run_script_from_command(f"RFID_SCAN_COMMIT LANE={_lane}")
+            # Two cases where we commit immediately rather than waiting:
+            #   (a) lane_loaded already fired before spool creation finished —
+            #       _handle_lane_loaded has already run but found no pending
+            #       entry, so we must commit here now that we have one.
+            #   (b) This is a synchronous GCode scan (RFID_SCAN_BEGIN / RFID_SCAN)
+            #       which drives its own commit flow and does not use lane_loaded.
+            # In all other AFC event-driven cases, leave the spool_id in _pending
+            # and let _handle_lane_loaded trigger RFID_SCAN_COMMIT when it fires.
+            if self._lane_loaded_seen.get(_lane) or _lane in self._sync_scan_lanes:
+                self._debug(
+                    f"rfid[{self.name}]: auto_create_spool: lane_loaded already"
+                    f" received (or sync scan) — committing spool {_sid} now"
+                )
+                self.gcode.run_script_from_command(f"RFID_SCAN_COMMIT LANE={_lane}")
+            else:
+                self._debug(
+                    f"rfid[{self.name}]: auto_create_spool: spool {_sid} stored in"
+                    f" pending for lane {_lane} — awaiting lane_loaded to commit"
+                )
 
         self.reactor.register_async_callback(_on_created)
 
@@ -2061,6 +2091,9 @@ class Rfid:
         self._commit_in_progress.pop(lane, None)
         self._lane_committed.pop(lane, None)
         self._uid_lookup_in_flight.pop(lane, None)
+        # Reset the lane_loaded flag so the new scan window is not treated as
+        # already loaded from a previous cycle.
+        self._lane_loaded_seen.pop(lane, None)
         # Discard any deferred UID from a previous scan window so it is never
         # applied to the newly-starting window's lane_loaded event.
         self._deferred_uid.pop(lane, None)
@@ -2662,6 +2695,17 @@ class Rfid:
             if reader is not self:
                 self._debug_verbose(f"rfid[{self.name}]: EVENT prep_start not for this reader")
                 return
+            # No-double-scan guard: if this lane was already confirmed (tag read
+            # and committed) within the current load cycle — i.e. _lane_committed
+            # is True but lane_loaded has not yet fired — skip starting another
+            # scan window.  This prevents AFC autoload from triggering a redundant
+            # scan after the tag was already validated.
+            if self._lane_committed.get(lane) and not self._lane_loaded_seen.get(lane):
+                self._debug(
+                    f"rfid[{self.name}]: prep_start: lane {lane} already committed"
+                    f" this cycle — skipping redundant scan"
+                )
+                return
             # Start the continuous scan timer so the reader keeps scanning
             # throughout the spool-spinning window instead of only once.
             self._start_scan_timer(lane)
@@ -2689,6 +2733,12 @@ class Rfid:
             if reader is not self:
                 self._debug_verbose(f"rfid[{self.name}]: EVENT lane_loaded not for this reader")
                 return
+            # Record that lane_loaded has been received for this scan session.
+            # _on_created (auto_create_spool) checks this flag: if it is True
+            # when the background spool-creation finishes, it commits immediately;
+            # otherwise it leaves the spool_id in _pending for this handler to
+            # pick up when it eventually fires.
+            self._lane_loaded_seen[lane] = True
             # Save seen-UIDs and last-seen UID before ending the session; both are
             # cleared by _end_scan_session → _clear_scan_state and are needed below.
             seen_uids_snapshot = self._scan_seen_uids.get(lane, set()).copy()

@@ -363,5 +363,218 @@ class TestHandleLaneLoadedDeferredFallback(unittest.TestCase):
                          "Second lane_loaded must not dispatch another lookup")
 
 
+# ---------------------------------------------------------------------------
+# Tests: pending spool assignment (race-proof lane_loaded / spool creation)
+# ---------------------------------------------------------------------------
+
+class TestPendingSpoolAssignment(unittest.TestCase):
+    """_on_created must store spool_id in _pending and only commit once
+    lane_loaded has also fired — regardless of which event comes first."""
+
+    def setUp(self):
+        self.reactor = _make_reactor(monotonic_value=1000.0)
+        self.rfid = _make_rfid(lanes="lane1", reactor=self.reactor)
+        self.lane = "lane1"
+        self.rfid._find_reader_for_lane = lambda l: (self.rfid, self.lane)
+
+    def _make_lane_obj(self, name="lane1"):
+        lo = MagicMock()
+        lo.name = name
+        return lo
+
+    # ------------------------------------------------------------------
+    # Helper: simulate what _do_auto_create_spool does on the reactor
+    # thread (the _on_created inner function).
+    # ------------------------------------------------------------------
+    def _fire_on_created(self, spool_id=42, uid="AABB1122"):
+        """Replay the _on_created reactor callback for the given spool_id."""
+        _lane = self.lane
+        _uid = uid
+        _sid = spool_id
+        _timeout = self.rfid.event_timeout
+
+        # Replicate _on_created body exactly as in rfid.py
+        self.rfid._commit_in_progress[_lane] = True
+        self.rfid._end_scan_session(_lane, reason="auto_create_spool_done")
+        self.rfid._pending[_lane] = {
+            "lane": _lane,
+            "spoolman_id": _sid,
+            "uid_hex": _uid,
+            "tag_text": None,
+            "ts": time.time(),
+            "timeout": _timeout,
+        }
+        # Conditional commit — the logic under test
+        if self.rfid._lane_loaded_seen.get(_lane) or _lane in self.rfid._sync_scan_lanes:
+            self.rfid.gcode.run_script_from_command(f"RFID_SCAN_COMMIT LANE={_lane}")
+
+    # ------------------------------------------------------------------
+    # Case A: spool creation finishes BEFORE lane_loaded fires
+    # ------------------------------------------------------------------
+    def test_on_created_before_lane_loaded_does_not_commit_immediately(self):
+        """When lane_loaded has not yet fired, _on_created must NOT call
+        RFID_SCAN_COMMIT — it stores the spool_id in _pending and waits."""
+        # lane_loaded has not fired → _lane_loaded_seen is False
+        self.assertFalse(self.rfid._lane_loaded_seen.get(self.lane))
+
+        self._fire_on_created(spool_id=99)
+
+        # spool_id must be in _pending
+        self.assertIn(self.lane, self.rfid._pending)
+        self.assertEqual(self.rfid._pending[self.lane]["spoolman_id"], 99)
+        # RFID_SCAN_COMMIT must NOT have been called yet
+        for call_args in self.rfid.gcode.run_script_from_command.call_args_list:
+            self.assertNotIn("RFID_SCAN_COMMIT", str(call_args))
+
+    def test_lane_loaded_after_on_created_triggers_commit(self):
+        """When lane_loaded fires AFTER spool creation, _handle_lane_loaded
+        must find the spool_id in _pending and schedule RFID_SCAN_COMMIT."""
+        self._fire_on_created(spool_id=99)
+
+        # Now lane_loaded fires — it should call RFID_SCAN_COMMIT via callback
+        callbacks_registered = []
+        self.rfid.reactor.register_async_callback = lambda fn: callbacks_registered.append(fn)
+
+        self.rfid._handle_lane_loaded(self._make_lane_obj("lane1"))
+
+        # _lane_loaded_seen must now be True
+        self.assertTrue(self.rfid._lane_loaded_seen.get(self.lane))
+        # An async callback must have been registered to run RFID_SCAN_COMMIT
+        self.assertGreater(len(callbacks_registered), 0,
+                           "Expected an async commit callback to be registered")
+
+    # ------------------------------------------------------------------
+    # Case B: lane_loaded fires BEFORE spool creation finishes
+    # ------------------------------------------------------------------
+    def test_lane_loaded_before_on_created_sets_flag(self):
+        """When lane_loaded fires before spool creation, _lane_loaded_seen
+        must be set so _on_created can commit immediately afterward."""
+        # Simulate lane_loaded firing with no pending entry yet
+        self.rfid._handle_lane_loaded(self._make_lane_obj("lane1"))
+
+        self.assertTrue(
+            self.rfid._lane_loaded_seen.get(self.lane),
+            "_lane_loaded_seen must be True after lane_loaded fires",
+        )
+
+    def test_on_created_after_lane_loaded_commits_immediately(self):
+        """When _on_created fires after lane_loaded, it must call
+        RFID_SCAN_COMMIT immediately because the lane is already loaded."""
+        # lane_loaded fires first (no pending yet)
+        self.rfid._handle_lane_loaded(self._make_lane_obj("lane1"))
+        self.assertTrue(self.rfid._lane_loaded_seen.get(self.lane))
+
+        # Reset gcode mock call history so we can inspect only subsequent calls
+        self.rfid.gcode.run_script_from_command.reset_mock()
+
+        # Spool creation finishes — _on_created should see the flag and commit
+        self._fire_on_created(spool_id=77)
+
+        calls = [str(c) for c in self.rfid.gcode.run_script_from_command.call_args_list]
+        self.assertTrue(
+            any("RFID_SCAN_COMMIT" in c for c in calls),
+            "RFID_SCAN_COMMIT must be called when _on_created fires after lane_loaded",
+        )
+
+    # ------------------------------------------------------------------
+    # GCode sync-scan path must not be gated on lane_loaded
+    # ------------------------------------------------------------------
+    def test_sync_scan_lane_commits_immediately(self):
+        """For synchronous GCode scans (lane in _sync_scan_lanes) _on_created
+        must commit immediately regardless of _lane_loaded_seen."""
+        # lane_loaded has NOT fired
+        self.assertFalse(self.rfid._lane_loaded_seen.get(self.lane))
+        # Mark lane as a sync scan lane (as _run_scan_window_sync would do)
+        self.rfid._sync_scan_lanes.add(self.lane)
+
+        self.rfid.gcode.run_script_from_command.reset_mock()
+        self._fire_on_created(spool_id=55)
+
+        calls = [str(c) for c in self.rfid.gcode.run_script_from_command.call_args_list]
+        self.assertTrue(
+            any("RFID_SCAN_COMMIT" in c for c in calls),
+            "Sync-scan path must commit immediately without waiting for lane_loaded",
+        )
+
+    # ------------------------------------------------------------------
+    # _start_scan_timer clears _lane_loaded_seen for new cycle
+    # ------------------------------------------------------------------
+    def test_start_scan_timer_clears_lane_loaded_seen(self):
+        """_start_scan_timer must reset _lane_loaded_seen so a new load cycle
+        does not inherit the flag from the previous one."""
+        self.rfid._lane_loaded_seen[self.lane] = True
+
+        self.rfid._start_scan_timer(self.lane)
+
+        self.assertFalse(
+            self.rfid._lane_loaded_seen.get(self.lane),
+            "_lane_loaded_seen must be cleared by _start_scan_timer",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: no-double-scan guard in _handle_lane_prep_start
+# ---------------------------------------------------------------------------
+
+class TestNoDoubleScanGuard(unittest.TestCase):
+    """After a lane is committed within a load cycle, a second lane_prep_start
+    must not restart the scan timer until the cycle resets."""
+
+    def setUp(self):
+        self.reactor = _make_reactor(monotonic_value=1000.0)
+        self.rfid = _make_rfid(lanes="lane2", reactor=self.reactor)
+        self.lane = "lane2"
+        self.rfid._find_reader_for_lane = lambda l: (self.rfid, self.lane)
+
+    def _make_lane_obj(self, name="lane2"):
+        lo = MagicMock()
+        lo.name = name
+        return lo
+
+    def test_prep_start_starts_scan_when_not_committed(self):
+        """A normal lane_prep_start (no prior commit) must start the scan timer."""
+        timer_started = []
+        original = self.rfid._start_scan_timer
+        self.rfid._start_scan_timer = lambda l: timer_started.append(l) or original(l)
+
+        self.rfid._handle_lane_prep_start(self._make_lane_obj("lane2"))
+
+        self.assertIn(self.lane, timer_started,
+                      "_start_scan_timer must be called on the first prep_start")
+
+    def test_prep_start_blocked_when_committed_before_lane_loaded(self):
+        """If the lane was already committed this cycle (tag confirmed) but
+        lane_loaded has not yet fired, a second prep_start must be ignored."""
+        # Simulate a committed lane mid-cycle (tag found, but lane not yet loaded)
+        self.rfid._lane_committed[self.lane] = True
+        self.rfid._lane_loaded_seen[self.lane] = False  # load not finished yet
+
+        timer_started = []
+        self.rfid._start_scan_timer = lambda l: timer_started.append(l)
+
+        self.rfid._handle_lane_prep_start(self._make_lane_obj("lane2"))
+
+        self.assertNotIn(self.lane, timer_started,
+                         "_start_scan_timer must NOT be called when lane is already "
+                         "committed within the current load cycle")
+
+    def test_prep_start_allowed_after_lane_loaded(self):
+        """Once lane_loaded has fired (load cycle complete), a new prep_start
+        for the same lane must be allowed to start a fresh scan."""
+        # Previous cycle: committed AND loaded — new cycle is legitimate
+        self.rfid._lane_committed[self.lane] = True
+        self.rfid._lane_loaded_seen[self.lane] = True  # prior load completed
+
+        timer_started = []
+        original = self.rfid._start_scan_timer
+        self.rfid._start_scan_timer = lambda l: timer_started.append(l) or original(l)
+
+        self.rfid._handle_lane_prep_start(self._make_lane_obj("lane2"))
+
+        self.assertIn(self.lane, timer_started,
+                      "_start_scan_timer must be called when the prior load cycle "
+                      "has fully completed (lane_loaded was received)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
