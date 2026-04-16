@@ -474,6 +474,11 @@ class Rfid:
         # failed earlier in the same scan window.
         # Format: lane -> {uid_hex: monotonic_timestamp_of_failure}
         self._auth_fail_uids: dict[str, dict[str, float]] = {}
+        # Per-window set of UIDs whose Bambu blocks have been fully and successfully
+        # read and parsed in the current scan window.  Once a UID is here, subsequent
+        # _scan_once calls skip the expensive MIFARE auth re-read for that UID.
+        # Format: lane -> set of uid_hex strings
+        self._scan_complete_uids: dict[str, set[str]] = {}
 
         self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
 
@@ -1397,95 +1402,112 @@ class Rfid:
                         and tag_sak & 0x08
                         and uid_hex is not None
                     ):
-                        # Per-scan-window attempt state for this UID.
-                        # Format: {uid_hex: {"rounds": int, "exhausted": bool, "ts": float}}
-                        _fail_cache = self._auth_fail_uids.setdefault(lane, {})
-                        _uid_state = _fail_cache.get(uid_hex)
-                        if _uid_state is not None and _uid_state.get("exhausted"):
+                        # Skip auth entirely if this UID was already fully read and
+                        # parsed earlier in this scan window — we have all the data.
+                        if uid_hex in self._scan_complete_uids.get(lane, set()):
                             self._debug(
                                 f"rfid[{self.name}]: Bambu auth skipped uid={uid_hex}"
-                                " (exhausted attempts this scan window)"
+                                " (full read already complete this scan window)"
                             )
                         else:
-                            _rounds_done = _uid_state.get("rounds", 0) if _uid_state else 0
-                            _round_num = _rounds_done + 1
-                            self._debug(
-                                f"rfid[{self.name}]: MIFARE Classic uid={uid_hex}"
-                                f" sak=0x{tag_sak:02X}"
-                                f" — Bambu auth round={_round_num}/{_BAMBU_MAX_ROUNDS}"
-                            )
-                            bambu_blocks = self._try_bambu_read_with_fallback(
-                                uid_hex, round_num=_round_num)
-                            _MIFARE_BLOCK_SIZE = 16
-                            if self._bambu_blocks_ok(bambu_blocks):
+                            # Per-scan-window attempt state for this UID.
+                            # Format: {uid_hex: {"rounds": int, "exhausted": bool, "ts": float}}
+                            _fail_cache = self._auth_fail_uids.setdefault(lane, {})
+                            _uid_state = _fail_cache.get(uid_hex)
+                            if _uid_state is not None and _uid_state.get("exhausted"):
                                 self._debug(
-                                    f"rfid[{self.name}]: Bambu authenticated read succeeded"
-                                    f" uid={uid_hex} (required blocks present)"
+                                    f"rfid[{self.name}]: Bambu auth skipped uid={uid_hex}"
+                                    " (exhausted attempts this scan window)"
                                 )
-                                filament_info = self._apply_tag_parser(uid_hex, bambu_blocks)
-                                tag["raw_bytes"] = bambu_blocks
-                                if isinstance(bambu_blocks, dict):
-                                    _block_count = len(bambu_blocks.get("blocks") or {})
-                                else:
-                                    _block_count = 0
-                                tag["raw_len"] = _block_count * _MIFARE_BLOCK_SIZE
-                                if filament_info is not None:
-                                    sid = filament_info.get("spoolman_id")
-                                    tag["spoolman_id"] = sid
-                                    tag["filament_info"] = filament_info
-                                    # Log a full labeled summary of all parsed spool
-                                    # fields so users can see tray UID, weight,
-                                    # production date, temperatures, etc. in one place
-                                    # (matching what the Bambu Android app shows).
-                                    if _tag_parser is not None and hasattr(
-                                        _tag_parser, "format_bambu_info"
-                                    ):
-                                        summary = _tag_parser.format_bambu_info(
-                                            filament_info, uid_hex=uid_hex
+                            else:
+                                _rounds_done = _uid_state.get("rounds", 0) if _uid_state else 0
+                                _round_num = _rounds_done + 1
+                                self._debug(
+                                    f"rfid[{self.name}]: MIFARE Classic uid={uid_hex}"
+                                    f" sak=0x{tag_sak:02X}"
+                                    f" — Bambu auth round={_round_num}/{_BAMBU_MAX_ROUNDS}"
+                                )
+                                bambu_blocks = self._try_bambu_read_with_fallback(
+                                    uid_hex, round_num=_round_num)
+                                _MIFARE_BLOCK_SIZE = 16
+                                if self._bambu_blocks_ok(bambu_blocks):
+                                    self._debug(
+                                        f"rfid[{self.name}]: Bambu authenticated read succeeded"
+                                        f" uid={uid_hex} (required blocks present)"
+                                    )
+                                    filament_info = self._apply_tag_parser(uid_hex, bambu_blocks)
+                                    tag["raw_bytes"] = bambu_blocks
+                                    if isinstance(bambu_blocks, dict):
+                                        _block_count = len(bambu_blocks.get("blocks") or {})
+                                    else:
+                                        _block_count = 0
+                                    tag["raw_len"] = _block_count * _MIFARE_BLOCK_SIZE
+                                    if filament_info is not None:
+                                        # Mark this UID as fully read *and* successfully
+                                        # parsed for this scan window so subsequent
+                                        # _scan_once calls skip the expensive MIFARE
+                                        # auth re-read — we already have all the data.
+                                        self._scan_complete_uids.setdefault(lane, set()).add(uid_hex)
+                                        self._debug(
+                                            f"rfid[{self.name}]: Bambu full read complete"
+                                            f" uid={uid_hex} — marked complete for this scan window"
                                         )
-                                        # Prefix every line with the reader name so
-                                        # each line is attributable in syslog /
-                                        # journald / file-tail output where log
-                                        # records are not grouped.
-                                        prefix = f"rfid[{self.name}]: "
-                                        for line in summary.splitlines():
-                                            self._log.info("%s%s", prefix, line)
+                                        sid = filament_info.get("spoolman_id")
+                                        tag["spoolman_id"] = sid
+                                        tag["filament_info"] = filament_info
+                                        # Log a full labeled summary of all parsed spool
+                                        # fields so users can see tray UID, weight,
+                                        # production date, temperatures, etc. in one place
+                                        # (matching what the Bambu Android app shows).
+                                        if _tag_parser is not None and hasattr(
+                                            _tag_parser, "format_bambu_info"
+                                        ):
+                                            summary = _tag_parser.format_bambu_info(
+                                                filament_info, uid_hex=uid_hex
+                                            )
+                                            # Prefix every line with the reader name so
+                                            # each line is attributable in syslog /
+                                            # journald / file-tail output where log
+                                            # records are not grouped.
+                                            prefix = f"rfid[{self.name}]: "
+                                            for line in summary.splitlines():
+                                                self._log.info("%s%s", prefix, line)
+                                        else:
+                                            self._debug(
+                                                f"rfid[{self.name}]: Bambu tag parsed"
+                                                f" uid={uid_hex}"
+                                                f" material={filament_info.get('material')}"
+                                                f" color=#{filament_info.get('color_hex')}"
+                                                f" brand={filament_info.get('brand')}"
+                                            )
+                                else:
+                                    # Required blocks not obtained — track rounds; mark
+                                    # exhausted once _BAMBU_MAX_ROUNDS rounds have been tried.
+                                    _new_rounds = _rounds_done + 1
+                                    _exhausted = _new_rounds >= _BAMBU_MAX_ROUNDS
+                                    _fail_cache[uid_hex] = {
+                                        "rounds": _new_rounds,
+                                        "exhausted": _exhausted,
+                                        "ts": self.reactor.monotonic(),
+                                    }
+                                    if _exhausted:
+                                        self._debug(
+                                            f"rfid[{self.name}]: Bambu auth exhausted uid={uid_hex}"
+                                            f" after {_new_rounds} round(s)"
+                                            " — will not retry this scan window"
+                                        )
                                     else:
                                         self._debug(
-                                            f"rfid[{self.name}]: Bambu tag parsed"
-                                            f" uid={uid_hex}"
-                                            f" material={filament_info.get('material')}"
-                                            f" color=#{filament_info.get('color_hex')}"
-                                            f" brand={filament_info.get('brand')}"
+                                            f"rfid[{self.name}]: Bambu auth round={_round_num}"
+                                            f" incomplete uid={uid_hex}"
+                                            f" — will retry (max {_BAMBU_MAX_ROUNDS} rounds)"
                                         )
-                            else:
-                                # Required blocks not obtained — track rounds; mark
-                                # exhausted once _BAMBU_MAX_ROUNDS rounds have been tried.
-                                _new_rounds = _rounds_done + 1
-                                _exhausted = _new_rounds >= _BAMBU_MAX_ROUNDS
-                                _fail_cache[uid_hex] = {
-                                    "rounds": _new_rounds,
-                                    "exhausted": _exhausted,
-                                    "ts": self.reactor.monotonic(),
-                                }
-                                if _exhausted:
-                                    self._debug(
-                                        f"rfid[{self.name}]: Bambu auth exhausted uid={uid_hex}"
-                                        f" after {_new_rounds} round(s)"
-                                        " — will not retry this scan window"
-                                    )
-                                else:
-                                    self._debug(
-                                        f"rfid[{self.name}]: Bambu auth round={_round_num}"
-                                        f" incomplete uid={uid_hex}"
-                                        f" — will retry (max {_BAMBU_MAX_ROUNDS} rounds)"
-                                    )
-                                # Store any partial block data for diagnostics.
-                                if bambu_blocks is not None:
-                                    tag["raw_bytes"] = bambu_blocks
-                                    _bc = (len(bambu_blocks.get("blocks") or {})
-                                           if isinstance(bambu_blocks, dict) else 0)
-                                    tag["raw_len"] = _bc * _MIFARE_BLOCK_SIZE
+                                    # Store any partial block data for diagnostics.
+                                    if bambu_blocks is not None:
+                                        tag["raw_bytes"] = bambu_blocks
+                                        _bc = (len(bambu_blocks.get("blocks") or {})
+                                               if isinstance(bambu_blocks, dict) else 0)
+                                        tag["raw_len"] = _bc * _MIFARE_BLOCK_SIZE
                     # Cache update: store plain int sid.
                     if uid_hex and sid is not None:
                         existing = _UID_SPOOL_CACHE.get(uid_hex)
@@ -1758,6 +1780,11 @@ class Rfid:
         (which is thread-safe) to update reactor-side state (_pending, cache) and
         issue RFID_SCAN_COMMIT when creation succeeds.
 
+        Before creating, always performs a Spoolman UID lookup to guard against
+        duplicate spool creation when the early-commit path bypasses the normal
+        lookup-before-create flow.  Only creates a new spool after all lookups
+        definitively return no match.
+
         Delegates the full vendor/filament/spool creation pipeline (including
         SpoolmanDB density lookup) to SpoolmanClient.auto_create_spool, then
         registers the hardware UID in the spool's extra fields.
@@ -1765,6 +1792,76 @@ class Rfid:
         client = self._spoolman
         if client is None:
             return
+
+        # Step 0: check whether this UID is already registered in Spoolman before
+        # attempting to create anything.  The early-commit paths in
+        # _scan_timer_callback dispatch here directly (without a prior lookup), so
+        # this guard is the last line of defence against duplicate spool creation.
+        if uid_hex:
+            try:
+                existing_sid = client.find_spool_by_uid(uid_hex, self.max_uids)
+            except Exception as exc:
+                self._log.warning(
+                    "rfid: auto_create_spool: pre-create lookup failed (inconclusive)"
+                    " uid=%s: %s — aborting creation to avoid duplicate spool",
+                    uid_hex, exc,
+                )
+                # Treat a lookup error as inconclusive — do NOT create; freeze the lane
+                # so no further ticks re-trigger creation until the lane is re-scanned.
+                self._freeze_lane_async(lane, reason="auto_create_spool_lookup_error")
+                return
+
+            if existing_sid is not None:
+                self._log.info(
+                    "rfid: auto_create_spool: uid=%s already registered as spool %s"
+                    " in Spoolman — skipping creation, using existing spool"
+                    " (lookup succeeded before create was attempted)",
+                    uid_hex, existing_sid,
+                )
+                _lane = lane
+                _uid = uid_hex
+                _sid = existing_sid
+                _timeout = self.event_timeout
+
+                def _on_found_existing(event_time):
+                    self._commit_in_progress[_lane] = True
+                    self._end_scan_session(_lane, reason="uid_found_before_create")
+                    _UID_SPOOL_CACHE[_uid] = _sid
+                    _mark_uid_cache_dirty()
+                    self._pending[_lane] = {
+                        "lane": _lane,
+                        "spoolman_id": _sid,
+                        "uid_hex": _uid,
+                        "tag_text": None,
+                        "ts": time.time(),
+                        "timeout": _timeout,
+                    }
+                    self._respond(
+                        f"rfid: auto_create_spool: uid={_uid} already exists as"
+                        f" spool {_sid} on lane {_lane} — creation skipped"
+                    )
+                    if self._lane_loaded_seen.get(_lane) or _lane in self._sync_scan_lanes:
+                        self._debug(
+                            f"rfid[{self.name}]: auto_create_spool: lane_loaded already"
+                            f" received (or sync scan) — committing existing spool"
+                            f" {_sid} now"
+                        )
+                        self.gcode.run_script_from_command(f"RFID_SCAN_COMMIT LANE={_lane}")
+                    else:
+                        self._debug(
+                            f"rfid[{self.name}]: auto_create_spool: existing spool {_sid}"
+                            f" stored in pending for lane {_lane} — awaiting lane_loaded"
+                        )
+
+                self.reactor.register_async_callback(_on_found_existing)
+                return
+
+            self._log.info(
+                "rfid: auto_create_spool: uid=%s not found in Spoolman"
+                " — all lookups failed, proceeding with creation"
+                " (auto_create_spool=True / CREATE=1)",
+                uid_hex,
+            )
 
         # Normalise OpenSpool payload: it uses "type" for material and "weight"
         # for remaining weight.  Ensure standard keys are present before delegating.
@@ -2038,6 +2135,7 @@ class Rfid:
         self._scan_no_tag_streak.pop(lane, None)
         self._scan_tick_count.pop(lane, None)
         self._auth_fail_uids.pop(lane, None)
+        self._scan_complete_uids.pop(lane, None)
         self._scan_gen[lane] = self._scan_gen.get(lane, 0) + 1
         if reason:
             self._debug(
@@ -2107,6 +2205,7 @@ class Rfid:
         self._scan_no_tag_streak[lane] = 0
         self._scan_tick_count[lane] = 0
         self._auth_fail_uids[lane] = {}
+        self._scan_complete_uids[lane] = set()
         # Capture current generation so the timer callback can detect staleness.
         gen = self._scan_gen.get(lane, 0)
 
@@ -3503,41 +3602,89 @@ class Rfid:
                         "RFID_CHECK_TAG: auto-create requested but spoolman_url not configured"
                     )
                 else:
-                    new_sid = reader._auto_create_spool(filament_info, uid_hex=uid_hex if uid_hex != "unknown" else None)
-                    if new_sid is not None:
-                        spoolman_id = new_sid
-                        if uid_hex != "unknown":
-                            # Register UID in Spoolman extra field and update local cache.
-                            reader._reassign_uid_to_spool(uid_hex, int(spoolman_id))
-                        gcmd.respond_info(
-                            f"RFID_CHECK_TAG: created spoolman spool id={spoolman_id}"
-                            f" for uid={uid_hex}"
-                        )
-                        is_bambu = fmt == "bambu"
-                        if write:
-                            if is_bambu:
-                                gcmd.respond_info(
-                                    f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
-                                    "spoolman_id cached (cannot write to Bambu tag)"
-                                )
-                            else:
-                                ok = reader._write_spoolman_id_to_tag(
-                                    spoolman_id, uid_hex, is_bambu=is_bambu
-                                )
-                                if ok:
+                    # Before creating, check whether this UID is already in Spoolman.
+                    # Only proceed with creation after a *definitive* not-found result.
+                    # A lookup error is inconclusive — skip creation to avoid duplicates.
+                    found_sid = None
+                    lookup_error = False
+                    if uid_hex != "unknown" and reader._spoolman is not None:
+                        try:
+                            found_sid = reader._spoolman.find_spool_by_uid(uid_hex, reader.max_uids)
+                        except Exception as _lkp_exc:
+                            lookup_error = True
+                            gcmd.respond_info(
+                                f"RFID_CHECK_TAG: Spoolman lookup failed for uid={uid_hex}"
+                                f" ({_lkp_exc}) — skipping auto-create (inconclusive)"
+                            )
+                    if not lookup_error:
+                        if found_sid is not None:
+                            gcmd.respond_info(
+                                f"RFID_CHECK_TAG: uid={uid_hex} already found as spool"
+                                f" {found_sid} in Spoolman — skipping auto-create"
+                            )
+                            spoolman_id = found_sid
+                            if write:
+                                is_bambu = fmt == "bambu"
+                                if is_bambu:
                                     gcmd.respond_info(
-                                        f"RFID_CHECK_TAG: wrote spoolman_id={spoolman_id}"
-                                        f" to tag uid={uid_hex}"
+                                        f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
+                                        "spoolman_id cached (cannot write to Bambu tag)"
                                     )
                                 else:
-                                    gcmd.respond_info(
-                                        f"RFID_CHECK_TAG: write-back skipped or failed"
-                                        f" for uid={uid_hex}"
+                                    ok = reader._write_spoolman_id_to_tag(
+                                        spoolman_id, uid_hex, is_bambu=is_bambu
                                     )
-                    else:
-                        gcmd.respond_info(
-                            f"RFID_CHECK_TAG: spool creation failed for uid={uid_hex}"
-                        )
+                                    if ok:
+                                        gcmd.respond_info(
+                                            f"RFID_CHECK_TAG: wrote spoolman_id={spoolman_id}"
+                                            f" to tag uid={uid_hex}"
+                                        )
+                                    else:
+                                        gcmd.respond_info(
+                                            f"RFID_CHECK_TAG: write-back skipped or failed"
+                                            f" for uid={uid_hex}"
+                                        )
+                        else:
+                            if uid_hex != "unknown":
+                                gcmd.respond_info(
+                                    f"RFID_CHECK_TAG: uid={uid_hex} not found in Spoolman"
+                                    f" — triggering auto-create (CREATE=1)"
+                                )
+                            new_sid = reader._auto_create_spool(filament_info, uid_hex=uid_hex if uid_hex != "unknown" else None)
+                            if new_sid is not None:
+                                spoolman_id = new_sid
+                                if uid_hex != "unknown":
+                                    # Register UID in Spoolman extra field and update local cache.
+                                    reader._reassign_uid_to_spool(uid_hex, int(spoolman_id))
+                                gcmd.respond_info(
+                                    f"RFID_CHECK_TAG: created spoolman spool id={spoolman_id}"
+                                    f" for uid={uid_hex}"
+                                )
+                                if write:
+                                    is_bambu = fmt == "bambu"
+                                    if is_bambu:
+                                        gcmd.respond_info(
+                                            f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
+                                            "spoolman_id cached (cannot write to Bambu tag)"
+                                        )
+                                    else:
+                                        ok = reader._write_spoolman_id_to_tag(
+                                            spoolman_id, uid_hex, is_bambu=is_bambu
+                                        )
+                                        if ok:
+                                            gcmd.respond_info(
+                                                f"RFID_CHECK_TAG: wrote spoolman_id={spoolman_id}"
+                                                f" to tag uid={uid_hex}"
+                                            )
+                                        else:
+                                            gcmd.respond_info(
+                                                f"RFID_CHECK_TAG: write-back skipped or failed"
+                                                f" for uid={uid_hex}"
+                                            )
+                            else:
+                                gcmd.respond_info(
+                                    f"RFID_CHECK_TAG: spool creation failed for uid={uid_hex}"
+                                )
         else:
             gcmd.respond_info(f"RFID_CHECK_TAG: uid={uid_hex} — no filament data parsed")
 
