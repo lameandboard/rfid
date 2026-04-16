@@ -470,7 +470,7 @@ class SpoolmanClient:
                         # the response body directly — no secondary HTTP fetch needed
                         # when the query already returned exact-match data.
                         uid_in_response = False
-                        resp_extra = (spool.get("extra") or {})
+                        resp_extra = spool.get("extra") or {}
                         for _n in range(1, max_uids + 1):
                             raw_v = resp_extra.get(self.uid_field_name(_n))
                             if raw_v is None:
