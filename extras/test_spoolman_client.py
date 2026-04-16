@@ -448,5 +448,231 @@ class TestAutoCreateSpoolSpoolmanDB(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Tests: find_spool_by_uid — inline verification and false-positive handling
+# ---------------------------------------------------------------------------
+
+def _spool_response(spool_id, uid_slot_values=None):
+    """Build a minimal Spoolman spool dict as returned by the search API.
+
+    *uid_slot_values* is an optional dict mapping slot index (1-based) to UID
+    string.  Values are JSON-encoded to match what Spoolman stores/returns.
+    Pass ``None`` to omit the ``extra`` key entirely (simulates an API that
+    does not include extra fields in search results).
+    """
+    spool = {"id": spool_id}
+    if uid_slot_values is not None:
+        spool["extra"] = {
+            f"rfid_uid_{n}": json.dumps(v)
+            for n, v in uid_slot_values.items()
+        }
+    return spool
+
+
+class TestFindSpoolByUid(unittest.TestCase):
+    """find_spool_by_uid: inline verification, false-positive rejection, fallback."""
+
+    _UID = "C2C304EB"
+    _MAX_UIDS = 4  # keep small so tests are quick
+
+    def _client_with_fields(self, req_fn):
+        """Return a client that reports all rfid_uid_N fields as present."""
+        client = sc.SpoolmanClient("http://localhost:7912")
+        # Override fields_exist so the fields pre-check always passes.
+        client.fields_exist = MagicMock(return_value=True)
+        client._req = MagicMock(side_effect=req_fn)
+        return client
+
+    # ------------------------------------------------------------------
+    # Confirmed inline
+    # ------------------------------------------------------------------
+
+    def test_uid_confirmed_inline_returns_spool_id(self):
+        """When the search response extra contains the queried UID, return the spool."""
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_1]" in path:
+                return [_spool_response(16, {1: self._UID})]
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 16)
+        # Must NOT have made a secondary GET /api/v1/spool/<id> call.
+        secondary = [
+            c for c in client._req.call_args_list
+            if c.args[0] == "GET" and c.args[1] == f"/api/v1/spool/16"
+        ]
+        self.assertEqual(len(secondary), 0,
+                         "No secondary fetch expected when inline check confirms UID")
+
+    def test_uid_confirmed_in_different_slot_inline(self):
+        """UID in rfid_uid_2 of the response is still confirmed when querying rfid_uid_1."""
+        # Spoolman may return a spool for rfid_uid_1 query; the extra has uid in slot 2.
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_1]" in path:
+                # Response includes slot 2 matching the UID (slot 1 has a different value)
+                return [_spool_response(7, {1: "AABBCCDD", 2: self._UID})]
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 7)
+
+    # ------------------------------------------------------------------
+    # False-positive: queried field has a non-matching value in response
+    # ------------------------------------------------------------------
+
+    def test_false_positive_skips_secondary_fetch(self):
+        """When response shows the queried field has a different UID, no secondary fetch."""
+        different_uid = "C2C304EB12345678"
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                # Spoolman returns spool 16 for every slot query (partial match).
+                return [_spool_response(16, {1: different_uid})]
+            if method == "GET" and path == "/api/v1/spool":
+                # Fallback full scan: spool has different_uid, not our UID.
+                return [_spool_response(16, {1: different_uid})]
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid, "UID not in any spool — should return None")
+
+        # Must NOT have made secondary per-spool GET calls.
+        secondary = [
+            c for c in client._req.call_args_list
+            if c.args[0] == "GET" and "/api/v1/spool/16" in c.args[1]
+        ]
+        self.assertEqual(len(secondary), 0,
+                         "No secondary fetch expected for inline-rejected false positives")
+
+    def test_rejected_id_not_rechecked_across_slots(self):
+        """A spool inline-rejected in slot 1 query must not be re-fetched in slot 2+ queries."""
+        different_uid = "DEADBEEF"
+        secondary_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                return [_spool_response(99, {1: different_uid})]
+            if method == "GET" and "/api/v1/spool/99" in path:
+                secondary_calls.append(path)
+                return _spool_response(99, {1: different_uid})
+            if method == "GET" and path == "/api/v1/spool":
+                return [_spool_response(99, {1: different_uid})]
+            return []
+
+        client = self._client_with_fields(_req)
+        client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(len(secondary_calls), 0,
+                         "Spool 99 must not be fetched at all — rejected inline on first hit")
+
+    # ------------------------------------------------------------------
+    # Missing extra in search response → secondary fetch
+    # ------------------------------------------------------------------
+
+    def test_secondary_fetch_when_response_has_no_extra(self):
+        """When search response omits extra, a secondary fetch must be performed."""
+        fetch_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_1]" in path:
+                # Response has no 'extra' key.
+                return [{"id": 5}]
+            if method == "GET" and "/api/v1/spool/5" in path:
+                fetch_calls.append(path)
+                # The spool really does contain the UID.
+                return _spool_response(5, {1: self._UID})
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 5)
+        self.assertEqual(len(fetch_calls), 1, "One secondary fetch expected")
+
+    def test_secondary_fetch_miss_returns_none(self):
+        """Secondary fetch that does not find the UID must result in None."""
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_1]" in path:
+                return [{"id": 5}]
+            if method == "GET" and "/api/v1/spool/5" in path:
+                return _spool_response(5, {1: "DIFFERENTUID"})
+            if method == "GET" and path == "/api/v1/spool":
+                return []
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid)
+
+    # ------------------------------------------------------------------
+    # Fallback full-spool scan
+    # ------------------------------------------------------------------
+
+    def test_fallback_scan_finds_uid(self):
+        """When all slot queries return empty, fallback scan must find the spool."""
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                return []  # All per-slot queries return empty.
+            if method == "GET" and path == "/api/v1/spool":
+                return [_spool_response(42, {1: self._UID})]
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 42)
+
+    def test_fallback_scan_with_raw_unencoded_value(self):
+        """Fallback scan must match UIDs stored without JSON encoding (legacy)."""
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                return []
+            if method == "GET" and path == "/api/v1/spool":
+                # Value stored as raw string without json.dumps (legacy).
+                return [{"id": 77, "extra": {"rfid_uid_1": self._UID}}]
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 77)
+
+    def test_not_found_returns_none(self):
+        """When the UID is genuinely absent from all spools, must return None."""
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                return []
+            if method == "GET" and path == "/api/v1/spool":
+                return [_spool_response(1, {1: "AABBCCDD"}),
+                        _spool_response(2, {1: "11223344"})]
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid)
+
+    # ------------------------------------------------------------------
+    # _decode_extra_value helper
+    # ------------------------------------------------------------------
+
+    def test_decode_extra_value_json_string(self):
+        """JSON-encoded string must be decoded to plain string."""
+        self.assertEqual(sc.SpoolmanClient._decode_extra_value('"C2C304EB"'), "C2C304EB")
+
+    def test_decode_extra_value_raw_string(self):
+        """Raw string (no JSON encoding) must be returned as-is."""
+        self.assertEqual(sc.SpoolmanClient._decode_extra_value("C2C304EB"), "C2C304EB")
+
+    def test_decode_extra_value_ignores_non_string_json(self):
+        """Non-string JSON values (e.g. numbers) must not replace the raw string."""
+        # json.loads("1234") → int 1234, not a str → fallback to raw
+        self.assertEqual(sc.SpoolmanClient._decode_extra_value("1234"), "1234")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
