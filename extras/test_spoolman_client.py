@@ -483,6 +483,14 @@ class TestFindSpoolByUid(unittest.TestCase):
         client._req = MagicMock(side_effect=req_fn)
         return client
 
+    def _count_secondary_fetches(self, client, spool_id):
+        """Count how many secondary per-spool GET /api/v1/spool/<id> calls were made."""
+        return sum(
+            1 for c in client._req.call_args_list
+            if c.args[0] == "GET" and f"/api/v1/spool/{spool_id}" in c.args[1]
+               and "extra[" not in c.args[1]  # exclude slot-query GETs
+        )
+
     # ------------------------------------------------------------------
     # Confirmed inline
     # ------------------------------------------------------------------
@@ -498,12 +506,7 @@ class TestFindSpoolByUid(unittest.TestCase):
         client = self._client_with_fields(_req)
         sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
         self.assertEqual(sid, 16)
-        # Must NOT have made a secondary GET /api/v1/spool/<id> call.
-        secondary = [
-            c for c in client._req.call_args_list
-            if c.args[0] == "GET" and c.args[1] == f"/api/v1/spool/16"
-        ]
-        self.assertEqual(len(secondary), 0,
+        self.assertEqual(self._count_secondary_fetches(client, 16), 0,
                          "No secondary fetch expected when inline check confirms UID")
 
     def test_uid_confirmed_in_different_slot_inline(self):
@@ -540,13 +543,7 @@ class TestFindSpoolByUid(unittest.TestCase):
         client = self._client_with_fields(_req)
         sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
         self.assertIsNone(sid, "UID not in any spool — should return None")
-
-        # Must NOT have made secondary per-spool GET calls.
-        secondary = [
-            c for c in client._req.call_args_list
-            if c.args[0] == "GET" and "/api/v1/spool/16" in c.args[1]
-        ]
-        self.assertEqual(len(secondary), 0,
+        self.assertEqual(self._count_secondary_fetches(client, 16), 0,
                          "No secondary fetch expected for inline-rejected false positives")
 
     def test_rejected_id_not_rechecked_across_slots(self):

@@ -484,7 +484,7 @@ class SpoolmanClient:
         primary_had_error = False
         # Track spool IDs that were definitively shown not to contain uid_hex so
         # the same false-positive candidate is not re-checked for every slot query.
-        _rejected_ids: set = set()
+        _rejected_ids = set()  # type: set[int]
 
         for n in range(1, max_uids + 1):
             field_key = self.uid_field_name(n)
