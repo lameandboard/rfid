@@ -478,7 +478,7 @@ class Rfid:
         # read and parsed in the current scan window.  Once a UID is here, subsequent
         # _scan_once calls skip the expensive MIFARE auth re-read for that UID.
         # Format: lane -> set of uid_hex strings
-        self._scan_complete_uids: dict[str, set] = {}
+        self._scan_complete_uids: dict[str, set[str]] = {}
 
         self._mmu_system = None  # "afc" or "hh"; detected at klippy:connect
 
@@ -1442,15 +1442,16 @@ class Rfid:
                                     else:
                                         _block_count = 0
                                     tag["raw_len"] = _block_count * _MIFARE_BLOCK_SIZE
-                                    # Mark this UID as fully read for this scan window so
-                                    # subsequent _scan_once calls skip the expensive MIFARE
-                                    # auth re-read — we already have all the data we need.
-                                    self._scan_complete_uids.setdefault(lane, set()).add(uid_hex)
-                                    self._debug(
-                                        f"rfid[{self.name}]: Bambu full read complete"
-                                        f" uid={uid_hex} — marked complete for this scan window"
-                                    )
                                     if filament_info is not None:
+                                        # Mark this UID as fully read *and* successfully
+                                        # parsed for this scan window so subsequent
+                                        # _scan_once calls skip the expensive MIFARE
+                                        # auth re-read — we already have all the data.
+                                        self._scan_complete_uids.setdefault(lane, set()).add(uid_hex)
+                                        self._debug(
+                                            f"rfid[{self.name}]: Bambu full read complete"
+                                            f" uid={uid_hex} — marked complete for this scan window"
+                                        )
                                         sid = filament_info.get("spoolman_id")
                                         tag["spoolman_id"] = sid
                                         tag["filament_info"] = filament_info
@@ -1801,11 +1802,14 @@ class Rfid:
                 existing_sid = client.find_spool_by_uid(uid_hex, self.max_uids)
             except Exception as exc:
                 self._log.warning(
-                    "rfid: auto_create_spool: pre-create lookup failed"
-                    " uid=%s: %s — proceeding with creation",
+                    "rfid: auto_create_spool: pre-create lookup failed (inconclusive)"
+                    " uid=%s: %s — aborting creation to avoid duplicate spool",
                     uid_hex, exc,
                 )
-                existing_sid = None
+                # Treat a lookup error as inconclusive — do NOT create; freeze the lane
+                # so no further ticks re-trigger creation until the lane is re-scanned.
+                self._freeze_lane_async(lane, reason="auto_create_spool_lookup_error")
+                return
 
             if existing_sid is not None:
                 self._log.info(
@@ -3599,16 +3603,48 @@ class Rfid:
                     )
                 else:
                     # Before creating, check whether this UID is already in Spoolman.
-                    # Only proceed with creation if all lookups return no match.
+                    # Only proceed with creation after a *definitive* not-found result.
+                    # A lookup error is inconclusive — skip creation to avoid duplicates.
                     found_sid = None
-                    if uid_hex != "unknown":
-                        found_sid = reader._spoolman_find_spool_by_uid(uid_hex)
-                    if found_sid is not None:
+                    lookup_error = False
+                    if uid_hex != "unknown" and reader._spoolman is not None:
+                        try:
+                            found_sid = reader._spoolman.find_spool_by_uid(uid_hex, reader.max_uids)
+                        except Exception as _lkp_exc:
+                            lookup_error = True
+                            gcmd.respond_info(
+                                f"RFID_CHECK_TAG: Spoolman lookup failed for uid={uid_hex}"
+                                f" ({_lkp_exc}) — skipping auto-create (inconclusive)"
+                            )
+                    if lookup_error:
+                        pass  # already reported above; skip creation
+                    elif found_sid is not None:
                         gcmd.respond_info(
                             f"RFID_CHECK_TAG: uid={uid_hex} already found as spool"
                             f" {found_sid} in Spoolman — skipping auto-create"
                         )
                         spoolman_id = found_sid
+                        is_bambu = fmt == "bambu"
+                        if write:
+                            if is_bambu:
+                                gcmd.respond_info(
+                                    f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
+                                    "spoolman_id cached (cannot write to Bambu tag)"
+                                )
+                            else:
+                                ok = reader._write_spoolman_id_to_tag(
+                                    spoolman_id, uid_hex, is_bambu=is_bambu
+                                )
+                                if ok:
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: wrote spoolman_id={spoolman_id}"
+                                        f" to tag uid={uid_hex}"
+                                    )
+                                else:
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: write-back skipped or failed"
+                                        f" for uid={uid_hex}"
+                                    )
                     else:
                         if uid_hex != "unknown":
                             gcmd.respond_info(

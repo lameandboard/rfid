@@ -461,9 +461,10 @@ class SpoolmanClient:
                     f"/api/v1/spool?extra[{field_key}]={url_parse.quote(json.dumps(uid_hex), safe='')}",
                 )
                 if isinstance(spools, list) and spools:
-                    spool = spools[0]
-                    spool_id_val = spool.get("id")
-                    if spool_id_val is not None:
+                    for spool in spools:
+                        spool_id_val = spool.get("id")
+                        if spool_id_val is None:
+                            continue
                         candidate_id = int(spool_id_val)
                         # Confirm uid_hex is present in the search-response extra dict
                         # to guard against Spoolman partial/substring matches.  Check
