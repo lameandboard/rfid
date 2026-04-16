@@ -461,11 +461,39 @@ class SpoolmanClient:
                     f"/api/v1/spool?extra[{field_key}]={url_parse.quote(json.dumps(uid_hex), safe='')}",
                 )
                 if isinstance(spools, list) and spools:
-                    spool_id_val = spools[0].get("id")
+                    spool = spools[0]
+                    spool_id_val = spool.get("id")
                     if spool_id_val is not None:
                         candidate_id = int(spool_id_val)
-                        # Verify the candidate actually contains uid_hex to prevent
-                        # false-positive matches caused by Spoolman partial matching.
+                        # Confirm uid_hex is present in the search-response extra dict
+                        # to guard against Spoolman partial/substring matches.  Check
+                        # the response body directly — no secondary HTTP fetch needed
+                        # when the query already returned exact-match data.
+                        uid_in_response = False
+                        resp_extra = (spool.get("extra") or {})
+                        for _n in range(1, max_uids + 1):
+                            raw_v = resp_extra.get(self.uid_field_name(_n))
+                            if raw_v is None:
+                                continue
+                            decoded_v = str(raw_v)
+                            try:
+                                _cv = json.loads(str(raw_v))
+                                if isinstance(_cv, str):
+                                    decoded_v = _cv
+                            except (json.JSONDecodeError, ValueError, TypeError):
+                                pass
+                            if decoded_v == uid_hex:
+                                uid_in_response = True
+                                break
+                        if uid_in_response:
+                            LOG.debug(
+                                "find_spool_by_uid: uid=%s confirmed in spool %d"
+                                " response extra fields — no secondary fetch needed",
+                                uid_hex, candidate_id,
+                            )
+                            return candidate_id
+                        # UID not found in response extra — fall back to a direct spool
+                        # fetch (handles cases where the search API omits extra fields).
                         try:
                             slots = self.get_uid_slots(candidate_id, max_uids)
                         except Exception as verify_exc:
@@ -475,6 +503,11 @@ class SpoolmanClient:
                             )
                             continue
                         if slots is not None and uid_hex in slots.values():
+                            LOG.debug(
+                                "find_spool_by_uid: uid=%s confirmed in spool %d"
+                                " via secondary fetch (extra not in search response)",
+                                uid_hex, candidate_id,
+                            )
                             return candidate_id
                         LOG.info(
                             "find_spool_by_uid: query returned spool %d for uid=%s"
