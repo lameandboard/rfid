@@ -425,6 +425,26 @@ class SpoolmanClient:
                     slots[n] = val
         return slots
 
+    @staticmethod
+    def _decode_extra_value(raw_v):
+        """Decode a Spoolman extra-field value to a plain string.
+
+        Values stored by this plugin are JSON-encoded (e.g. ``'"C2C304EB"'``).
+        Older entries or values written by external tools may be bare strings
+        (e.g. ``'C2C304EB'``).  Both forms are handled by attempting JSON
+        decode first and falling back to the raw string.
+
+        Returns the decoded string, or the raw string if decoding fails.
+        """
+        decoded = str(raw_v)
+        try:
+            candidate = json.loads(str(raw_v))
+            if isinstance(candidate, str):
+                decoded = candidate
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return decoded
+
     def find_spool_by_uid(self, uid_hex, max_uids):
         """Search Spoolman for a spool whose ``rfid_uid_N`` extra field equals ``uid_hex``.
 
@@ -433,15 +453,28 @@ class SpoolmanClient:
         immediately to avoid false-positive matches.
 
         Primary path: queries each numbered slot with the JSON-encoded value (since
-        Spoolman stores extra field values as JSON-encoded strings).  Each hit is
-        **verified** by fetching the candidate spool's UID slots and confirming
-        ``uid_hex`` is actually present before returning, preventing false positives.
+        Spoolman stores extra field values as JSON-encoded strings).  For each hit,
+        the search-response ``extra`` dict is checked inline:
 
-        Fallback path: if all per-slot queries return empty, fetches all spools and
-        scans their ``extra`` dicts in Python, decoding JSON-encoded values with a
-        fallback to the raw string for backward compatibility.
+        * If the **queried field** is present in the response with a non-matching
+          value, Spoolman returned a partial/substring match — the spool is rejected
+          inline without any additional HTTP fetch and added to ``_rejected_ids`` so
+          the same false-positive spool is silently skipped in subsequent slot queries.
+
+        * If the response ``extra`` does not include the queried field, a single
+          secondary GET fetch is performed to verify; this handles the (rare) case
+          where the search API omits extra-field values from its response.
+
+        Fallback path: if all per-slot queries return empty or only false-positives,
+        fetches all spools and scans their ``extra`` dicts in Python, decoding
+        JSON-encoded values with a fallback to the raw string.
 
         Returns ``None`` if not found.
+
+        Raises ``RuntimeError`` when any HTTP/network failure makes the result
+        inconclusive (slot query error, secondary verification fetch error, or
+        fallback scan error).  Callers must treat this as "unknown — do not
+        auto-create" to avoid duplicate spool creation on transient failures.
         """
         # Short-circuit: if rfid_uid_N fields don't exist yet, no spool can have
         # this UID — create them now and skip the search entirely.
@@ -452,7 +485,12 @@ class SpoolmanClient:
             )
             self.ensure_rfid_uid_fields(max_uids)
             return None
+
         primary_had_error = False
+        # Track spool IDs that were definitively shown not to contain uid_hex so
+        # the same false-positive candidate is not re-checked for every slot query.
+        _rejected_ids = set()  # type: set[int]
+
         for n in range(1, max_uids + 1):
             field_key = self.uid_field_name(n)
             try:
@@ -460,91 +498,143 @@ class SpoolmanClient:
                     "GET",
                     f"/api/v1/spool?extra[{field_key}]={url_parse.quote(json.dumps(uid_hex), safe='')}",
                 )
-                if isinstance(spools, list) and spools:
-                    for spool in spools:
-                        spool_id_val = spool.get("id")
-                        if spool_id_val is None:
-                            continue
-                        candidate_id = int(spool_id_val)
-                        # Confirm uid_hex is present in the search-response extra dict
-                        # to guard against Spoolman partial/substring matches.  Check
-                        # the response body directly — no secondary HTTP fetch needed
-                        # when the query already returned exact-match data.
-                        uid_in_response = False
-                        resp_extra = spool.get("extra") or {}
+                if not (isinstance(spools, list) and spools):
+                    continue
+                for spool in spools:
+                    spool_id_val = spool.get("id")
+                    if spool_id_val is None:
+                        continue
+                    candidate_id = int(spool_id_val)
+
+                    # Skip candidates already proved not to contain uid_hex.
+                    if candidate_id in _rejected_ids:
+                        LOG.debug(
+                            "find_spool_by_uid: spool %d already rejected"
+                            " this call — skipping (uid=%s field=%s)",
+                            candidate_id, uid_hex, field_key,
+                        )
+                        continue
+
+                    # --- Inline verification using the search-response extra dict ---
+                    resp_extra = spool.get("extra") or {}
+                    if isinstance(resp_extra, dict):
+                        # Fast path: UID matches one of the response slots → confirmed.
                         for _n in range(1, max_uids + 1):
                             raw_v = resp_extra.get(self.uid_field_name(_n))
                             if raw_v is None:
                                 continue
-                            decoded_v = str(raw_v)
-                            try:
-                                _cv = json.loads(str(raw_v))
-                                if isinstance(_cv, str):
-                                    decoded_v = _cv
-                            except (json.JSONDecodeError, ValueError, TypeError):
-                                pass
-                            if decoded_v == uid_hex:
-                                uid_in_response = True
-                                break
-                        if uid_in_response:
-                            LOG.debug(
-                                "find_spool_by_uid: uid=%s confirmed in spool %d"
-                                " response extra fields — no secondary fetch needed",
-                                uid_hex, candidate_id,
+                            if self._decode_extra_value(raw_v) == uid_hex:
+                                LOG.debug(
+                                    "find_spool_by_uid: uid=%s confirmed in spool %d"
+                                    " via inline response extra (slot %d)",
+                                    uid_hex, candidate_id, _n,
+                                )
+                                return candidate_id
+
+                        # The queried field is present in the response with a
+                        # non-matching value — this is a Spoolman partial/substring
+                        # match false-positive.  Reject inline; no secondary fetch.
+                        queried_raw = resp_extra.get(field_key)
+                        if queried_raw is not None:
+                            LOG.info(
+                                "find_spool_by_uid: spool %d returned for uid=%s"
+                                " query on %s but response shows %s=%r"
+                                " (decoded: %r) — Spoolman partial/substring match;"
+                                " rejecting without secondary fetch",
+                                candidate_id, uid_hex, field_key,
+                                field_key, queried_raw,
+                                self._decode_extra_value(queried_raw),
                             )
-                            return candidate_id
-                        # UID not found in response extra — fall back to a direct spool
-                        # fetch (handles cases where the search API omits extra fields).
-                        try:
-                            slots = self.get_uid_slots(candidate_id, max_uids)
-                        except Exception as verify_exc:
-                            LOG.debug(
-                                "find_spool_by_uid: verification fetch for spool %d"
-                                " failed: %s", candidate_id, verify_exc,
-                            )
+                            _rejected_ids.add(candidate_id)
                             continue
-                        if slots is not None and uid_hex in slots.values():
-                            LOG.debug(
-                                "find_spool_by_uid: uid=%s confirmed in spool %d"
-                                " via secondary fetch (extra not in search response)",
-                                uid_hex, candidate_id,
-                            )
-                            return candidate_id
-                        LOG.info(
-                            "find_spool_by_uid: query returned spool %d for uid=%s"
-                            " but verification failed (uid not in extra fields)"
-                            " — treating as no match", candidate_id, uid_hex,
+
+                    # The response either has no extra dict or did not include the
+                    # queried field.  Fall back to one secondary fetch to verify.
+                    LOG.debug(
+                        "find_spool_by_uid: spool %d — response missing %s;"
+                        " secondary fetch needed to verify uid=%s",
+                        candidate_id, field_key, uid_hex,
+                    )
+                    try:
+                        slots = self.get_uid_slots(candidate_id, max_uids)
+                    except Exception as verify_exc:
+                        LOG.warning(
+                            "find_spool_by_uid: secondary fetch for spool %d"
+                            " failed: %s — lookup is inconclusive",
+                            candidate_id, verify_exc,
                         )
+                        raise
+                    if slots and uid_hex in slots.values():
+                        LOG.debug(
+                            "find_spool_by_uid: uid=%s confirmed in spool %d"
+                            " via secondary fetch",
+                            uid_hex, candidate_id,
+                        )
+                        return candidate_id
+                    LOG.info(
+                        "find_spool_by_uid: spool %d secondary fetch slots=%r —"
+                        " uid=%s not present; spool rejected",
+                        candidate_id, list(slots.values()) if slots else [],
+                        uid_hex,
+                    )
+                    _rejected_ids.add(candidate_id)
             except Exception as exc:
-                LOG.debug(
-                    "find_spool_by_uid uid=%s field=%s: %s", uid_hex, field_key, exc
+                LOG.warning(
+                    "find_spool_by_uid uid=%s field=%s: %s — lookup may be inconclusive",
+                    uid_hex, field_key, exc,
                 )
                 primary_had_error = True
+
         if primary_had_error:
-            return None
+            raise RuntimeError(
+                f"find_spool_by_uid: Spoolman lookup for uid={uid_hex} was inconclusive"
+                " (one or more slot queries or secondary fetches failed) —"
+                " treating as error, not miss"
+            )
+
         # Fallback: fetch all spools and scan rfid_uid_N values in Python.
+        # This handles legacy entries where the search index may not have been
+        # updated, and covers Spoolman versions that do not index extra fields.
+        LOG.debug(
+            "find_spool_by_uid: no match in %d slot queries for uid=%s"
+            " — running fallback full-spool scan",
+            max_uids, uid_hex,
+        )
         try:
             all_spools = self._req("GET", "/api/v1/spool") or []
             if isinstance(all_spools, list):
                 for spool in all_spools:
-                    extra = (spool.get("extra") or {})
+                    extra = spool.get("extra") or {}
+                    if not isinstance(extra, dict):
+                        continue
                     for n in range(1, max_uids + 1):
                         raw_v = extra.get(self.uid_field_name(n))
                         if raw_v is None:
                             continue
-                        decoded_v = str(raw_v)
-                        try:
-                            candidate = json.loads(str(raw_v))
-                            if isinstance(candidate, str):
-                                decoded_v = candidate
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            pass
-                        if decoded_v == uid_hex:
+                        if self._decode_extra_value(raw_v) == uid_hex:
                             spool_id_val = spool.get("id")
                             if spool_id_val is not None:
+                                LOG.debug(
+                                    "find_spool_by_uid: uid=%s found in spool %d"
+                                    " via fallback full-spool scan",
+                                    uid_hex, spool_id_val,
+                                )
                                 return int(spool_id_val)
         except Exception as exc:
-            LOG.debug("find_spool_by_uid fallback scan failed: %s", exc)
+            LOG.warning(
+                "find_spool_by_uid fallback scan failed: %s — lookup is inconclusive",
+                exc,
+            )
+            raise RuntimeError(
+                f"find_spool_by_uid: fallback full-spool scan for uid={uid_hex} failed:"
+                f" {exc}"
+            ) from exc
+        LOG.info(
+            "find_spool_by_uid: uid=%s not found in Spoolman"
+            " (checked %d slot queries + fallback scan;"
+            " false-positives rejected: %d)",
+            uid_hex, max_uids, len(_rejected_ids),
+        )
         return None
 
     def _patch_uid_field(self, spool_id, field_key, value):
