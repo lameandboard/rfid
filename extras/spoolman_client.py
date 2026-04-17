@@ -15,13 +15,14 @@
 
 import json
 import logging
+import re
 import time
 from typing import Optional
 from urllib import error as url_error
 from urllib import parse as url_parse
 from urllib import request
 
-LOG = logging.getLogger(__name__)
+LOG = logging.getLogger("rfid.spoolman_client")
 
 # ---------------------------------------------------------------------------
 # SpoolmanDB fetch caches — populated at most once per process.
@@ -33,9 +34,13 @@ LOG = logging.getLogger(__name__)
 #   None = not yet attempted
 #   []   = attempted but failed (so we don't retry on every scan)
 #   list = successfully populated
+# _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE (str|None):
+#   None  = not yet populated (or not available)
+#   str   = manufacturer name from the top-level "manufacturer" key in bambulab.json
 # ---------------------------------------------------------------------------
 _SPOOLMANDB_MATERIALS_CACHE: Optional[dict] = None   # material_lower -> density (float)
 _SPOOLMANDB_BAMBU_CACHE: Optional[list] = None        # list of filament dicts from bambulab.json
+_SPOOLMANDB_BAMBU_MANUFACTURER_CACHE: Optional[str] = None  # top-level manufacturer name
 
 # Hardcoded density fallback table (g/cm³) — used when SpoolmanDB is unreachable.
 _DENSITY_FALLBACK: dict = {
@@ -73,6 +78,20 @@ _TAG_FORMAT_BRANDS: dict = {
 
 # Default spool weight (grams) used when the tag does not supply one.
 _DEFAULT_SPOOL_WEIGHT_G: int = 1000
+
+
+def _to_int_safe(val) -> Optional[int]:
+    """Convert *val* to int, returning None on failure.
+
+    Used to safely coerce numeric tag or SpoolmanDB temperature/weight values
+    without raising on invalid or missing data.
+    """
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def _fetch_spoolmandb_materials() -> dict:
@@ -127,10 +146,19 @@ def _fetch_spoolmandb_bambu() -> list:
     Returns a list of filament dicts from filaments/bambulab.json.
     On network failure returns [] so callers fall back to materials lookup.
     Result is cached in _SPOOLMANDB_BAMBU_CACHE for the process lifetime.
+
+    Also populates _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE with the manufacturer
+    name from the top-level "manufacturer" key in the JSON (e.g. "Bambu Lab"),
+    which can be used for vendor name normalisation when creating Spoolman vendor
+    records.  This cache is set to None when the field is absent or on failure.
     """
-    global _SPOOLMANDB_BAMBU_CACHE
+    global _SPOOLMANDB_BAMBU_CACHE, _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE
     if _SPOOLMANDB_BAMBU_CACHE is not None:
         return _SPOOLMANDB_BAMBU_CACHE
+    # Reset the manufacturer cache now so that any outcome of this fetch
+    # (missing key, list payload, or exception) leaves it in a known state
+    # rather than potentially carrying a stale value from a previous run.
+    _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = None
     try:
         req = request.Request(
             "https://donkie.github.io/SpoolmanDB/filaments/bambulab.json",
@@ -141,12 +169,20 @@ def _fetch_spoolmandb_bambu() -> list:
         filaments: list = []
         if isinstance(raw, dict):
             filaments = raw.get("filaments") or []
+            # Capture manufacturer name for vendor normalisation.
+            _mfr = str(raw.get("manufacturer") or "").strip()
+            if _mfr:
+                _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = _mfr
+            # If the key is absent or empty, the cache stays None (already set
+            # above) — no stale name is carried forward.
         elif isinstance(raw, list):
+            # Top-level list: no manufacturer metadata available.
             filaments = raw
         _SPOOLMANDB_BAMBU_CACHE = filaments if isinstance(filaments, list) else []
         LOG.debug(
-            "spoolman: SpoolmanDB Bambu filaments loaded (%d entries)",
+            "spoolman: SpoolmanDB Bambu filaments loaded (%d entries, manufacturer=%r)",
             len(_SPOOLMANDB_BAMBU_CACHE),
+            _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE,
         )
         return _SPOOLMANDB_BAMBU_CACHE
     except Exception as exc:
@@ -155,6 +191,9 @@ def _fetch_spoolmandb_bambu() -> list:
             exc,
         )
         _SPOOLMANDB_BAMBU_CACHE = []
+        # Ensure the manufacturer cache is also cleared on failure so that no
+        # stale name influences vendor resolution on subsequent calls.
+        _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE = None
         return []
 
 
@@ -188,9 +227,10 @@ class SpoolmanClient:
             curl_parts.append(f"-d '{safe_body}'")
         curl_cmd = " ".join(curl_parts)
 
-        LOG.debug("spoolman: → %s %s%s", method, url,
-                  f"  body={body_str[:400]}{'...' if len(body_str) > 400 else ''}"
-                  if body_str else "")
+        _log_fn = LOG.info if method in ("POST", "PUT", "PATCH") else LOG.debug
+        _log_fn("spoolman: → %s %s%s", method, url,
+                f"  body={body_str[:800]}{'...' if len(body_str) > 800 else ''}"
+                if body_str else "")
         LOG.debug("spoolman:   %s", curl_cmd)
 
         req = request.Request(url, data=data, headers=self.headers, method=method)
@@ -385,6 +425,26 @@ class SpoolmanClient:
                     slots[n] = val
         return slots
 
+    @staticmethod
+    def _decode_extra_value(raw_v):
+        """Decode a Spoolman extra-field value to a plain string.
+
+        Values stored by this plugin are JSON-encoded (e.g. ``'"C2C304EB"'``).
+        Older entries or values written by external tools may be bare strings
+        (e.g. ``'C2C304EB'``).  Both forms are handled by attempting JSON
+        decode first and falling back to the raw string.
+
+        Returns the decoded string, or the raw string if decoding fails.
+        """
+        decoded = str(raw_v)
+        try:
+            candidate = json.loads(str(raw_v))
+            if isinstance(candidate, str):
+                decoded = candidate
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return decoded
+
     def find_spool_by_uid(self, uid_hex, max_uids):
         """Search Spoolman for a spool whose ``rfid_uid_N`` extra field equals ``uid_hex``.
 
@@ -393,15 +453,28 @@ class SpoolmanClient:
         immediately to avoid false-positive matches.
 
         Primary path: queries each numbered slot with the JSON-encoded value (since
-        Spoolman stores extra field values as JSON-encoded strings).  Each hit is
-        **verified** by fetching the candidate spool's UID slots and confirming
-        ``uid_hex`` is actually present before returning, preventing false positives.
+        Spoolman stores extra field values as JSON-encoded strings).  For each hit,
+        the search-response ``extra`` dict is checked inline:
 
-        Fallback path: if all per-slot queries return empty, fetches all spools and
-        scans their ``extra`` dicts in Python, decoding JSON-encoded values with a
-        fallback to the raw string for backward compatibility.
+        * If the **queried field** is present in the response with a non-matching
+          value, Spoolman returned a partial/substring match — the spool is rejected
+          inline without any additional HTTP fetch and added to ``_rejected_ids`` so
+          the same false-positive spool is silently skipped in subsequent slot queries.
+
+        * If the response ``extra`` does not include the queried field, a single
+          secondary GET fetch is performed to verify; this handles the (rare) case
+          where the search API omits extra-field values from its response.
+
+        Fallback path: if all per-slot queries return empty or only false-positives,
+        fetches all spools and scans their ``extra`` dicts in Python, decoding
+        JSON-encoded values with a fallback to the raw string.
 
         Returns ``None`` if not found.
+
+        Raises ``RuntimeError`` when any HTTP/network failure makes the result
+        inconclusive (slot query error, secondary verification fetch error, or
+        fallback scan error).  Callers must treat this as "unknown — do not
+        auto-create" to avoid duplicate spool creation on transient failures.
         """
         # Short-circuit: if rfid_uid_N fields don't exist yet, no spool can have
         # this UID — create them now and skip the search entirely.
@@ -412,7 +485,12 @@ class SpoolmanClient:
             )
             self.ensure_rfid_uid_fields(max_uids)
             return None
+
         primary_had_error = False
+        # Track spool IDs that were definitively shown not to contain uid_hex so
+        # the same false-positive candidate is not re-checked for every slot query.
+        _rejected_ids = set()  # type: set[int]
+
         for n in range(1, max_uids + 1):
             field_key = self.uid_field_name(n)
             try:
@@ -420,57 +498,143 @@ class SpoolmanClient:
                     "GET",
                     f"/api/v1/spool?extra[{field_key}]={url_parse.quote(json.dumps(uid_hex), safe='')}",
                 )
-                if isinstance(spools, list) and spools:
-                    spool_id_val = spools[0].get("id")
-                    if spool_id_val is not None:
-                        candidate_id = int(spool_id_val)
-                        # Verify the candidate actually contains uid_hex to prevent
-                        # false-positive matches caused by Spoolman partial matching.
-                        try:
-                            slots = self.get_uid_slots(candidate_id, max_uids)
-                        except Exception as verify_exc:
-                            LOG.debug(
-                                "find_spool_by_uid: verification fetch for spool %d"
-                                " failed: %s", candidate_id, verify_exc,
-                            )
-                            continue
-                        if slots is not None and uid_hex in slots.values():
-                            return candidate_id
-                        LOG.info(
-                            "find_spool_by_uid: query returned spool %d for uid=%s"
-                            " but verification failed (uid not in extra fields)"
-                            " — treating as no match", candidate_id, uid_hex,
+                if not (isinstance(spools, list) and spools):
+                    continue
+                for spool in spools:
+                    spool_id_val = spool.get("id")
+                    if spool_id_val is None:
+                        continue
+                    candidate_id = int(spool_id_val)
+
+                    # Skip candidates already proved not to contain uid_hex.
+                    if candidate_id in _rejected_ids:
+                        LOG.debug(
+                            "find_spool_by_uid: spool %d already rejected"
+                            " this call — skipping (uid=%s field=%s)",
+                            candidate_id, uid_hex, field_key,
                         )
+                        continue
+
+                    # --- Inline verification using the search-response extra dict ---
+                    resp_extra = spool.get("extra") or {}
+                    if isinstance(resp_extra, dict):
+                        # Fast path: UID matches one of the response slots → confirmed.
+                        for _n in range(1, max_uids + 1):
+                            raw_v = resp_extra.get(self.uid_field_name(_n))
+                            if raw_v is None:
+                                continue
+                            if self._decode_extra_value(raw_v) == uid_hex:
+                                LOG.debug(
+                                    "find_spool_by_uid: uid=%s confirmed in spool %d"
+                                    " via inline response extra (slot %d)",
+                                    uid_hex, candidate_id, _n,
+                                )
+                                return candidate_id
+
+                        # The queried field is present in the response with a
+                        # non-matching value — this is a Spoolman partial/substring
+                        # match false-positive.  Reject inline; no secondary fetch.
+                        queried_raw = resp_extra.get(field_key)
+                        if queried_raw is not None:
+                            LOG.info(
+                                "find_spool_by_uid: spool %d returned for uid=%s"
+                                " query on %s but response shows %s=%r"
+                                " (decoded: %r) — Spoolman partial/substring match;"
+                                " rejecting without secondary fetch",
+                                candidate_id, uid_hex, field_key,
+                                field_key, queried_raw,
+                                self._decode_extra_value(queried_raw),
+                            )
+                            _rejected_ids.add(candidate_id)
+                            continue
+
+                    # The response either has no extra dict or did not include the
+                    # queried field.  Fall back to one secondary fetch to verify.
+                    LOG.debug(
+                        "find_spool_by_uid: spool %d — response missing %s;"
+                        " secondary fetch needed to verify uid=%s",
+                        candidate_id, field_key, uid_hex,
+                    )
+                    try:
+                        slots = self.get_uid_slots(candidate_id, max_uids)
+                    except Exception as verify_exc:
+                        LOG.warning(
+                            "find_spool_by_uid: secondary fetch for spool %d"
+                            " failed: %s — lookup is inconclusive",
+                            candidate_id, verify_exc,
+                        )
+                        raise
+                    if slots and uid_hex in slots.values():
+                        LOG.debug(
+                            "find_spool_by_uid: uid=%s confirmed in spool %d"
+                            " via secondary fetch",
+                            uid_hex, candidate_id,
+                        )
+                        return candidate_id
+                    LOG.info(
+                        "find_spool_by_uid: spool %d secondary fetch slots=%r —"
+                        " uid=%s not present; spool rejected",
+                        candidate_id, list(slots.values()) if slots else [],
+                        uid_hex,
+                    )
+                    _rejected_ids.add(candidate_id)
             except Exception as exc:
-                LOG.debug(
-                    "find_spool_by_uid uid=%s field=%s: %s", uid_hex, field_key, exc
+                LOG.warning(
+                    "find_spool_by_uid uid=%s field=%s: %s — lookup may be inconclusive",
+                    uid_hex, field_key, exc,
                 )
                 primary_had_error = True
+
         if primary_had_error:
-            return None
+            raise RuntimeError(
+                f"find_spool_by_uid: Spoolman lookup for uid={uid_hex} was inconclusive"
+                " (one or more slot queries or secondary fetches failed) —"
+                " treating as error, not miss"
+            )
+
         # Fallback: fetch all spools and scan rfid_uid_N values in Python.
+        # This handles legacy entries where the search index may not have been
+        # updated, and covers Spoolman versions that do not index extra fields.
+        LOG.debug(
+            "find_spool_by_uid: no match in %d slot queries for uid=%s"
+            " — running fallback full-spool scan",
+            max_uids, uid_hex,
+        )
         try:
             all_spools = self._req("GET", "/api/v1/spool") or []
             if isinstance(all_spools, list):
                 for spool in all_spools:
-                    extra = (spool.get("extra") or {})
+                    extra = spool.get("extra") or {}
+                    if not isinstance(extra, dict):
+                        continue
                     for n in range(1, max_uids + 1):
                         raw_v = extra.get(self.uid_field_name(n))
                         if raw_v is None:
                             continue
-                        decoded_v = str(raw_v)
-                        try:
-                            candidate = json.loads(str(raw_v))
-                            if isinstance(candidate, str):
-                                decoded_v = candidate
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            pass
-                        if decoded_v == uid_hex:
+                        if self._decode_extra_value(raw_v) == uid_hex:
                             spool_id_val = spool.get("id")
                             if spool_id_val is not None:
+                                LOG.debug(
+                                    "find_spool_by_uid: uid=%s found in spool %d"
+                                    " via fallback full-spool scan",
+                                    uid_hex, spool_id_val,
+                                )
                                 return int(spool_id_val)
         except Exception as exc:
-            LOG.debug("find_spool_by_uid fallback scan failed: %s", exc)
+            LOG.warning(
+                "find_spool_by_uid fallback scan failed: %s — lookup is inconclusive",
+                exc,
+            )
+            raise RuntimeError(
+                f"find_spool_by_uid: fallback full-spool scan for uid={uid_hex} failed:"
+                f" {exc}"
+            ) from exc
+        LOG.info(
+            "find_spool_by_uid: uid=%s not found in Spoolman"
+            " (checked %d slot queries + fallback scan;"
+            " false-positives rejected: %d)",
+            uid_hex, max_uids, len(_rejected_ids),
+        )
         return None
 
     def _patch_uid_field(self, spool_id, field_key, value):
@@ -664,20 +828,24 @@ class SpoolmanClient:
                 return f
         return None
 
-    def create_filament(self, name, vendor_id, material, density=None, color_hex=None):
+    def create_filament(self, name, vendor_id, material, density=None, color_hex=None, diameter=1.75):
         """Create a new filament and return the filament dict."""
         body = {"name": name, "vendor_id": int(vendor_id), "material": material}
-        if density is not None:
-            try:
-                body["density"] = float(density)
-            except (ValueError, TypeError):
-                pass
+        # density and diameter are required by the Spoolman API; always send them.
+        try:
+            body["density"] = float(density) if density is not None else _DENSITY_DEFAULT
+        except (TypeError, ValueError):
+            body["density"] = _DENSITY_DEFAULT
+        try:
+            body["diameter"] = float(diameter) if diameter is not None else 1.75
+        except (TypeError, ValueError):
+            body["diameter"] = 1.75
         if color_hex:
             body["color_hex"] = str(color_hex).lstrip("#").upper()
         return self._req("POST", "/api/v1/filament", body)
 
     def find_or_create_filament(self, name, vendor_id, material,
-                                density=None, color_hex=None):
+                                density=None, color_hex=None, diameter=1.75):
         """Return the filament_id for *name*+*vendor_id*, creating it if necessary.
 
         Raises ``ValueError`` when both the lookup and the create call return an
@@ -685,7 +853,7 @@ class SpoolmanClient:
         """
         fil = self.find_filament(name, vendor_id)
         if fil is None:
-            fil = self.create_filament(name, vendor_id, material, density, color_hex)
+            fil = self.create_filament(name, vendor_id, material, density, color_hex, diameter)
         if not isinstance(fil, dict) or fil.get("id") is None:
             raise ValueError(
                 f"Spoolman filament find/create for {name!r} returned unexpected response: {fil!r}"
@@ -695,7 +863,7 @@ class SpoolmanClient:
     # --- Spool helpers ---
 
     def create_spool(self, filament_id, initial_weight=None, remaining_weight=None,
-                     spool_weight=None):
+                     spool_weight=None, lot_nr=None, extra=None):
         """Create a new spool and return the spool dict.
 
         Args:
@@ -703,6 +871,8 @@ class SpoolmanClient:
             initial_weight:   weight of the filament on a brand-new full spool (grams).
             remaining_weight: current remaining filament weight (grams).
             spool_weight:     weight of the empty spool holder (grams).
+            lot_nr:           lot / tray UID string for identifying this spool.
+            extra:            dict of extra field key→value pairs to store on the spool.
         """
         body = {"filament_id": int(filament_id)}
         if initial_weight is not None:
@@ -720,28 +890,47 @@ class SpoolmanClient:
                 body["spool_weight"] = float(spool_weight)
             except (ValueError, TypeError):
                 pass
+        if lot_nr:
+            body["lot_nr"] = str(lot_nr)
+        if extra and isinstance(extra, dict):
+            body["extra"] = {str(k): json.dumps(v) for k, v in extra.items() if v is not None}
         return self._req("POST", "/api/v1/spool", body)
 
-    def auto_create_spool(self, filament_info: dict) -> Optional[int]:
+    def auto_create_spool(self, filament_info: dict, uid_hex: Optional[str] = None) -> Optional[int]:
         """Find or create a Spoolman vendor/filament/spool from tag filament data.
 
         Returns the new Spoolman spool ID on success, or None on failure.
 
-        Bare-minimum metadata required before creating anything:
+        Required before creating anything:
           * material  — filament type (e.g. "PLA", "PETG")
-          * color_hex — 6-digit hex color string; cannot be deduced from context
-          * weight_g  — spool weight in grams; defaults to 1000 g if not supplied
 
-        Additional fields that can be deduced when absent:
-          * brand     — inferred from tag_format, falls back to "Generic"
+        Optional but used when present:
+          * color_hex   — 6-digit hex color string; omitted from filament if absent
+          * weight_g    — spool weight in grams; defaults to 1000 g if not supplied
+          * brand       — inferred from tag_format, falls back to "Generic"
           * diameter_mm — defaults to 1.75 mm
 
+        The optional uid_hex argument (hardware RFID UID) is stored in the
+        spool's extra field (rfid_uid_1) at creation time when provided, after
+        ensuring the extra-field schema exists in Spoolman.
+
         Steps:
-        1. Determine density via SpoolmanDB (Bambu DB or materials.json) or fallback table.
+        1. Determine density via SpoolmanDB (Bambu DB or materials.json) or fallback
+           table.  For Bambu tags the DB is searched first by material_id (Bambu SKU
+           stored in the per-colour ``id`` field, e.g. "GFA50") then by material +
+           color_hex.  This yields a ``bambu_match`` (filament entry) and optional
+           ``bambu_color_match`` (colour entry) which carry richer metadata.
         2. Resolve vendor_id: find or create, with Generic fallback if brand fails.
-        3. Search for existing filament by material + vendor (prefer color_hex match).
-        4. If no match: POST /api/v1/filament — create the filament.
-        5. POST /api/v1/spool — create the spool referencing the filament.
+           For Bambu tags the manufacturer name from the SpoolmanDB top-level JSON
+           is preferred over the raw tag brand when resolving the vendor.
+        3. Search for existing filament by external_id, then material + vendor
+           (prefer color_hex match).
+        4. If no match: POST /api/v1/filament — create the filament.  Fields are
+           populated from tag data first, then filled from SpoolmanDB (name,
+           extruder_temp, bed_temp, spool_weight) to ensure Spoolman has complete
+           metadata without requiring complete tag data.
+        5. POST /api/v1/spool — create the spool referencing the filament,
+           including lot_nr (tray_uid) and uid_hex in extra fields.
         """
         material = str(filament_info.get("material") or "").strip()
         if not material:
@@ -751,10 +940,8 @@ class SpoolmanClient:
         color_hex = str(filament_info.get("color_hex") or "").strip().lstrip("#").upper()
         if not color_hex:
             LOG.debug(
-                "auto_create_spool: skipped — no color_hex in tag data"
-                " (bare minimum: material + color_hex + weight)"
+                "auto_create_spool: no color_hex in tag data — proceeding without color"
             )
-            return None
 
         weight_g = filament_info.get("weight_g")
         if weight_g is None:
@@ -767,11 +954,11 @@ class SpoolmanClient:
             try:
                 weight_g = float(weight_g)
             except (TypeError, ValueError):
+                weight_g = _DEFAULT_SPOOL_WEIGHT_G
                 LOG.debug(
-                    "auto_create_spool: skipped — invalid weight_g in tag data: %r",
-                    weight_g,
+                    "auto_create_spool: invalid weight_g in tag data: %r, defaulting to %d g",
+                    filament_info.get("weight_g"), _DEFAULT_SPOOL_WEIGHT_G,
                 )
-                return None
 
         brand = str(filament_info.get("brand") or "").strip()
         if not brand:
@@ -785,26 +972,78 @@ class SpoolmanClient:
         diameter_mm = filament_info.get("diameter_mm") or 1.75
         is_bambu = bool(filament_info.get("is_bambu")) or "bambu" in brand.lower()
 
+        # material_id (e.g. "GFA50", "GFG02") is the Bambu external filament DB id.
+        # Used as Spoolman external_id to look up an existing matching filament entry.
+        material_id = str(filament_info.get("material_id") or "").strip() or None
+        _raw_tray_uid = str(filament_info.get("tray_uid") or "").strip()
+        # Validate tray_uid: must be a non-empty even-length hex string (e.g. 32 hex chars
+        # for a 16-byte Bambu Tray UID).  If bytes slipped through, convert; if garbled, discard.
+        tray_uid: Optional[str] = None
+        if _raw_tray_uid:
+            if isinstance(filament_info.get("tray_uid"), (bytes, bytearray)):
+                # Raw bytes — convert to uppercase hex string.
+                tray_uid = filament_info["tray_uid"].hex().upper()
+                LOG.debug("auto_create_spool: tray_uid converted from bytes → %s", tray_uid)
+            elif re.fullmatch(r"[0-9A-Fa-f]+", _raw_tray_uid) and len(_raw_tray_uid) % 2 == 0:
+                tray_uid = _raw_tray_uid.upper()
+            else:
+                LOG.warning(
+                    "auto_create_spool: tray_uid %r is not a valid hex string"
+                    " — discarding to avoid Spoolman 422 error",
+                    _raw_tray_uid,
+                )
+
         # ------------------------------------------------------------------
         # 1. Determine density (required by Spoolman POST /api/v1/filament)
+        #    For Bambu tags, also fetch richer SpoolmanDB metadata (name,
+        #    temperatures, spool weight) to use when creating a new filament.
         # ------------------------------------------------------------------
         density: float = _DENSITY_DEFAULT
         material_lower = material.lower().strip()
+        # bambu_match: the matching filament entry from SpoolmanDB bambulab.json
+        # bambu_color_match: the specific colour entry within bambu_match (may be None)
+        bambu_match: Optional[dict] = None
+        bambu_color_match: Optional[dict] = None
 
         if is_bambu:
             bambu_filaments = _fetch_spoolmandb_bambu()
-            bambu_match = None
-            for entry in bambu_filaments:
-                if str(entry.get("material") or "").lower().strip() == material_lower:
-                    bambu_match = entry
-                    if color_hex:
-                        colors = entry.get("colors") or []
-                        for c in colors:
-                            if str(c.get("hex") or "").upper().lstrip("#") == color_hex:
-                                bambu_match = entry
-                                color_hex = str(c.get("hex") or color_hex).upper().lstrip("#")
-                                break
-                    break
+
+            # 1a. Try to match by Bambu SKU (material_id) via colours[].id — most
+            #     precise, uniquely identifies brand + material + colour variant.
+            if material_id:
+                for entry in bambu_filaments:
+                    for c in (entry.get("colors") or []):
+                        if str(c.get("id") or "").upper() == material_id.upper():
+                            bambu_match = entry
+                            bambu_color_match = c
+                            # Use the SpoolmanDB colour hex when available; it is
+                            # the canonical value for this SKU.
+                            if c.get("hex"):
+                                color_hex = str(c["hex"]).upper().lstrip("#")
+                            break
+                    if bambu_match is not None:
+                        break
+                if bambu_match is not None:
+                    LOG.debug(
+                        "auto_create_spool: SpoolmanDB Bambu match by SKU"
+                        " material_id=%s color=%r",
+                        material_id, bambu_color_match.get("name") if bambu_color_match else None,
+                    )
+
+            # 1b. Fall back to material-type + color_hex matching when no SKU match.
+            if bambu_match is None:
+                for entry in bambu_filaments:
+                    if str(entry.get("material") or "").lower().strip() == material_lower:
+                        bambu_match = entry
+                        if color_hex:
+                            for c in (entry.get("colors") or []):
+                                c_hex = str(c.get("hex") or "").upper().lstrip("#")
+                                if c_hex == color_hex:
+                                    bambu_color_match = c
+                                    color_hex = c_hex
+                                    break
+                        break
+
             if bambu_match is not None:
                 try:
                     density = float(bambu_match["density"])
@@ -841,11 +1080,23 @@ class SpoolmanClient:
         # 2. Resolve or create vendor — try brand first, then Generic fallback.
         #    Raises are caught so a failed brand lookup doesn't abort the whole
         #    operation; we fall back to "Generic" instead.
+        #    For Bambu tags, prefer the manufacturer name from SpoolmanDB (the
+        #    canonical name) over the raw tag brand to avoid creating a duplicate
+        #    vendor when the tag uses a slightly different spelling.
         # ------------------------------------------------------------------
         vendor_id: Optional[int] = None
         resolved_vendor_name: Optional[str] = None
         _vendor_candidates: list = []
-        if brand and brand.lower() != "generic":
+        # Use the SpoolmanDB manufacturer name as the primary vendor candidate
+        # for Bambu tags, since it is the canonical name used in the filament DB.
+        if is_bambu and _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE:
+            _spoolmandb_mfr = _SPOOLMANDB_BAMBU_MANUFACTURER_CACHE
+            if _spoolmandb_mfr.lower() != "generic":
+                _vendor_candidates.append(_spoolmandb_mfr)
+            # Also add the tag brand as a fallback (may differ from DB name).
+            if brand and brand.lower() != "generic" and brand != _spoolmandb_mfr:
+                _vendor_candidates.append(brand)
+        elif brand and brand.lower() != "generic":
             _vendor_candidates.append(brand)
         _vendor_candidates.append("Generic")
 
@@ -874,29 +1125,46 @@ class SpoolmanClient:
             )
 
         # ------------------------------------------------------------------
-        # 3. Search for an existing matching filament
+        # 3. Search for an existing matching filament.
+        #    First try by external_id (Bambu material_id like "GFA50"), then
+        #    fall back to material + vendor search with color_hex preference.
         # ------------------------------------------------------------------
         filament_id: Optional[int] = None
         search_ok = True
         try:
-            params: dict = {"material": material}
-            if vendor_id is not None:
-                params["vendor_name"] = resolved_vendor_name
-            filaments = self._req(
-                "GET", "/api/v1/filament?" + url_parse.urlencode(params)
-            )
-            if isinstance(filaments, list) and filaments:
-                if color_hex:
-                    for f in filaments:
-                        if str(f.get("color_hex") or "").upper() == color_hex:
-                            filament_id = int(f["id"])
-                            break
-                if filament_id is None:
-                    filament_id = int(filaments[0]["id"])
-                LOG.debug(
-                    "auto_create_spool: found filament id=%s material=%s",
-                    filament_id, material,
+            # 3a. Search by external_id when a Bambu material_id is available.
+            if material_id:
+                ext_results = self._req(
+                    "GET",
+                    "/api/v1/filament?" + url_parse.urlencode({"external_id": material_id}),
                 )
+                if isinstance(ext_results, list) and ext_results:
+                    filament_id = int(ext_results[0]["id"])
+                    LOG.debug(
+                        "auto_create_spool: found filament id=%s by external_id=%s",
+                        filament_id, material_id,
+                    )
+
+            # 3b. Fall back to material + vendor search.
+            if filament_id is None:
+                params: dict = {"material": material}
+                if vendor_id is not None:
+                    params["vendor_name"] = resolved_vendor_name
+                filaments = self._req(
+                    "GET", "/api/v1/filament?" + url_parse.urlencode(params)
+                )
+                if isinstance(filaments, list) and filaments:
+                    if color_hex:
+                        for f in filaments:
+                            if str(f.get("color_hex") or "").upper() == color_hex:
+                                filament_id = int(f["id"])
+                                break
+                    if filament_id is None:
+                        filament_id = int(filaments[0]["id"])
+                    LOG.debug(
+                        "auto_create_spool: found filament id=%s material=%s",
+                        filament_id, material,
+                    )
         except url_error.URLError as exc:
             LOG.debug("auto_create_spool: filament search failed: %s", exc)
             search_ok = False
@@ -908,30 +1176,69 @@ class SpoolmanClient:
             return None
 
         # ------------------------------------------------------------------
-        # 4. Create filament if no match found
+        # 4. Create filament if no match found.
+        #    Populate fields from tag data first, then fill gaps from SpoolmanDB
+        #    (bambu_match) so the Spoolman record is as complete as possible even
+        #    when the tag does not carry temperature or weight metadata.
         # ------------------------------------------------------------------
         if filament_id is None:
-            filament_name = f"{brand} {material}" if brand else material
+            # Build a descriptive name.  Prefer the SpoolmanDB filament name
+            # (e.g. "PLA Basic", "PETG HF") over the generic "{brand} {material}"
+            # fallback so the Spoolman UI shows a meaningful label.
+            db_fil_name = str(bambu_match.get("name") or "").strip() if bambu_match else ""
+            if db_fil_name:
+                filament_name = f"{resolved_vendor_name} {db_fil_name}" if resolved_vendor_name else db_fil_name
+            else:
+                filament_name = f"{brand} {material}" if brand else material
+
             filament_body: dict = {
                 "name": filament_name,
                 "material": material,
                 "density": density,
                 "diameter": float(diameter_mm),
-                "color_hex": color_hex,
                 "weight": float(weight_g),
             }
+            if color_hex:
+                filament_body["color_hex"] = color_hex
             if vendor_id is not None:
                 filament_body["vendor_id"] = vendor_id
+            if material_id:
+                filament_body["external_id"] = material_id
+
+            # Temperature settings: use tag data when present, otherwise fall
+            # back to SpoolmanDB values (Bambu only).  SpoolmanDB carries both
+            # min ("extruder_temp") and max ("extruder_temp_max") temps.
             min_temp = filament_info.get("min_temp")
             max_temp = filament_info.get("max_temp")
             bed_temp = filament_info.get("bed_temp")
-            if min_temp is not None:
-                filament_body["settings_extruder_temp"] = int(min_temp)
-            if max_temp is not None:
-                filament_body["settings_extruder_temp_max"] = int(max_temp)
-            if bed_temp is not None:
-                filament_body["settings_bed_temp"] = int(bed_temp)
+            if bambu_match is not None:
+                if min_temp is None:
+                    min_temp = bambu_match.get("extruder_temp")
+                if max_temp is None:
+                    max_temp = bambu_match.get("extruder_temp_max")
+                if bed_temp is None:
+                    bed_temp = bambu_match.get("bed_temp")
+
+            # settings_extruder_temp: use min_temp (lower hotend bound) as the
+            # recommended extruder temperature; settings_extruder_temp_max for
+            # the upper bound when available.
+            _ext_min = _to_int_safe(min_temp)
+            _ext_max = _to_int_safe(max_temp)
+            _bed = _to_int_safe(bed_temp)
+            if _ext_min is not None:
+                filament_body["settings_extruder_temp"] = _ext_min
+            elif _ext_max is not None:
+                filament_body["settings_extruder_temp"] = _ext_max
+            if _ext_min is not None and _ext_max is not None:
+                filament_body["settings_extruder_temp_max"] = _ext_max
+            if _bed is not None:
+                filament_body["settings_bed_temp"] = _bed
+
             try:
+                LOG.info(
+                    "auto_create_spool: creating filament — payload: %s",
+                    json.dumps(filament_body, default=str),
+                )
                 created = self._req("POST", "/api/v1/filament", filament_body)
                 if not isinstance(created, dict) or created.get("id") is None:
                     LOG.warning(
@@ -940,26 +1247,67 @@ class SpoolmanClient:
                     )
                     return None
                 filament_id = int(created["id"])
-                LOG.debug(
+                LOG.info(
                     "auto_create_spool: created filament id=%s name=%r density=%s",
                     filament_id, filament_name, density,
                 )
             except url_error.URLError as exc:
-                LOG.debug("auto_create_spool: filament create failed: %s", exc)
+                LOG.warning("auto_create_spool: filament create failed: %s", exc)
                 return None
             except Exception:
                 LOG.exception("auto_create_spool: filament create error")
                 return None
 
         # ------------------------------------------------------------------
-        # 5. Create spool
+        # 5. Create spool, including lot_nr (tray_uid) and uid_hex extra field.
+        #    The rfid_uid_1 extra field must be registered in Spoolman before
+        #    it can be set on the spool.  Attempt to ensure it exists first;
+        #    if that fails, create the spool without the extra UID field (the
+        #    caller's add_uid_to_spool call will register it on the next scan).
+        #    spool_weight_g: use tag data when present, otherwise use the
+        #    SpoolmanDB value (Bambu only) so the tare weight is accurate.
         # ------------------------------------------------------------------
         spool_weight_g = filament_info.get("spool_weight_g")
+        if spool_weight_g is None and bambu_match is not None:
+            _db_spool_w = bambu_match.get("spool_weight")
+            if _db_spool_w is not None:
+                try:
+                    spool_weight_g = float(_db_spool_w)
+                    LOG.debug(
+                        "auto_create_spool: spool_weight_g=%s from SpoolmanDB",
+                        spool_weight_g,
+                    )
+                except (TypeError, ValueError):
+                    pass
+        spool_extra: Optional[dict] = None
+        if uid_hex:
+            try:
+                ok, _ = self.ensure_rfid_uid_fields(1)
+                if ok:
+                    spool_extra = {self.uid_field_name(1): uid_hex}
+            except Exception as exc:
+                LOG.debug(
+                    "auto_create_spool: ensure_rfid_uid_fields failed: %s"
+                    " — creating spool without extra UID field", exc
+                )
         try:
+            _spool_log = {
+                "filament_id": filament_id,
+                "remaining_weight": float(weight_g),
+                "spool_weight": spool_weight_g,
+                "lot_nr": tray_uid,
+                "extra": spool_extra,
+            }
+            LOG.info(
+                "auto_create_spool: creating spool — payload: %s",
+                json.dumps(_spool_log, default=str),
+            )
             created_spool = self.create_spool(
                 filament_id,
                 remaining_weight=float(weight_g),
                 spool_weight=spool_weight_g,
+                lot_nr=tray_uid,
+                extra=spool_extra,
             )
             if not isinstance(created_spool, dict) or created_spool.get("id") is None:
                 LOG.warning(
@@ -968,10 +1316,10 @@ class SpoolmanClient:
                 )
                 return None
             new_spool_id = int(created_spool["id"])
-            LOG.debug("auto_create_spool: created spool id=%s", new_spool_id)
+            LOG.info("auto_create_spool: created spool id=%s", new_spool_id)
             return new_spool_id
         except url_error.URLError as exc:
-            LOG.debug("auto_create_spool: spool create failed: %s", exc)
+            LOG.warning("auto_create_spool: spool create failed: %s", exc)
             return None
         except Exception:
             LOG.exception("auto_create_spool: spool create error")

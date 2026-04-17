@@ -16,9 +16,10 @@
 """
 RFID tag format parser for the rfid Klipper extra.
 
-Provides a single entry point:
+Provides two public entry points:
 
     parse_tag(raw, uid_hex: str | None = None) -> dict | None
+    is_parse_error(info: dict | None) -> bool
 
 ``raw`` may be:
   * ``bytes`` / ``bytearray`` — raw user-memory dump (starting at page 4 for
@@ -43,17 +44,61 @@ generic_ndef_json  Generic NDEF text record containing JSON filament data
 Optional dependencies
 ---------------------
 - pycryptodome (``pip3 install pycryptodome``) — required for Bambu Lab tag
-  decryption via HKDF key derivation.  Without it, Bambu detection still works
-  but parse_tag() returns None for Bambu tags instead of a filament dict.
+  key derivation via HKDF-SHA256.  Without it, Bambu tag detection still works
+  but parse_tag() returns an error dict (not a full filament dict) for Bambu tags.
 - cbor2 (``pip3 install cbor2``) — required for OpenPrintTag CBOR payloads.
+
+Bambu Lab tag authentication — how it works
+--------------------------------------------
+Bambu Lab spool tags are MIFARE Classic 1K chips with per-tag, per-sector
+encryption keys derived via HKDF-SHA256.  The derivation procedure is adapted
+from MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp (GPLv3):
+  https://github.com/MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp/blob/c8aa59e6d4c132f9e78bde24d791bbb330a12b7d/source/app/src/main/java/app/mrb/bambuspoolpal/nfc/NfcTagProcessor.kt#L53-L139
+No code was copied; the algorithm was reimplemented in Python from the
+published procedure.
+
+  IKM   = 4-byte tag UID (unique per spool) — uid is the HKDF input key material
+  Salt  = static 16-byte Bambu device master key (see ``_BAMBU_MASTER_KEY``)
+  Info  = b"RFID-A\\x00"  (Key A, used for all authenticated reads)
+  Output = 96 bytes split into 16 × 6-byte MIFARE sector keys
+
+Key B derivation (for write access)
+------------------------------------
+Key B is derived identically to Key A but with the context b"RFID-B\\x00".
+This convention follows community tooling (e.g. open Bambu tag programmers).
+On factory-programmed Bambu tags Key B is typically all-zeros; on custom/blank
+MIFARE Classic tags programmed with this toolchain Key B is HKDF-derived.
+
+  IKM   = 4-byte tag UID (same as Key A)
+  Salt  = _BAMBU_MASTER_KEY (same as Key A)
+  Info  = b"RFID-B\\x00"  (Key B, used for write authentication)
+  Output = 96 bytes split into 16 × 6-byte sector Key B values
+
+Use ``_bambu_derive_keys_b()`` to obtain Key B values.  Pass them with
+``use_key_b=True`` to the reader's write method.
+
+After key derivation, each of the 16 sectors is authenticated (Key A) and read
+with the MFRC522 PCD_AUTHENT command before the data blocks can be accessed.
+``parse_tag()`` expects these decrypted blocks as a dict:
+  ``{"uid_bytes": bytes, "blocks": {abs_block_index: 16-byte-bytes}}``
+
+Hardware requirements for Bambu tags:
+  • Reader must support ISO/IEC 14443 Type A 3-pass authentication
+    (MFRC522, PN532, ACR122U, RC663, Proxmark3 all qualify).
+  • Standard "pass-through" USB HID card readers do NOT support this and
+    will never be able to read Bambu tag sector data.
+  • pycryptodome must be installed for HKDF key derivation.
 
 Known limitations
 -----------------
 - Creality CFS and QIDI Box tags are MIFARE Classic 1K and require
-  sector-key authentication which standard MFRC522/PN532 firmware does not
-  perform.  Detection is attempted from the raw dump when available; if the
-  raw bytes look like these formats they are parsed, but in practice the data
-  past page 15 (sector 1) may not be available without key auth.
+  sector-key authentication.  Detection is attempted from the raw dump when
+  available; if the raw bytes look like these formats they are parsed, but in
+  practice the data past page 15 (sector 1) may not be available without auth.
+- Factory Bambu tags carry an RSA-2048 signature; the Bambu printer firmware
+  validates this signature so official firmware will reject reprogrammed tags.
+  Writing Tray UID / spool metadata to custom (blank) MIFARE Classic tags
+  programmed with this toolchain is fully supported via Key B authentication.
 """
 
 from __future__ import annotations
@@ -422,14 +467,17 @@ def _try_elegoo(raw: bytes) -> Optional[dict]:
 # ---- Bambu Lab -------------------------------------------------------------
 
 def _detect_bambu(raw: bytes) -> bool:
-    """Heuristically detect a Bambu Lab MIFARE Classic 1K tag.
+    """Heuristically detect a Bambu Lab MIFARE Classic 1K tag from a raw byte dump.
 
     Bambu tags use MIFARE Classic 1K with RSA-2048-signed, per-UID derived
-    encryption keys.  We cannot decrypt them with MFRC522/PN532 hardware.
+    encryption keys.  A raw byte dump from an unauthenticated read cannot be
+    decrypted here — the encrypted blocks look like random data.  Full sector
+    data is only available after per-sector HKDF key derivation and MIFARE
+    authentication (see ``_bambu_derive_keys`` and the module docstring).
 
-    Detection is unreliable from raw bytes alone because the encrypted
-    blocks look like random data; we flag it only when the raw dump is exactly
-    a multiple of 64 bytes (MIFARE Classic sector size) with no readable NDEF.
+    Detection is unreliable from raw bytes alone; we flag a candidate only when
+    the raw dump is exactly a multiple of 64 bytes (MIFARE Classic sector size)
+    with no readable NDEF and no known filament keywords.
     This is a best-effort heuristic only.
     """
     if len(raw) == 0:
@@ -452,10 +500,38 @@ def _detect_bambu(raw: bytes) -> bool:
     return True
 
 
-# Bambu Lab HKDF key derivation
 # ---------------------------------------------------------------------------
-# Master key and algorithm from Bambu-Research-Group/RFID-Tag-Guide/deriveKeys.py
+# Bambu Lab HKDF sector-key derivation
 # ---------------------------------------------------------------------------
+# Adapted from MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp
+# (GPLv3), NfcTagProcessor.kt lines 53–139, commit c8aa59e6d4c132f9e78bde24d791bbb330a12b7d:
+#   https://github.com/MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp/blob/c8aa59e6d4c132f9e78bde24d791bbb330a12b7d/source/app/src/main/java/app/mrb/bambuspoolpal/nfc/NfcTagProcessor.kt
+# No code was copied; the procedure was faithfully reimplemented in Python.
+#
+# The Android app uses BouncyCastle's HKDFBytesGenerator with:
+#   HKDFParameters(uid, masterKey, context)
+#   → HKDFParameters(IKM=uid, salt=masterKey, info=context)
+#
+# Key derivation overview:
+#   IKM  (input key material) = tag UID bytes        (4 bytes, unique per tag)
+#   Salt                       = _BAMBU_MASTER_KEY    (static 16-byte device key)
+#   Info / context             = b"RFID-A\x00"        (7 bytes, incl. null)
+#   Output length              = sector_count × 6 bytes (96 bytes for 16 sectors)
+#
+# pycryptodome HKDF signature:
+#   HKDF(master, key_len, salt, hashmod, num_keys=1, context=b"")
+#   where 'master' is the IKM (first positional argument).
+#
+#   Correct call: HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, SHA256, 16, context=...)
+#                           ↑ IKM              ↑ salt
+#
+# Hardware requirements:
+#   Authenticated MIFARE Classic reads require hardware that supports the
+#   ISO/IEC 14443 Type A 3-pass authentication protocol (e.g. MFRC522,
+#   PN532, ACR122U).  Cheap "pass-through" USB readers typically do NOT
+#   support per-sector key authentication and will fail silently.
+# ---------------------------------------------------------------------------
+
 _BAMBU_MASTER_KEY = bytes([
     0x9a, 0x75, 0x9c, 0xf2, 0xc4, 0xf7, 0xca, 0xff,
     0x22, 0x2c, 0xb9, 0x76, 0x9b, 0x41, 0xbc, 0x96,
@@ -463,20 +539,101 @@ _BAMBU_MASTER_KEY = bytes([
 
 
 def _bambu_derive_keys(uid_bytes: bytes) -> list:
-    """Derive the 16 MIFARE sector A-keys for a Bambu Lab tag from its UID.
+    """Derive the 16 MIFARE sector Key-A values for a Bambu Lab tag.
 
-    Algorithm (from Bambu-Research-Group/RFID-Tag-Guide/deriveKeys.py):
-      raw = HKDF(uid_bytes, 6, master_key, SHA256, num_keys=16, context=b"RFID-A\\0")
-    Returns list of 16 × 6-byte keys (one per sector).
-    Raises ImportError if pycryptodome is not available.
+    Procedure adapted from MrBambuSpoolPal/MrBambuSpoolPal-BambuSpoolPal_AndroidApp
+    (GPLv3), NfcTagProcessor.kt lines 53–139, commit c8aa59e6d4c132f9e78bde24d791bbb330a12b7d.
+    No code was copied; reimplemented from the published algorithm.
+
+    Uses HKDF-SHA256 with the tag UID as the IKM and the static Bambu master
+    key as the salt.  Returns a list of 16 × 6-byte keys (one per MIFARE
+    Classic 1K sector, sectors 0-15).
+
+    Parameters
+    ----------
+    uid_bytes : bytes
+        Raw UID bytes read from the tag (typically 4 bytes for MIFARE Classic 1K).
+
+    Returns
+    -------
+    list of 16 bytes objects, each exactly 6 bytes long.
+
+    Raises
+    ------
+    ImportError
+        If pycryptodome is not installed.  Install with: pip3 install pycryptodome
+
+    Notes
+    -----
+    The Android reference (BouncyCastle HKDFParameters) uses:
+      HKDFParameters(uid, masterKey, context)
+      → IKM=uid, salt=masterKey, info=context
+
+    pycryptodome's HKDF signature: HKDF(master, key_len, salt, hashmod, …)
+    where 'master' is the IKM (first argument).
+
+    Correct mapping:
+      HKDF(master=uid_bytes, key_len=6, salt=_BAMBU_MASTER_KEY, …)
+
+    WARNING: Do NOT swap uid_bytes and _BAMBU_MASTER_KEY.  The uid must be the
+    IKM (first argument) and _BAMBU_MASTER_KEY must be the salt (third argument),
+    matching the Android reference.  Swapping them produces completely wrong keys
+    and silent authentication failure on every sector.
     """
     if not _PYCRYPTODOME_OK:
         raise ImportError(
             "pycryptodome required for Bambu tag key derivation. "
             "Install with: pip3 install pycryptodome"
         )
+    # pycryptodome HKDF(master, key_len, salt, hashmod, num_keys, context):
+    #   master  = uid_bytes          (IKM — tag UID, per Android HKDFParameters)
+    #   key_len = 6                  (MIFARE Classic key width in bytes)
+    #   salt    = _BAMBU_MASTER_KEY  (static Bambu device secret, used as salt)
+    #   num_keys= 16                 (one key per sector; internally derives
+    #                                 96 bytes and splits into 16 × 6-byte keys)
+    #   context = b"RFID-A\x00"     (7-byte info/context string for Key A)
     raw = _HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, _SHA256, 16, context=b"RFID-A\x00")
-    return [raw[i * 6:(i + 1) * 6] for i in range(16)]
+    return list(raw)
+
+
+def _bambu_derive_keys_b(uid_bytes: bytes) -> list:
+    """Derive the 16 MIFARE sector Key-B values for a Bambu Lab tag.
+
+    Identical to ``_bambu_derive_keys()`` except the HKDF context is
+    ``b"RFID-B\\x00"`` instead of ``b"RFID-A\\x00"``.  Key B is used to
+    authenticate sectors before writing data blocks.
+
+    This convention is followed by community Bambu tag programming tools.
+    On factory-programmed Bambu spools Key B is typically all-zeros (unused);
+    on custom MIFARE Classic tags programmed with this toolchain the derived
+    Key B values are written into the sector trailers at programming time so
+    that subsequent writes always authenticate with the correct key.
+
+    Parameters
+    ----------
+    uid_bytes : bytes
+        Raw UID bytes from the tag (same bytes used for Key A derivation).
+        The UID must be in the byte order returned by the RFID reader —
+        do NOT reverse or hexify these bytes before passing them here.
+
+    Returns
+    -------
+    list of 16 bytes objects, each exactly 6 bytes long.
+
+    Raises
+    ------
+    ImportError
+        If pycryptodome is not installed.  Install with: pip3 install pycryptodome
+    """
+    if not _PYCRYPTODOME_OK:
+        raise ImportError(
+            "pycryptodome required for Bambu tag key derivation. "
+            "Install with: pip3 install pycryptodome"
+        )
+    # Same HKDF call as _bambu_derive_keys() but with context b"RFID-B\x00"
+    # (Key B context) instead of b"RFID-A\x00" (Key A context).
+    raw = _HKDF(uid_bytes, 6, _BAMBU_MASTER_KEY, _SHA256, 16, context=b"RFID-B\x00")
+    return list(raw)
 
 
 def _parse_bambu_blocks(blocks: dict) -> Optional[dict]:
@@ -484,76 +641,185 @@ def _parse_bambu_blocks(blocks: dict) -> Optional[dict]:
 
     blocks: dict mapping absolute block index → 16-byte data bytes,
             produced by read_authenticated_blocks() after key auth.
-    Returns filament info dict or None if essential blocks are missing.
+    Returns filament info dict or None if the essential material block is missing.
 
-    Block layout per BambuLabRfid.md:
-      Block 1  (sec 0, blk 1): Material type, ASCII null-padded
-      Block 2  (sec 0, blk 2): Spool serial, ASCII null-padded
-      Block 4  (sec 1, blk 0): RGBA color (4B), diameter×100 uint16 LE,
-                                weight g uint16 LE, spool-weight uint16 LE
-      Block 5  (sec 1, blk 1): min_temp, max_temp, bed_temp (int16 LE each)
-      Block 6  (sec 1, blk 2): Brand / vendor, ASCII null-padded
+    Block layout from Bambu-Research-Group/RFID-Tag-Guide/BambuLabRfid.md
+    (all multi-byte numbers are Little Endian):
+
+      Block 1  (sec 0, blk 1): Tray Info Index
+                                  bytes  0-7:  Material Variant ID (ASCII)
+                                  bytes  8-15: Material ID (ASCII, e.g. "GFA50")
+      Block 2  (sec 0, blk 2): Filament Type — basic type string (e.g. "PLA")
+      Block 4  (sec 1, blk 0): Detailed Filament Type (e.g. "PLA Basic")
+      Block 5  (sec 1, blk 1): Color / Weight / Diameter
+                                  bytes  0-3:  RGBA color
+                                  bytes  4-5:  Spool weight uint16 (grams)
+                                  bytes  8-11: Filament diameter float32 (mm)
+      Block 6  (sec 1, blk 2): Temperatures and Drying Info
+                                  bytes  0-1:  Drying temperature uint16 (°C)
+                                  bytes  2-3:  Drying time uint16 (hours)
+                                  bytes  4-5:  Bed temperature type uint16
+                                  bytes  6-7:  Bed temperature uint16 (°C)
+                                  bytes  8-9:  Max hotend temperature uint16 (°C)
+                                  bytes 10-11: Min hotend temperature uint16 (°C)
+      Block 9  (sec 2, blk 1): Tray UID — 16-byte ASCII hex string
+      Block 12 (sec 3, blk 0): Production date — ASCII "yyyy_MM_dd_HH_mm"
+      Block 14 (sec 3, blk 2): Filament length — uint16 at offset 4 (meters)
+      Block 16 (sec 4, blk 0): Extra color info
+                                  bytes  0-1:  Format ID uint16 (0x0002 = color present)
+                                  bytes  2-3:  Color count uint16
+                                  bytes  4-7:  Second color ABGR (note: reversed order)
+
+    Blocks 3, 7, 11, 15, 19, … are MIFARE sector trailers (encryption keys)
+    and are never present in the authenticated block dict.
     """
-    def _ascii_block(blk_idx):
+    def _read_str(blk_idx, offset=0, length=16):
+        """Read a null-terminated ASCII string from a block."""
         b = blocks.get(blk_idx)
-        if not b:
+        if not b or len(b) < offset + length:
             return None
         try:
-            return b.rstrip(b"\x00").decode("ascii", errors="ignore").strip() or None
+            return b[offset:offset + length].rstrip(b"\x00").decode("ascii", errors="ignore").strip() or None
         except Exception:
             return None
 
-    material = _ascii_block(1)
+    def _read_u16(blk_idx, offset):
+        """Read a uint16 LE from a block at the given byte offset."""
+        b = blocks.get(blk_idx)
+        if not b or len(b) < offset + 2:
+            return None
+        return struct.unpack_from("<H", b, offset)[0]
+
+    def _read_f32(blk_idx, offset):
+        """Read a float32 LE from a block at the given byte offset."""
+        b = blocks.get(blk_idx)
+        if not b or len(b) < offset + 4:
+            return None
+        return struct.unpack_from("<f", b, offset)[0]
+
+    # --- Block 2: basic filament type (required) ---
+    material = _read_str(2)
     if not material:
         return None
 
-    spool_serial = _ascii_block(2)
-    brand = _ascii_block(6)
+    # --- Block 1: tray info index ---
+    # bytes 0-7 = material variant ID, bytes 8-15 = material ID
+    material_variant_id = _read_str(1, offset=0, length=8)
+    material_id = _read_str(1, offset=8, length=8)
 
+    # --- Block 4: detailed filament type ---
+    material_detail = _read_str(4)
+
+    # --- Block 5: RGBA color, spool weight, filament diameter ---
     color_hex = None
     color_rgba = None
-    diameter_mm = None
     weight_g = None
-    if 4 in blocks and len(blocks[4]) >= 8:
-        b4 = blocks[4]
-        color_rgba = (b4[0], b4[1], b4[2], b4[3])
-        # Use 6-digit RGB for color_hex; keep alpha only in color_rgba
-        color_hex = "%02X%02X%02X" % color_rgba[:3]
-        raw_diam = struct.unpack_from("<H", b4, 4)[0]
-        if raw_diam > 0:
-            diameter_mm = round(raw_diam / 100.0, 2)
-        raw_weight = struct.unpack_from("<H", b4, 6)[0]
-        if raw_weight > 0:
-            weight_g = float(raw_weight)
+    diameter_mm = None
+    b5 = blocks.get(5)
+    if b5 and len(b5) >= 12:
+        r, g, b_val, a = b5[0], b5[1], b5[2], b5[3]
+        color_rgba = (r, g, b_val, a)
+        color_hex = "%02X%02X%02X" % (r, g, b_val)  # 6-digit RGB; alpha kept in color_rgba
 
-    min_temp = None
-    max_temp = None
+        raw_weight = _read_u16(5, 4)
+        if raw_weight and raw_weight > 0:
+            weight_g = int(raw_weight)
+
+        raw_diam = _read_f32(5, 8)
+        if raw_diam and 0.5 < raw_diam < 5.0:  # sanity: 0.5–5 mm
+            diameter_mm = round(float(raw_diam), 2)
+
+    # --- Block 6: temperatures and drying info ---
+    drying_temp = None
+    drying_time_h = None
     bed_temp = None
-    if 5 in blocks and len(blocks[5]) >= 6:
-        b5 = blocks[5]
-        v_min, v_max, v_bed = struct.unpack_from("<hhh", b5, 0)
-        if 0 < v_min < 500:
-            min_temp = int(v_min)
-        if 0 < v_max < 500:
-            max_temp = int(v_max)
-        if 0 < v_bed < 200:
-            bed_temp = int(v_bed)
+    max_temp = None
+    min_temp = None
+    b6 = blocks.get(6)
+    if b6 and len(b6) >= 12:
+        v_dry_temp = _read_u16(6, 0)
+        v_dry_time = _read_u16(6, 2)
+        # offset 4-5: bed temp type (ignored — types not publicly documented)
+        v_bed_temp = _read_u16(6, 6)
+        v_max_temp = _read_u16(6, 8)
+        v_min_temp = _read_u16(6, 10)
 
-    return {
+        if v_dry_temp and 0 < v_dry_temp < 200:
+            drying_temp = int(v_dry_temp)
+        if v_dry_time and 0 < v_dry_time < 100:
+            drying_time_h = int(v_dry_time)
+        if v_bed_temp and 0 < v_bed_temp < 200:
+            bed_temp = int(v_bed_temp)
+        if v_max_temp and 0 < v_max_temp < 500:
+            max_temp = int(v_max_temp)
+        if v_min_temp and 0 < v_min_temp < 500:
+            min_temp = int(v_min_temp)
+
+    # --- Block 9: tray UID (16 raw bytes → 32-char uppercase hex string) ---
+    # The tag stores the Tray UID as 16 raw binary bytes (not ASCII text).
+    # When displayed it is shown as the 32-character hex representation.
+    # An all-zero block means the UID slot has not been written; treat it
+    # as absent so callers don't see a false "0000…" tray UID.
+    tray_uid = None
+    b9 = blocks.get(9)
+    if b9 and len(b9) >= 16:
+        uid_bytes = b9[:16]
+        if any(byte != 0 for byte in uid_bytes):
+            tray_uid = uid_bytes.hex().upper()
+
+    # --- Block 12: production date "yyyy_MM_dd_HH_mm" ---
+    production_date = _read_str(12)
+
+    # --- Block 14: filament length in meters (uint16 at offset 4) ---
+    filament_length_m = None
+    v_len = _read_u16(14, 4)
+    if v_len and v_len > 0:
+        filament_length_m = int(v_len)
+
+    # --- Block 16: extra color info (second color for multi-colour filaments) ---
+    # Format ID 0x0002 signals that extra color data is present.
+    # Second color is stored as ABGR (reversed), so we swap to RGBA for consistency.
+    second_color_hex = None
+    b16 = blocks.get(16)
+    if b16 and len(b16) >= 8:
+        fmt_id = struct.unpack_from("<H", b16, 0)[0]
+        if fmt_id == 0x0002:
+            # bytes 4-7: ABGR — index 0=A, 1=B, 2=G, 3=R
+            a2, b2, g2, r2 = b16[4], b16[5], b16[6], b16[7]
+            second_color_hex = "%02X%02X%02X" % (r2, g2, b2)
+
+    info: dict = {
         "material": material,
-        "brand": brand or "Bambu Lab",
+        "brand": "Bambu Lab",
         "color_hex": color_hex,
         "color_rgba": color_rgba,
-        "diameter_mm": diameter_mm or 1.75,
+        "diameter_mm": diameter_mm if diameter_mm is not None else 1.75,
         "weight_g": weight_g,
         "min_temp": min_temp,
         "max_temp": max_temp,
         "bed_temp": bed_temp,
-        "spool_serial": spool_serial,
+        "drying_temp": drying_temp,
+        "drying_time_h": drying_time_h,
         "spoolman_id": None,
         "writable": False,
         "tag_format": "bambu",
     }
+    # Optional fields — only include when present so callers can check ``if key in info``
+    if material_detail:
+        info["material_detail"] = material_detail
+    if material_id:
+        info["material_id"] = material_id
+    if material_variant_id:
+        info["material_variant_id"] = material_variant_id
+    if tray_uid:
+        info["tray_uid"] = tray_uid
+    if production_date:
+        info["production_date"] = production_date
+    if filament_length_m is not None:
+        info["filament_length_m"] = filament_length_m
+    if second_color_hex:
+        info["second_color_hex"] = second_color_hex
+    return info
 
 
 _ANYCUBIC_MAGIC = b"\x7B\x00"
@@ -1199,6 +1465,8 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
         return None
 
     # --- Raw bytes path ---
+    # Each format is tried exactly once in priority order; the first successful
+    # parse is returned immediately.  No format is re-attempted or double-decoded.
     if not raw:
         return None
 
@@ -1263,12 +1531,23 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
         return result
 
     # 6 — Bambu Lab (encrypted raw dump — only detectable, cannot decrypt without auth)
+    # Return a clear error dict instead of None so callers can surface a helpful
+    # message.  Full decryption requires an authenticated MIFARE Classic read with
+    # HKDF-derived Key A keys; a raw byte dump cannot be decrypted here.
+    # Use is_parse_error() to distinguish this from a successful parse.
     if _detect_bambu(raw):
         _log.debug(
             "rfid: Bambu Lab tag detected in raw dump%s — "
             "use authenticated read for full data", uid_info
         )
-        return None
+        return {
+            "error": (
+                "Detected Bambu Lab tag but decryption/authentication not available; "
+                "see README for hardware requirements"
+            ),
+            "tag_format": "bambu",
+            "brand": "Bambu Lab",
+        }
 
     # 7 — Fallback: try raw bytes as UTF-8 text for JSON / URL formats
     try:
@@ -1296,4 +1575,140 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
 def is_bambu_tag(info: Optional[dict]) -> bool:
     """Return True if the parsed info dict originated from a Bambu Lab tag."""
     return isinstance(info, dict) and info.get("tag_format") == "bambu"
+
+
+def format_bambu_info(info: dict, uid_hex: Optional[str] = None) -> str:
+    """Format a parsed Bambu Lab filament info dict into a human-readable summary.
+
+    Produces a labeled, multi-line string showing all available spool fields —
+    matching the data visible in the Bambu Lab Android app and public tag decoders
+    (e.g. queengooborg/Bambu-Lab-RFID-Tag-Guide, BambuSpoolPal).
+
+    Parameters
+    ----------
+    info:
+        Dict returned by ``parse_tag()`` for a Bambu Lab tag.
+    uid_hex:
+        Optional hardware UID hex string (4-byte MIFARE UID, e.g. ``"62F0E76B"``).
+        Shown as "Tag UID" in the summary to distinguish it from the Tray UID
+        stored inside the tag's block 9.
+
+    Returns
+    -------
+    Multi-line string suitable for passing to ``logging.info()``.
+
+    Example output
+    --------------
+    === Bambu Lab RFID Tag ===
+      Tag UID (hardware) : 62F0E76B
+      Tray UID           : 5F390A603AAB4B8FB1524EA53B16FA77
+      Filament Type      : PLA Basic
+      Material           : PLA
+      Material ID        : GFA50
+      Color              : #FF3700
+      Diameter           : 1.75 mm
+      Weight             : 1000 g
+      Filament Length    : 330 m
+      Production Date    : 2024_03_15_10_30
+      Drying             : 55 °C x 8 h
+      Bed Temperature    : 60 °C
+      Hotend Range       : 190-220 °C
+    """
+    lines = ["=== Bambu Lab RFID Tag ==="]
+
+    # Hardware UID (anti-collision UID from the MFRC522; 4 bytes for MIFARE Classic 1K)
+    if uid_hex:
+        lines.append(f"  Tag UID (hardware) : {uid_hex}")
+
+    # Tray UID — 16-byte ASCII hex string stored in block 9 of the tag.
+    # This is the "UID" shown by Bambu apps and tag decoders; it is NOT the
+    # same as the MIFARE anti-collision UID above.
+    tray_uid = info.get("tray_uid")
+    if tray_uid:
+        # Ensure tray_uid is shown as a hex string even if bytes slipped through.
+        if isinstance(tray_uid, (bytes, bytearray)):
+            tray_uid = tray_uid.hex().upper()
+        lines.append(f"  Tray UID           : {tray_uid}")
+
+    # Detailed filament type (e.g. "PLA Basic") comes from block 4.
+    # Basic material name (e.g. "PLA") comes from block 2.
+    material_detail = info.get("material_detail")
+    material = info.get("material")
+    if material_detail:
+        lines.append(f"  Filament Type      : {material_detail}")
+    if material:
+        lines.append(f"  Material           : {material}")
+
+    # Material IDs from the tray info index block (block 1).
+    # material_id is the SKU-style code (e.g. "GFA50").
+    # material_variant_id is the variant byte prefix (e.g. "GFL99").
+    material_id = info.get("material_id")
+    if material_id:
+        lines.append(f"  Material ID        : {material_id}")
+    material_variant_id = info.get("material_variant_id")
+    if material_variant_id:
+        lines.append(f"  Variant ID         : {material_variant_id}")
+
+    # Color as 6-digit HTML hex (no '#') from block 5 bytes 0-3 (RGBA).
+    color_hex = info.get("color_hex")
+    if color_hex:
+        lines.append(f"  Color              : #{color_hex}")
+    # Second color for multi-colour filaments (block 16, ABGR → RGBA).
+    second_color = info.get("second_color_hex")
+    if second_color:
+        lines.append(f"  Second Color       : #{second_color}")
+
+    # Physical spool dimensions from block 5.
+    diameter_mm = info.get("diameter_mm")
+    if diameter_mm is not None:
+        lines.append(f"  Diameter           : {diameter_mm:.2f} mm")
+    weight_g = info.get("weight_g")
+    if weight_g is not None:
+        lines.append(f"  Weight             : {weight_g} g")
+
+    # Filament length in metres from block 14 offset 4.
+    filament_length_m = info.get("filament_length_m")
+    if filament_length_m is not None:
+        lines.append(f"  Filament Length    : {filament_length_m} m")
+
+    # Production date as ASCII "yyyy_MM_dd_HH_mm" from block 12.
+    production_date = info.get("production_date")
+    if production_date:
+        lines.append(f"  Production Date    : {production_date}")
+
+    # Drying recommendation from block 6 bytes 0-3.
+    drying_temp = info.get("drying_temp")
+    drying_time_h = info.get("drying_time_h")
+    if drying_temp is not None and drying_time_h is not None:
+        lines.append(f"  Drying             : {drying_temp} \u00b0C x {drying_time_h} h")
+    elif drying_temp is not None:
+        lines.append(f"  Drying Temp        : {drying_temp} \u00b0C")
+
+    # Bed temperature from block 6 bytes 6-7.
+    bed_temp = info.get("bed_temp")
+    if bed_temp is not None:
+        lines.append(f"  Bed Temperature    : {bed_temp} \u00b0C")
+
+    # Hotend temperature range from block 6 bytes 8-11.
+    min_temp = info.get("min_temp")
+    max_temp = info.get("max_temp")
+    if min_temp is not None and max_temp is not None:
+        lines.append(f"  Hotend Range       : {min_temp}-{max_temp} \u00b0C")
+    elif max_temp is not None:
+        lines.append(f"  Hotend Max         : {max_temp} \u00b0C")
+    elif min_temp is not None:
+        lines.append(f"  Hotend Min         : {min_temp} \u00b0C")
+
+    return "\n".join(lines)
+
+
+def is_parse_error(info: Optional[dict]) -> bool:
+    """Return True if the info dict represents a detection-only result or parse error.
+
+    parse_tag() returns a dict with an ``"error"`` key when a tag is detected
+    but cannot be fully decoded (e.g. a Bambu Lab raw byte dump without hardware
+    authentication support).  Use this helper to distinguish such partial results
+    from a successful parse that contains actionable filament data.
+    """
+    return isinstance(info, dict) and bool(info.get("error"))
 

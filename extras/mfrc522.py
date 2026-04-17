@@ -628,6 +628,94 @@ class MFRC522Device:
 
     # ---------- MIFARE Classic authenticated reads ----------
 
+    def _halt_and_reselect(self, expected_uid: Optional[bytes] = None) -> bool:
+        """Halt the active tag then re-SELECT it so that a fresh sector authentication
+        can be issued.
+
+        The MFRC522 Crypto1 state machine requires this sequence between consecutive
+        sector authentications.  Once ``PCD_AUTHENT`` succeeds and ``MFCrypto1On``
+        (Status2Reg bit 3) is set, the cipher remains active for the authenticated
+        sector.  Attempting to authenticate a *different* sector without first
+        leaving and re-entering the ACTIVE state causes the MFRC522 to reject all
+        subsequent ``PCD_AUTHENT`` commands — hence only sector 0 ever succeeds in
+        a naive loop.
+
+        Android's ``MifareClassic.authenticateSectorWithKeyA/B()`` API transparently
+        issues a HALT (deselect) and re-SELECT between sectors, which is why the
+        Android app can read all sectors without this explicit step.  Most bare-metal
+        MFRC522 Python drivers do not replicate this behaviour.
+
+        Fix sequence (per MFRC522 datasheet §8.1.3 and ISO 14443-3A §6.3.5):
+          1. Clear ``Status2Reg[MFCrypto1On]`` explicitly.
+          2. Send ISO 14443-3A HALT (0x50 0x00 + CRC) — tag enters HALT state.
+          3. Wait ≥ 5 ms for the tag to process the command.
+          4. Send WUPA (0x52) — REQA is ignored by halted tags; WUPA wakes them.
+          5. Run anticollision + SELECT to return the tag to ACTIVE state.
+          6. Wait ≥ 5 ms after re-select before issuing AUTH.
+
+        Parameters
+        ----------
+        expected_uid : bytes or None
+            When provided, the re-selected tag UID must match (first
+            ``len(expected_uid)`` bytes).  A mismatch returns ``False`` so the
+            caller aborts rather than continuing authenticated reads/writes on a
+            different tag — a risk when multiple tags are in the RF field, since
+            WUPA wakes *all* halted tags simultaneously.
+
+        Returns True on success (tag re-selected, UID matches if checked).
+        Returns False if WUPA, re-select, or UID validation fails.
+        The caller should abort reading remaining sectors on False.
+        """
+        # Step 1: clear the Crypto1 cipher flag before halting.
+        self._clear_mask(self.Status2Reg, 0x08)
+
+        # Step 2: send HALT.
+        self.halt_tag()
+
+        # Step 3: 5 ms settling time after HALT.
+        _delay_s = 0.005
+        if self._reactor is None:
+            self._wait_time(_delay_s)
+        else:
+            _deadline = self._now() + _delay_s
+            while self._now() < _deadline:
+                pass
+
+        # Step 4: wake the halted tag with WUPA (REQA is ignored in HALT state).
+        st, _ = self.request(self.PICC_WUPA)
+        if st != self.MI_OK:
+            self._dbg("mfrc522.halt_and_reselect wupa_failed")
+            return False
+
+        # Step 5: re-run anticollision + SELECT to return tag to ACTIVE state.
+        reselect_uid = self._anticoll_and_select()
+        if reselect_uid is None:
+            self._dbg("mfrc522.halt_and_reselect select_failed")
+            return False
+
+        # Validate UID when requested to guard against silently switching to a
+        # different tag (WUPA wakes all halted tags in the RF field).
+        if expected_uid is not None:
+            got_uid = bytes(reselect_uid[:len(expected_uid)])
+            if got_uid != bytes(expected_uid):
+                self._dbg(
+                    "mfrc522.halt_and_reselect uid_mismatch expected=%s got=%s" % (
+                        bytes(expected_uid).hex(), got_uid.hex())
+                )
+                return False
+
+        # Step 6: 5 ms settling time after SELECT before AUTH.
+        if self._reactor is None:
+            self._wait_time(_delay_s)
+        else:
+            _deadline = self._now() + _delay_s
+            while self._now() < _deadline:
+                pass
+
+        self._dbg("mfrc522.halt_and_reselect ok uid=%s" % (
+            "".join("%02X" % b for b in reselect_uid)))
+        return True
+
     def _auth_mifare_block(self, cmd: int, block_addr: int, key: bytes, uid: bytes) -> bool:
         """Authenticate a MIFARE Classic sector using the PCD_AUTHENT command.
 
@@ -690,6 +778,15 @@ class MFRC522Device:
         The tag must have already been selected (anticollision + select completed)
         and the antenna must be enabled when this method is called.
 
+        Between consecutive sectors this method issues a HALT → WUPA → re-SELECT
+        sequence (via :meth:`_halt_and_reselect`) before each new sector
+        authentication.  This is required by the MFRC522 Crypto1 state machine:
+        once ``PCD_AUTHENT`` succeeds the cipher stays active for the current
+        sector.  Without HALT + re-SELECT every subsequent sector authentication
+        fails — matching the user-observed symptom of "only sector 0 succeeds".
+        Android's ``MifareClassic`` API handles this transparently; bare-metal
+        MFRC522 drivers must replicate it explicitly.
+
         Parameters
         ----------
         uid       : Tag UID bytes (from anticollision).
@@ -706,12 +803,29 @@ class MFRC522Device:
         auth_cmd = self.PICC_AUTHENT1B if use_key_b else self.PICC_AUTHENT1A
         result: dict = {}
         for sector in range(num_sectors):
+            # Between consecutive sectors: HALT the tag and re-SELECT it so that
+            # the MFRC522 Crypto1 cipher is fully reset before the next AUTH
+            # command.  See _halt_and_reselect() docstring for full rationale.
+            if sector > 0:
+                if not self._halt_and_reselect(expected_uid=bytes(uid[:4])):
+                    self._dbg(
+                        "mfrc522.read_auth_blocks sector=%d halt_reselect_failed — "
+                        "aborting remaining sectors" % sector
+                    )
+                    for s in range(sector, num_sectors):
+                        for b in range(3):
+                            result[s * 4 + b] = None
+                    return result
+
             key = key_list[sector] if sector < len(key_list) else bytes(6)
             # Trailer block = sector * 4 + 3
             trailer_block = sector * 4 + 3
+            self._dbg("mfrc522.read_auth_blocks sector=%d trailer=%d key=%s" % (
+                sector, trailer_block, key.hex()))
             if not self._auth_mifare_block(auth_cmd, trailer_block, key, uid):
-                self._dbg("mfrc522.read_auth_blocks sector=%d auth_failed" % sector)
-                # Clear crypto state before next sector
+                self._dbg("mfrc522.read_auth_blocks sector=%d auth_failed trailer=%d" % (
+                    sector, trailer_block))
+                # Clear crypto state; halt/reselect will be issued for next sector.
                 self._clear_mask(self.Status2Reg, 0x08)
                 # Pre-fill None for the three data blocks so callers get a consistent index map
                 for blk_in_sector in range(3):
@@ -720,29 +834,50 @@ class MFRC522Device:
             for blk_in_sector in range(3):  # 3 data blocks per sector
                 abs_block = sector * 4 + blk_in_sector
                 data = self._read_mifare_block(abs_block)
+                if data is None:
+                    self._dbg("mfrc522.read_auth_blocks sector=%d block=%d read_failed" % (
+                        sector, abs_block))
                 result[abs_block] = data
-            # Clear MFCrypto1On before authenticating next sector
+            # Clear MFCrypto1On; halt/reselect for the next sector is issued at
+            # the top of the next loop iteration.
             self._clear_mask(self.Status2Reg, 0x08)
         return result
 
-    def read_mifare_classic_tag(self, key_list: list, num_sectors: int = 16) -> Optional[dict]:
+    def read_mifare_classic_tag(
+        self,
+        key_list: list,
+        num_sectors: int = 16,
+        use_key_b: bool = False,
+    ) -> Optional[dict]:
         """Full MIFARE Classic 1K read: REQA → anticoll → select → auth+read all sectors.
 
         Returns a dict suitable for rfid_tag_parser.parse_tag():
           {"uid_bytes": bytes, "uid_hex": str, "blocks": {abs_block: bytes}}
         Returns None if no tag is present.
+
+        Uses REQA first (finds IDLE tags); falls back to WUPA so that tags left
+        in HALT state by a preceding read_all_tags() call can still be reached.
+
+        use_key_b: When True, authenticate with Key B (PICC_AUTHENT1B) instead of
+                   Key A (PICC_AUTHENT1A).  Pass through to read_authenticated_blocks.
         """
         self.initialize()
         with self.antenna_enabled():
             st, _ = self.request(self.PICC_REQA)
+            if st != self.MI_OK:
+                # REQA only wakes IDLE tags; WUPA also wakes HALT-state tags.
+                self._dbg("mfrc522.read_mifare_classic reqa_miss — trying wupa")
+                st, _ = self.request(self.PICC_WUPA)
             if st != self.MI_OK:
                 return None
             uid = self._anticoll_and_select()
             if uid is None:
                 return None
             uid_hex = "".join("%02X" % b for b in uid)
-            self._dbg("mfrc522.read_mifare_classic uid=%s sectors=%d" % (uid_hex, num_sectors))
-            blocks = self.read_authenticated_blocks(uid, key_list, num_sectors=num_sectors)
+            self._dbg("mfrc522.read_mifare_classic uid=%s sectors=%d key_b=%s" % (
+                uid_hex, num_sectors, use_key_b))
+            blocks = self.read_authenticated_blocks(
+                uid, key_list, num_sectors=num_sectors, use_key_b=use_key_b)
             self.halt_tag()
         return {
             "uid_bytes": bytes(uid),
@@ -1032,7 +1167,11 @@ class MFRC522Device:
         REQA.  Set to True when fast_mode=False (safe/two-read mode) so the
         second confirmation tick can find the same tag again.
 
-        Returns a list of tag-info dicts (same schema as read_tag_info()).
+        Returns a list of tag-info dicts.  Each dict contains:
+          uid, uid_hex, raw_bytes, raw_len, spoolman_id, tag_text, sak.
+        MIFARE Classic tags (sak & 0x08) are returned as UID-only entries
+        (raw_bytes=None, raw_len=0) so the caller can apply an authenticated
+        read (e.g. Bambu HKDF) without re-selecting the tag.
         Returns [] if no tags are found.
         """
         self.initialize()
@@ -1076,12 +1215,13 @@ class MFRC522Device:
 
                 # --- retry anticollision/select up to 3 times ---
                 uid = None
+                sak = 0
                 for attempt in range(3):
-                    uid = self._anticoll_and_select()
+                    uid, sak = self._anticoll_and_select_with_sak()
                     self._dbg(
-                        lambda _p=pass_num, _a=attempt, _u=uid: (
-                            "mfrc522.read_all_tags pass=%d attempt=%d uid=%s"
-                            % (_p, _a, "".join("%02X" % b for b in _u) if _u else "None")
+                        lambda _p=pass_num, _a=attempt, _u=uid, _s=sak: (
+                            "mfrc522.read_all_tags pass=%d attempt=%d uid=%s sak=0x%02X"
+                            % (_p, _a, "".join("%02X" % b for b in _u) if _u else "None", _s)
                         )
                     )
                     if uid is not None:
@@ -1131,6 +1271,35 @@ class MFRC522Device:
                         "raw_len": 0,
                         "spoolman_id": None,
                         "tag_text": "",
+                        "sak": sak,
+                    })
+                    continue
+
+                # --- MIFARE Classic detection (SAK bit 3 set) ---
+                # SAK 0x08 = MIFARE Classic 1K, SAK 0x18 = MIFARE Classic 4K.
+                # These tags require sector authentication before any data read.
+                # The Type-2 READ command (0x30) used by read_4pages() will return
+                # only a 4-bit NAK from a Classic tag, producing the symptom:
+                #   "back_bits=4 len=1" with status=MI_OK.
+                # Return a UID-only entry so the caller (_scan_once in rfid.py)
+                # can attempt the correct authenticated-read path (e.g. Bambu HKDF).
+                if sak & 0x08:
+                    self._dbg(
+                        "mfrc522.read_all_tags uid=%s sak=0x%02X MIFARE Classic detected"
+                        " — skipping Type2 page reads; caller should use authenticated read",
+                        uid_hex, sak,
+                    )
+                    self.halt_tag()
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    self._write_reg(self.BitFramingReg, 0x00)
+                    tags.append({
+                        "uid": uid,
+                        "uid_hex": uid_hex,
+                        "raw_bytes": None,
+                        "raw_len": 0,
+                        "spoolman_id": None,
+                        "tag_text": "",
+                        "sak": sak,
                     })
                     continue
 
@@ -1186,6 +1355,7 @@ class MFRC522Device:
                     "raw_len": len(raw) if raw else 0,
                     "spoolman_id": spoolman_id,
                     "tag_text": text or "",
+                    "sak": sak,
                 })
                 self._dbg(
                     "mfrc522.read_all_tags tag_appended uid=%s raw_len=%d spoolman_id=%s",
@@ -1391,12 +1561,174 @@ class MFRC522Device:
         self._dbg("mfrc522._write_mifare_block block=%d ok=%s" % (block_addr, ok))
         return ok
 
+    def write_mifare_classic_authenticated_blocks(
+        self,
+        uid: bytes,
+        key_list: list,
+        block_data: dict,
+        use_key_b: bool = True,
+    ) -> bool:
+        """Write specific data blocks to a MIFARE Classic tag after per-sector authentication.
+
+        The tag must already be selected (anticollision + select completed) when this
+        method is called.  Call :meth:`write_authenticated_bambu_blocks` for a fully
+        self-contained version that handles REQA, anticollision, select, and halt.
+
+        Parameters
+        ----------
+        uid : bytes
+            Tag UID bytes (from anticollision; only first 4 bytes are used).
+        key_list : list
+            16 × 6-byte sector keys.  For write operations pass Key B keys
+            (derived with ``rfid_tag_parser._bambu_derive_keys_b()`` or the
+            HKDF default-key list for blank tags).
+        block_data : dict
+            Mapping of absolute block index → 16-byte ``bytes`` to write.
+            Block 0 (manufacturer block) and sector trailer blocks (3, 7, 11, …)
+            are silently skipped — they cannot be written with this method.
+        use_key_b : bool
+            When ``True`` (default), authenticate each sector with Key B
+            (``PICC_AUTHENT1B``).  Set ``False`` to use Key A instead.
+
+        Returns
+        -------
+        bool
+            ``True`` if every requested block was written successfully.
+            ``False`` on any authentication or write failure (the method stops
+            at the first failure).
+        """
+        auth_cmd = self.PICC_AUTHENT1B if use_key_b else self.PICC_AUTHENT1A
+        uid_bytes = bytes(uid[:4])
+
+        # Group block addresses by sector so we only authenticate each sector once.
+        sectors_needed: dict = {}
+        for block_addr in block_data:
+            # Skip block 0 (manufacturer / UID block — permanently locked).
+            if block_addr == 0:
+                self._dbg(
+                    "mfrc522.write_auth_blocks: skipping block 0 (manufacturer block)"
+                )
+                continue
+            sector = block_addr // 4
+            # Skip sector trailer blocks (block 3 of each sector).
+            if block_addr == sector * 4 + 3:
+                self._dbg(
+                    "mfrc522.write_auth_blocks: skipping trailer block=%d" % block_addr
+                )
+                continue
+            sectors_needed.setdefault(sector, []).append(block_addr)
+
+        prev_sector = None
+        for sector, blocks in sorted(sectors_needed.items()):
+            # Between consecutive sectors: HALT + re-SELECT to reset Crypto1 state.
+            # See _halt_and_reselect() for full rationale.
+            if prev_sector is not None:
+                if not self._halt_and_reselect(expected_uid=uid_bytes):
+                    self._dbg(
+                        "mfrc522.write_auth_blocks sector=%d halt_reselect_failed" % sector
+                    )
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    return False
+            prev_sector = sector
+
+            key = key_list[sector] if sector < len(key_list) else bytes(6)
+            trailer_block = sector * 4 + 3
+            self._dbg(
+                "mfrc522.write_auth_blocks sector=%d trailer=%d key_b=%s key=%s"
+                % (sector, trailer_block, use_key_b, bytes(key).hex())
+            )
+            if not self._auth_mifare_block(auth_cmd, trailer_block, key, uid_bytes):
+                self._dbg(
+                    "mfrc522.write_auth_blocks: auth failed sector=%d" % sector
+                )
+                self._clear_mask(self.Status2Reg, 0x08)
+                return False
+            for block_addr in sorted(blocks):
+                data = block_data[block_addr]
+                if not self._write_mifare_block(block_addr, bytes(data)):
+                    self._dbg(
+                        "mfrc522.write_auth_blocks: write failed block=%d" % block_addr
+                    )
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    return False
+            # Clear MFCrypto1On; halt/reselect is issued at the top of the next iteration.
+            self._clear_mask(self.Status2Reg, 0x08)
+
+        return True
+
+    def write_authenticated_bambu_blocks(
+        self,
+        key_list: list,
+        block_data: dict,
+        use_key_b: bool = True,
+    ) -> Optional[dict]:
+        """Write specific MIFARE Classic blocks using per-sector authenticated keys.
+
+        Fully self-contained write cycle:
+          REQA (→ WUPA on miss) → anticollision → select → authenticate each
+          needed sector → write blocks → halt.
+
+        Intended for Bambu-compatible MIFARE Classic tags.  Pass Key B keys
+        (from ``rfid_tag_parser._bambu_derive_keys_b()``) with the default
+        ``use_key_b=True`` to write with Key B authentication.
+
+        This method is separate from the scan/read path and is only called
+        when an explicit write command (``RFID_WRITE`` / ``RFID_BAMBU_WRITE``)
+        is issued.
+
+        Parameters
+        ----------
+        key_list : list
+            16 × 6-byte sector keys for the tag.
+        block_data : dict
+            Mapping of absolute block index → 16-byte ``bytes`` to write.
+        use_key_b : bool
+            ``True`` (default) to authenticate with Key B; ``False`` for Key A.
+
+        Returns
+        -------
+        dict or None
+            ``{"uid_bytes": bytes, "uid_hex": str}`` on success, ``None`` on failure
+            (no tag present, authentication failure, or write error).
+        """
+        self.initialize()
+        with self.antenna_enabled():
+            self._rf_reset()
+            st, _ = self.request(self.PICC_REQA)
+            if st != self.MI_OK:
+                # WUPA wakes halted tags left over from a preceding read cycle.
+                self._dbg(
+                    "mfrc522.write_auth_bambu_blocks reqa_miss — trying wupa"
+                )
+                st, _ = self.request(self.PICC_WUPA)
+            if st != self.MI_OK:
+                return None
+            uid = self._anticoll_and_select()
+            if uid is None:
+                return None
+            uid_bytes = bytes(uid)
+            uid_hex = "".join("%02X" % b for b in uid)
+            self._dbg(
+                "mfrc522.write_auth_bambu_blocks uid=%s key_b=%s blocks=%s"
+                % (uid_hex, use_key_b, sorted(block_data.keys()))
+            )
+            ok = self.write_mifare_classic_authenticated_blocks(
+                uid_bytes, key_list, block_data, use_key_b=use_key_b
+            )
+            self.halt_tag()
+        if ok:
+            return {"uid_bytes": uid_bytes, "uid_hex": uid_hex}
+        return None
+
     def _write_mifare_classic_json(self, uid: list, text: str) -> bool:
         """Write JSON *text* to MIFARE Classic data blocks using the default key A (0xFF×6).
 
         Writes starting at sector 1 (absolute block 4), using 3 data blocks per sector
         (48 bytes).  Sector trailer blocks are skipped.  Each sector is authenticated
         individually before its data blocks are written.
+
+        Between consecutive sectors a HALT + re-SELECT sequence is performed to
+        reset the MFRC522 Crypto1 state.  See :meth:`_halt_and_reselect`.
 
         Returns True on full success, False on any auth or write failure.
         """
@@ -1408,7 +1740,19 @@ class MFRC522Device:
 
         offset = 0
         sector = 1  # sector 0 holds manufacturer data; start at sector 1
+        first_sector = True
         while offset < padded_len:
+            # Between consecutive sectors: HALT + re-SELECT to reset Crypto1 state.
+            if not first_sector:
+                if not self._halt_and_reselect(expected_uid=uid_bytes):
+                    self._dbg(
+                        "mfrc522._write_mifare_classic_json halt_reselect_failed sector=%d"
+                        % sector
+                    )
+                    self._clear_mask(self.Status2Reg, 0x08)
+                    return False
+            first_sector = False
+
             trailer = sector * 4 + 3
             if not self._auth_mifare_block(0x60, trailer, default_key, uid_bytes):
                 self._dbg("mfrc522._write_mifare_classic_json auth failed sector=%d" % sector)
@@ -1426,6 +1770,7 @@ class MFRC522Device:
                     self._clear_mask(self.Status2Reg, 0x08)
                     return False
                 offset += 16
+            # Clear MFCrypto1On; halt/reselect is issued at the top of the next iteration.
             self._clear_mask(self.Status2Reg, 0x08)
             sector += 1
 
