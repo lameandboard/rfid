@@ -470,6 +470,11 @@ class SpoolmanClient:
         JSON-encoded values with a fallback to the raw string.
 
         Returns ``None`` if not found.
+
+        Raises ``RuntimeError`` when any HTTP/network failure makes the result
+        inconclusive (slot query error, secondary verification fetch error, or
+        fallback scan error).  Callers must treat this as "unknown — do not
+        auto-create" to avoid duplicate spool creation on transient failures.
         """
         # Short-circuit: if rfid_uid_N fields don't exist yet, no spool can have
         # this UID — create them now and skip the search entirely.
@@ -553,11 +558,12 @@ class SpoolmanClient:
                     try:
                         slots = self.get_uid_slots(candidate_id, max_uids)
                     except Exception as verify_exc:
-                        LOG.debug(
+                        LOG.warning(
                             "find_spool_by_uid: secondary fetch for spool %d"
-                            " failed: %s", candidate_id, verify_exc,
+                            " failed: %s — lookup is inconclusive",
+                            candidate_id, verify_exc,
                         )
-                        continue
+                        raise
                     if slots and uid_hex in slots.values():
                         LOG.debug(
                             "find_spool_by_uid: uid=%s confirmed in spool %d"
@@ -573,13 +579,18 @@ class SpoolmanClient:
                     )
                     _rejected_ids.add(candidate_id)
             except Exception as exc:
-                LOG.debug(
-                    "find_spool_by_uid uid=%s field=%s: %s", uid_hex, field_key, exc
+                LOG.warning(
+                    "find_spool_by_uid uid=%s field=%s: %s — lookup may be inconclusive",
+                    uid_hex, field_key, exc,
                 )
                 primary_had_error = True
 
         if primary_had_error:
-            return None
+            raise RuntimeError(
+                f"find_spool_by_uid: Spoolman lookup for uid={uid_hex} was inconclusive"
+                " (one or more slot queries or secondary fetches failed) —"
+                " treating as error, not miss"
+            )
 
         # Fallback: fetch all spools and scan rfid_uid_N values in Python.
         # This handles legacy entries where the search index may not have been
@@ -610,7 +621,14 @@ class SpoolmanClient:
                                 )
                                 return int(spool_id_val)
         except Exception as exc:
-            LOG.debug("find_spool_by_uid fallback scan failed: %s", exc)
+            LOG.warning(
+                "find_spool_by_uid fallback scan failed: %s — lookup is inconclusive",
+                exc,
+            )
+            raise RuntimeError(
+                f"find_spool_by_uid: fallback full-spool scan for uid={uid_hex} failed:"
+                f" {exc}"
+            ) from exc
         LOG.info(
             "find_spool_by_uid: uid=%s not found in Spoolman"
             " (checked %d slot queries + fallback scan;"

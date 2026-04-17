@@ -654,6 +654,50 @@ class TestFindSpoolByUid(unittest.TestCase):
         self.assertIsNone(sid)
 
     # ------------------------------------------------------------------
+    # Error / inconclusive paths must raise, not return None
+    # ------------------------------------------------------------------
+
+    def test_primary_slot_error_raises(self):
+        """A network error on a slot query must raise RuntimeError, not return None."""
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                raise OSError("connection refused")
+            return []
+
+        client = self._client_with_fields(_req)
+        with self.assertRaises(RuntimeError):
+            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+
+    def test_secondary_fetch_error_raises(self):
+        """A network error on the secondary verification fetch must raise RuntimeError."""
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_1]" in path and "/spool?" in path:
+                # Response omits extra — secondary fetch will be needed.
+                return [{"id": 5}]
+            if method == "GET" and "/api/v1/spool/5" in path:
+                raise OSError("timeout")
+            return []
+
+        client = self._client_with_fields(_req)
+        with self.assertRaises(RuntimeError):
+            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+
+    def test_fallback_scan_error_raises(self):
+        """A network error on the fallback full-spool scan must raise RuntimeError."""
+        call_count = [0]
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                return []  # All slot queries empty — triggers fallback.
+            if method == "GET" and path == "/api/v1/spool":
+                raise OSError("server error")
+            return []
+
+        client = self._client_with_fields(_req)
+        with self.assertRaises(RuntimeError):
+            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+
+    # ------------------------------------------------------------------
     # _decode_extra_value helper
     # ------------------------------------------------------------------
 
