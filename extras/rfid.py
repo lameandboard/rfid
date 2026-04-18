@@ -1867,7 +1867,80 @@ class Rfid:
                 uid_hex,
             )
 
-        # Normalise OpenSpool payload: it uses "type" for material and "weight"
+        # Step 0b: For Bambu tags, check whether a spool already exists with the
+        # same Tray UID stored as lot_nr.  A physical Bambu spool may carry two
+        # RFID tags with different hardware UIDs but the same Tray UID; the second
+        # tag would fail the uid lookup above but must resolve to the same spool.
+        tray_uid = str(tag_data.get("tray_uid") or "").strip().upper()
+        if tray_uid and str(tag_data.get("tag_format") or "") == "bambu":
+            try:
+                lot_nr_sid = self._spoolman_find_spool_by_tray_uid(tray_uid)
+            except Exception as exc:
+                self._log.warning(
+                    "rfid: auto_create_spool: tray_uid lot_nr lookup failed"
+                    " (inconclusive) tray_uid=%s uid=%s: %s"
+                    " — aborting creation to avoid duplicate spool",
+                    tray_uid, uid_hex, exc,
+                )
+                self._freeze_lane_async(lane, reason="auto_create_spool_lot_nr_lookup_error")
+                return
+
+            if lot_nr_sid is not None:
+                self._log.info(
+                    "rfid: auto_create_spool: tray_uid=%s already registered as spool %s"
+                    " in Spoolman (lot_nr match) — skipping creation, associating uid=%s",
+                    tray_uid, lot_nr_sid, uid_hex,
+                )
+                # Register the scanned UID on the existing spool so future scans
+                # of this hardware tag resolve quickly via rfid_uid_N.
+                if uid_hex:
+                    try:
+                        client.add_uid_to_spool(lot_nr_sid, uid_hex, self.max_uids)
+                    except Exception as exc:
+                        self._log.warning(
+                            "rfid: auto_create_spool: failed to register uid=%s"
+                            " on existing spool %s (lot_nr=%s): %s",
+                            uid_hex, lot_nr_sid, tray_uid, exc,
+                        )
+                _lane = lane
+                _uid = uid_hex
+                _sid = lot_nr_sid
+                _timeout = self.event_timeout
+
+                def _on_found_by_lot_nr(event_time):
+                    self._commit_in_progress[_lane] = True
+                    self._end_scan_session(_lane, reason="tray_uid_lot_nr_found_before_create")
+                    _UID_SPOOL_CACHE[_uid] = _sid
+                    _mark_uid_cache_dirty()
+                    self._pending[_lane] = {
+                        "lane": _lane,
+                        "spoolman_id": _sid,
+                        "uid_hex": _uid,
+                        "tag_text": None,
+                        "ts": time.time(),
+                        "timeout": _timeout,
+                    }
+                    self._respond(
+                        f"rfid: auto_create_spool: Bambu tray_uid={tray_uid}"
+                        f" found existing spool {_sid} on lane {_lane}"
+                        f" — creation skipped, uid={_uid} associated"
+                    )
+                    if self._lane_loaded_seen.get(_lane) or _lane in self._sync_scan_lanes:
+                        self._debug(
+                            f"rfid[{self.name}]: auto_create_spool: lane_loaded already"
+                            f" received (or sync scan) — committing existing spool"
+                            f" {_sid} now"
+                        )
+                        self.gcode.run_script_from_command(f"RFID_SCAN_COMMIT LANE={_lane}")
+                    else:
+                        self._debug(
+                            f"rfid[{self.name}]: auto_create_spool: existing spool {_sid}"
+                            f" stored in pending for lane {_lane} — awaiting lane_loaded"
+                        )
+
+                self.reactor.register_async_callback(_on_found_by_lot_nr)
+                return
+
         # for remaining weight.  Ensure standard keys are present before delegating.
         filament_info = dict(tag_data)
         if "material" not in filament_info or not filament_info.get("material"):
@@ -2965,6 +3038,13 @@ class Rfid:
                     _lane = lane
                     _uid = best_uid
                     _timeout = self.event_timeout
+                    # Capture tray_uid from pending filament_info for Bambu lot_nr fallback.
+                    _pending_fi = (self._pending.get(lane) or {}).get("filament_info") or {}
+                    _tray_uid_fallback: Optional[str] = None
+                    if str(_pending_fi.get("tag_format") or "") == "bambu":
+                        _raw = str(_pending_fi.get("tray_uid") or "").strip().upper()
+                        if _raw:
+                            _tray_uid_fallback = _raw
                     self._respond(
                         f"RFID: lane {_lane} uid={_uid} -- dispatching Spoolman lookup"
                     )
@@ -2995,6 +3075,26 @@ class Rfid:
                                 self._log.warning(
                                     "rfid[%s]: Spoolman fallback lookup (attempt 2) uid=%s failed: %s",
                                     self.name, _uid, exc,
+                                )
+
+                        # For Bambu tags: if uid lookup failed, try lot_nr (tray_uid) lookup.
+                        # This handles the second RFID tag on a Bambu spool whose uid is not
+                        # yet registered in Spoolman but whose tray_uid matches lot_nr.
+                        if sid is None and _tray_uid_fallback:
+                            self._log.info(
+                                "rfid[%s]: Spoolman fallback: uid=%s not found;"
+                                " trying Bambu tray_uid lot_nr=%s",
+                                self.name, _uid, _tray_uid_fallback,
+                            )
+                            try:
+                                sid = self._spoolman_find_spool_by_tray_uid(_tray_uid_fallback)
+                                if sid is not None:
+                                    # Associate the scanned uid with the existing spool.
+                                    self._ensure_uid_in_spool_extra(_uid, sid)
+                            except Exception as exc:
+                                self._log.warning(
+                                    "rfid[%s]: Spoolman lot_nr fallback tray_uid=%s failed: %s",
+                                    self.name, _tray_uid_fallback, exc,
                                 )
 
                         def _on_spoolman_result(event_time):
@@ -3083,6 +3183,30 @@ class Rfid:
                 self.name, uid_hex, exc,
             )
             return None
+
+    def _spoolman_find_spool_by_tray_uid(self, tray_uid: str) -> Optional[int]:
+        """Query Spoolman for a spool whose ``lot_nr`` equals *tray_uid*.
+
+        Delegates to SpoolmanClient.find_spool_by_lot_nr.  Used for Bambu tags
+        that share the same Tray UID across two physical RFID tags — the second
+        tag can resolve to the existing spool by lot_nr instead of creating a
+        duplicate.
+
+        Returns the spool ID (int) if found, None otherwise.
+        Raises RuntimeError when the lookup is inconclusive (network error),
+        so callers can abort creation rather than risk duplicates.
+        Only call from GCode command handlers / thread-pool workers — never
+        from reactor timer callbacks (blocking urllib calls).
+        """
+        if self._spoolman is None:
+            return None
+        sid = self._spoolman.find_spool_by_lot_nr(tray_uid)
+        if sid is not None:
+            self._debug(
+                f"rfid: _spoolman_find_spool_by_tray_uid:"
+                f" found spool {sid} for tray_uid={tray_uid}"
+            )
+        return sid
 
     def _spoolman_add_uid_to_spool(self, spool_id: int, uid_hex: str) -> bool:
         """Write ``uid_hex`` into the first empty ``rfid_uid_N`` slot on ``spool_id``.
@@ -3673,46 +3797,95 @@ class Rfid:
                                             f" for uid={uid_hex}"
                                         )
                         else:
-                            if uid_hex != "unknown":
-                                gcmd.respond_info(
-                                    f"RFID_CHECK_TAG: uid={uid_hex} not found in Spoolman"
-                                    f" — triggering auto-create (CREATE=1)"
-                                )
-                            new_sid = reader._auto_create_spool(filament_info, uid_hex=uid_hex if uid_hex != "unknown" else None)
-                            if new_sid is not None:
-                                spoolman_id = new_sid
-                                if uid_hex != "unknown":
-                                    # Register UID in Spoolman extra field and update local cache.
-                                    reader._reassign_uid_to_spool(uid_hex, int(spoolman_id))
-                                gcmd.respond_info(
-                                    f"RFID_CHECK_TAG: created spoolman spool id={spoolman_id}"
-                                    f" for uid={uid_hex}"
-                                )
-                                if write:
-                                    is_bambu = fmt == "bambu"
-                                    if is_bambu:
-                                        gcmd.respond_info(
-                                            f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
-                                            "spoolman_id cached (cannot write to Bambu tag)"
-                                        )
-                                    else:
-                                        ok = reader._write_spoolman_id_to_tag(
-                                            spoolman_id, uid_hex, is_bambu=is_bambu
-                                        )
-                                        if ok:
+                            # For Bambu tags: check whether a spool already exists
+                            # with the same Tray UID stored as lot_nr before creating.
+                            _tray_uid = str(filament_info.get("tray_uid") or "").strip().upper()
+                            if _tray_uid and fmt == "bambu" and reader._spoolman is not None:
+                                try:
+                                    _lot_sid = reader._spoolman_find_spool_by_tray_uid(_tray_uid)
+                                except Exception as _lot_exc:
+                                    lookup_error = True
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: Spoolman lot_nr lookup failed"
+                                        f" for tray_uid={_tray_uid}"
+                                        f" ({_lot_exc}) — skipping auto-create (inconclusive)"
+                                    )
+                                    _lot_sid = None
+                                if not lookup_error and _lot_sid is not None:
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: Bambu tray_uid={_tray_uid}"
+                                        f" already found as spool {_lot_sid} in Spoolman"
+                                        f" (lot_nr match) — skipping auto-create"
+                                    )
+                                    found_sid = _lot_sid
+                                    spoolman_id = found_sid
+                                    # Associate the scanned uid with the existing spool.
+                                    if uid_hex != "unknown":
+                                        reader._ensure_uid_in_spool_extra(uid_hex, _lot_sid)
+                                    if write:
+                                        is_bambu = fmt == "bambu"
+                                        if is_bambu:
                                             gcmd.respond_info(
-                                                f"RFID_CHECK_TAG: wrote spoolman_id={spoolman_id}"
-                                                f" to tag uid={uid_hex}"
+                                                f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
+                                                "spoolman_id cached (cannot write to Bambu tag)"
                                             )
                                         else:
-                                            gcmd.respond_info(
-                                                f"RFID_CHECK_TAG: write-back skipped or failed"
-                                                f" for uid={uid_hex}"
+                                            ok = reader._write_spoolman_id_to_tag(
+                                                spoolman_id, uid_hex, is_bambu=is_bambu
                                             )
-                            else:
-                                gcmd.respond_info(
-                                    f"RFID_CHECK_TAG: spool creation failed for uid={uid_hex}"
-                                )
+                                            if ok:
+                                                gcmd.respond_info(
+                                                    f"RFID_CHECK_TAG: wrote"
+                                                    f" spoolman_id={spoolman_id}"
+                                                    f" to tag uid={uid_hex}"
+                                                )
+                                            else:
+                                                gcmd.respond_info(
+                                                    f"RFID_CHECK_TAG: write-back skipped"
+                                                    f" or failed for uid={uid_hex}"
+                                                )
+                            if not lookup_error and found_sid is None:
+                                # No existing spool found — proceed to create.
+                                if uid_hex != "unknown":
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: uid={uid_hex} not found in Spoolman"
+                                        f" — triggering auto-create (CREATE=1)"
+                                    )
+                                new_sid = reader._auto_create_spool(filament_info, uid_hex=uid_hex if uid_hex != "unknown" else None)
+                                if new_sid is not None:
+                                    spoolman_id = new_sid
+                                    if uid_hex != "unknown":
+                                        # Register UID in Spoolman extra field and update local cache.
+                                        reader._reassign_uid_to_spool(uid_hex, int(spoolman_id))
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: created spoolman spool id={spoolman_id}"
+                                        f" for uid={uid_hex}"
+                                    )
+                                    if write:
+                                        is_bambu = fmt == "bambu"
+                                        if is_bambu:
+                                            gcmd.respond_info(
+                                                f"RFID_CHECK_TAG: Bambu tag uid={uid_hex}: "
+                                                "spoolman_id cached (cannot write to Bambu tag)"
+                                            )
+                                        else:
+                                            ok = reader._write_spoolman_id_to_tag(
+                                                spoolman_id, uid_hex, is_bambu=is_bambu
+                                            )
+                                            if ok:
+                                                gcmd.respond_info(
+                                                    f"RFID_CHECK_TAG: wrote spoolman_id={spoolman_id}"
+                                                    f" to tag uid={uid_hex}"
+                                                )
+                                            else:
+                                                gcmd.respond_info(
+                                                    f"RFID_CHECK_TAG: write-back skipped or failed"
+                                                    f" for uid={uid_hex}"
+                                                )
+                                else:
+                                    gcmd.respond_info(
+                                        f"RFID_CHECK_TAG: spool creation failed for uid={uid_hex}"
+                                    )
         else:
             gcmd.respond_info(f"RFID_CHECK_TAG: uid={uid_hex} — no filament data parsed")
 

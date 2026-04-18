@@ -964,5 +964,123 @@ class TestUidIndex(unittest.TestCase):
             client.find_spool_by_uid(self._UID, self._MAX_UIDS)
 
 
+
+# ---------------------------------------------------------------------------
+# Tests: find_spool_by_lot_nr
+# ---------------------------------------------------------------------------
+
+class TestFindSpoolByLotNr(unittest.TestCase):
+    """find_spool_by_lot_nr: returns spool_id when lot_nr matches, None when absent."""
+
+    _LOT_NR = "AABBCCDDEEFF00112233445566778899"
+
+    def _make_client(self, req_fn):
+        client = sc.SpoolmanClient("http://localhost:7912")
+        client._req = MagicMock(side_effect=req_fn)
+        return client
+
+    def test_found_returns_spool_id(self):
+        """When a spool with matching lot_nr exists, return its ID."""
+        def _req(method, path, body=None):
+            if method == "GET" and "lot_nr=" in path:
+                return [{"id": 42, "lot_nr": self._LOT_NR}]
+            return []
+
+        client = self._make_client(_req)
+        sid = client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertEqual(sid, 42)
+
+    def test_found_case_insensitive(self):
+        """lot_nr comparison is case-insensitive (tray_uid may be uppercase or lowercase)."""
+        def _req(method, path, body=None):
+            if method == "GET" and "lot_nr=" in path:
+                return [{"id": 7, "lot_nr": self._LOT_NR.lower()}]
+            return []
+
+        client = self._make_client(_req)
+        sid = client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertEqual(sid, 7)
+
+    def test_not_found_returns_none(self):
+        """When no spool has the given lot_nr, return None."""
+        def _req(method, path, body=None):
+            if method == "GET" and "lot_nr=" in path:
+                return []
+            return []
+
+        client = self._make_client(_req)
+        sid = client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertIsNone(sid)
+
+    def test_empty_response_returns_none(self):
+        """An empty list response returns None without raising."""
+        def _req(method, path, body=None):
+            return []
+
+        client = self._make_client(_req)
+        sid = client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertIsNone(sid)
+
+    def test_network_error_raises_runtime_error(self):
+        """A network error must raise RuntimeError so callers treat it as inconclusive."""
+        def _req(method, path, body=None):
+            raise OSError("connection refused")
+
+        client = self._make_client(_req)
+        with self.assertRaises(RuntimeError):
+            client.find_spool_by_lot_nr(self._LOT_NR)
+
+    def test_list_response_with_wrong_lot_nr_returns_none(self):
+        """Spoolman may return partial matches; only exact lot_nr (case-insensitive) matches."""
+        def _req(method, path, body=None):
+            if method == "GET" and "lot_nr=" in path:
+                # Spoolman returned a spool with a different lot_nr (substring match).
+                return [{"id": 99, "lot_nr": "OTHER_LOT"}]
+            return []
+
+        client = self._make_client(_req)
+        sid = client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertIsNone(sid)
+
+    def test_items_wrapped_response(self):
+        """Some Spoolman versions wrap the list in {'items': [...]}."""
+        def _req(method, path, body=None):
+            if method == "GET" and "lot_nr=" in path:
+                return {"items": [{"id": 55, "lot_nr": self._LOT_NR}]}
+            return {}
+
+        client = self._make_client(_req)
+        sid = client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertEqual(sid, 55)
+
+    def test_first_match_returned_when_multiple_spools(self):
+        """When multiple spools match, return the first one's ID."""
+        def _req(method, path, body=None):
+            if method == "GET" and "lot_nr=" in path:
+                return [
+                    {"id": 10, "lot_nr": self._LOT_NR},
+                    {"id": 20, "lot_nr": self._LOT_NR},
+                ]
+            return []
+
+        client = self._make_client(_req)
+        sid = client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertEqual(sid, 10)
+
+    def test_query_url_encodes_lot_nr(self):
+        """The lot_nr value must be URL-encoded in the query string."""
+        captured_paths = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "lot_nr" in path:
+                captured_paths.append(path)
+            return []
+
+        client = self._make_client(_req)
+        client.find_spool_by_lot_nr(self._LOT_NR)
+        self.assertTrue(any("lot_nr=" in p for p in captured_paths),
+                        "GET request must include lot_nr= query parameter")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

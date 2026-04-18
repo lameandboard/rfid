@@ -744,6 +744,48 @@ class SpoolmanClient:
         )
         return None
 
+    def find_spool_by_lot_nr(self, lot_nr: str) -> Optional[int]:
+        """Search Spoolman for a spool whose ``lot_nr`` equals *lot_nr*.
+
+        Used to find Bambu spools by their Tray UID (stored as ``lot_nr`` when
+        a spool is created via :meth:`auto_create_spool`).  Because a Bambu
+        physical spool can carry two RFID tags with different hardware UIDs but
+        the *same* Tray UID, looking up by ``lot_nr`` lets the second tag resolve
+        to the already-created spool instead of triggering a duplicate creation.
+
+        Issues ``GET /api/v1/spool?lot_nr=<lot_nr>`` and returns the first
+        matching spool ID, or ``None`` if no match is found.
+
+        Raises ``RuntimeError`` on any HTTP/network failure so callers treat the
+        result as inconclusive (and avoid duplicate creation on transient errors).
+        """
+        try:
+            spools = self._req(
+                "GET",
+                f"/api/v1/spool?lot_nr={url_parse.quote(lot_nr, safe='')}",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"find_spool_by_lot_nr: GET /api/v1/spool?lot_nr={lot_nr} failed: {exc}"
+            ) from exc
+
+        items = spools if isinstance(spools, list) else (spools or {}).get("items", [])
+        for spool in items:
+            spool_lot = str(spool.get("lot_nr") or "").strip().upper()
+            if spool_lot == lot_nr.strip().upper():
+                spool_id_val = spool.get("id")
+                if spool_id_val is not None:
+                    sid = int(spool_id_val)
+                    LOG.debug(
+                        "find_spool_by_lot_nr: lot_nr=%s → spool %d",
+                        lot_nr, sid,
+                    )
+                    return sid
+        LOG.debug(
+            "find_spool_by_lot_nr: lot_nr=%s not found in Spoolman", lot_nr
+        )
+        return None
+
     def _patch_uid_field(self, spool_id, field_key, value):
         """PATCH a single ``rfid_uid_N`` field on *spool_id*.
 
