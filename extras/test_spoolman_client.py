@@ -709,5 +709,260 @@ class TestFindSpoolByUid(unittest.TestCase):
         self.assertEqual(sc.SpoolmanClient._decode_extra_value("1234"), "1234")
 
 
+# ---------------------------------------------------------------------------
+# Tests: UID index (use_uid_index=True)
+# ---------------------------------------------------------------------------
+
+def _make_uid_indexed_client(req_fn, uid_index_ttl=60.0):
+    """Return a SpoolmanClient with use_uid_index=True and _req mocked."""
+    client = sc.SpoolmanClient(
+        "http://localhost:7912",
+        use_uid_index=True,
+        uid_index_ttl=uid_index_ttl,
+    )
+    client.fields_exist = MagicMock(return_value=True)
+    client._req = MagicMock(side_effect=req_fn)
+    return client
+
+
+class TestUidIndex(unittest.TestCase):
+    """find_spool_by_uid with use_uid_index=True: index hit, eviction, rebuild."""
+
+    _UID = "C2C304EB"
+    _MAX_UIDS = 4
+
+    def _all_spools_response(self, uid_to_spool_id):
+        """Build a minimal /api/v1/spool list for the given uid→id mapping."""
+        spools = []
+        for uid, sid in uid_to_spool_id.items():
+            spools.append({
+                "id": sid,
+                "extra": {"rfid_uid_1": json.dumps(uid)},
+            })
+        return spools
+
+    # ------------------------------------------------------------------
+    # Index hit + verified → return spool without slot queries
+    # ------------------------------------------------------------------
+
+    def test_index_hit_verified_returns_spool_id(self):
+        """Index hit that passes verification must return the spool id."""
+        calls = []
+
+        def _req(method, path, body=None):
+            calls.append((method, path))
+            if method == "GET" and path == "/api/v1/spool":
+                return self._all_spools_response({self._UID: 42})
+            if method == "GET" and path == f"/api/v1/spool/42":
+                return {"id": 42, "extra": {"rfid_uid_1": json.dumps(self._UID)}}
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 42)
+        # No per-slot queries should have been made.
+        slot_queries = [p for _, p in calls if "extra[rfid_uid_" in p]
+        self.assertEqual(slot_queries, [],
+                         "No slot queries expected when index path is used")
+
+    def test_index_hit_verification_confirms_uid(self):
+        """Verify call must use exact UID match (decoded) across all slots."""
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                # Spool 7 has UID in slot 2
+                return [{"id": 7, "extra": {
+                    "rfid_uid_1": json.dumps("DIFFERENT"),
+                    "rfid_uid_2": json.dumps(self._UID),
+                }}]
+            if method == "GET" and "/api/v1/spool/7" in path:
+                return {"id": 7, "extra": {
+                    "rfid_uid_1": json.dumps("DIFFERENT"),
+                    "rfid_uid_2": json.dumps(self._UID),
+                }}
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        # Index is built from slot 2, so uid→7 should be in index.
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 7)
+
+    # ------------------------------------------------------------------
+    # Stale index hit where UID changed → evict, rebuild, continue
+    # ------------------------------------------------------------------
+
+    def test_stale_index_hit_evicts_and_returns_none(self):
+        """If verification fails (UID moved), evict and return None after rebuild."""
+        rebuild_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                rebuild_calls.append(path)
+                # After rebuild, spool 42 no longer has our UID.
+                return [{"id": 42, "extra": {"rfid_uid_1": json.dumps("OTHERID")}}]
+            if method == "GET" and "/api/v1/spool/42" in path:
+                # Verification: UID is no longer present.
+                return {"id": 42, "extra": {"rfid_uid_1": json.dumps("OTHERID")}}
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        # Seed the index with stale data (uid → 42) and mark it fresh.
+        client._uid_index = {self._UID: 42}
+        client._uid_index_built_at = sc.time.monotonic()
+
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid)
+        # The UID must have been evicted from the index.
+        self.assertNotIn(self._UID, client._uid_index,
+                         "Evicted UID must not remain in index")
+        # A rebuild must have been triggered after verification failed.
+        self.assertGreaterEqual(len(rebuild_calls), 1,
+                                "Index rebuild expected after verification failure")
+
+    def test_stale_index_hit_spool_deleted_evicts_and_returns_none(self):
+        """If verify returns 404 (spool deleted), evict, rebuild, return None."""
+        from urllib.error import HTTPError
+        rebuild_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                rebuild_calls.append(path)
+                return []  # No spools after deletion.
+            if method == "GET" and "/api/v1/spool/99" in path:
+                raise HTTPError(path, 404, "Not Found", {}, None)
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        client._uid_index = {self._UID: 99}
+        client._uid_index_built_at = sc.time.monotonic()
+
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid)
+        self.assertNotIn(self._UID, client._uid_index)
+        self.assertGreaterEqual(len(rebuild_calls), 1)
+
+    # ------------------------------------------------------------------
+    # Index miss triggers rebuild
+    # ------------------------------------------------------------------
+
+    def test_index_miss_triggers_rebuild_then_finds_spool(self):
+        """An index miss must trigger a rebuild; if uid appears after rebuild → return it."""
+        rebuild_count = [0]
+
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                rebuild_count[0] += 1
+                return self._all_spools_response({self._UID: 55})
+            if method == "GET" and "/api/v1/spool/55" in path:
+                return {"id": 55, "extra": {"rfid_uid_1": json.dumps(self._UID)}}
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        # Index is empty (never built) → stale → rebuild triggered.
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 55)
+        self.assertEqual(rebuild_count[0], 1, "Exactly one rebuild expected on cold start")
+
+    def test_stale_index_triggers_rebuild(self):
+        """An index older than TTL must trigger a rebuild."""
+        rebuild_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                rebuild_calls.append(path)
+                return self._all_spools_response({self._UID: 77})
+            if method == "GET" and "/api/v1/spool/77" in path:
+                return {"id": 77, "extra": {"rfid_uid_1": json.dumps(self._UID)}}
+            return []
+
+        client = _make_uid_indexed_client(_req, uid_index_ttl=60.0)
+        # Pre-seed an index that is way older than TTL.
+        client._uid_index = {}
+        client._uid_index_built_at = sc.time.monotonic() - 999.0  # far in the past
+
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 77)
+        self.assertEqual(len(rebuild_calls), 1, "Rebuild must occur when index is stale")
+
+    # ------------------------------------------------------------------
+    # Rebuild network failure → RuntimeError
+    # ------------------------------------------------------------------
+
+    def test_rebuild_failure_raises_runtime_error(self):
+        """A network error during index rebuild must raise RuntimeError."""
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                raise OSError("network down")
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        with self.assertRaises(RuntimeError):
+            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+
+    # ------------------------------------------------------------------
+    # Substring false-positives cannot cause incorrect returns via index
+    # ------------------------------------------------------------------
+
+    def test_substring_false_positive_cannot_match_via_index(self):
+        """The index stores exact UIDs; a substring of the target UID must NOT match."""
+        substring_uid = self._UID[:4]  # e.g. "C2C3"
+
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                # Only spool 11 exists, with a UID that is a substring of self._UID.
+                return [{"id": 11, "extra": {"rfid_uid_1": json.dumps(substring_uid)}}]
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid,
+                          "Substring UID in index must not match the full target UID")
+
+    # ------------------------------------------------------------------
+    # Disabled by default: use_uid_index=False must not affect slot-query path
+    # ------------------------------------------------------------------
+
+    def test_index_disabled_uses_slot_queries(self):
+        """When use_uid_index=False the existing slot-query path is used (not index)."""
+        slot_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path:
+                slot_calls.append(path)
+                if "rfid_uid_1" in path:
+                    return [_spool_response(5, {1: self._UID})]
+                return []
+            return []
+
+        # Default client: use_uid_index=False.
+        client = sc.SpoolmanClient("http://localhost:7912")
+        client.fields_exist = MagicMock(return_value=True)
+        client._req = MagicMock(side_effect=_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertEqual(sid, 5)
+        self.assertGreater(len(slot_calls), 0,
+                           "Slot queries must be used when index is disabled")
+        # Index must remain empty when disabled.
+        self.assertEqual(client._uid_index, {})
+
+    # ------------------------------------------------------------------
+    # Verify-on-hit: non-404 HTTP error during verify → RuntimeError
+    # ------------------------------------------------------------------
+
+    def test_verify_non_404_http_error_raises(self):
+        """An HTTP 500 during verify must propagate as RuntimeError."""
+        from urllib.error import HTTPError
+
+        def _req(method, path, body=None):
+            if method == "GET" and path == "/api/v1/spool":
+                return self._all_spools_response({self._UID: 30})
+            if method == "GET" and "/api/v1/spool/30" in path:
+                raise HTTPError(path, 500, "Internal Server Error", {}, None)
+            return []
+
+        client = _make_uid_indexed_client(_req)
+        with self.assertRaises(RuntimeError):
+            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -406,6 +406,8 @@ class Rfid:
         self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
         self._spoolman_api_key = config.get("spoolman_api_key", None)
         self._spoolman_timeout = config.getfloat("spoolman_timeout", 5.0, minval=1.0)
+        self._spoolman_uid_index = config.getboolean("spoolman_uid_index", False)
+        self._spoolman_uid_index_ttl = config.getfloat("spoolman_uid_index_ttl", 60.0, minval=1.0)
 
         lanes_cfg = config.get("lanes", None)
         if lanes_cfg is None:
@@ -490,6 +492,8 @@ class Rfid:
                 self.spoolman_url,
                 api_key=self._spoolman_api_key,
                 timeout=self._spoolman_timeout,
+                use_uid_index=self._spoolman_uid_index,
+                uid_index_ttl=self._spoolman_uid_index_ttl,
             )
             self._spoolman_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix="rfid_spoolman"
@@ -2437,6 +2441,19 @@ class Rfid:
                             self.name, uid_hex, lane,
                         )
                         blocked_uids.add(uid_hex)  # don't re-process this UID this window
+                        # Full Bambu read: tag is confirmed — no point keeping the scan
+                        # loop running.  Stop now and let lane_loaded trigger the lookup.
+                        if (
+                            filament_info is not None
+                            and filament_info.get("tag_format") == "bambu"
+                            and filament_info.get("material")
+                        ):
+                            self._debug(
+                                f"rfid[{self.name}]: Bambu full read complete"
+                                f" lane={lane} uid={uid_hex}"
+                                f" — stopping scan, awaiting lane_loaded for Spoolman lookup"
+                            )
+                            return self.reactor.NEVER
                 elif not self.auto_create_spool:
                     # No Spoolman and no auto-create: nothing more to do.
                     self._respond(
@@ -2464,8 +2481,17 @@ class Rfid:
                                     f" uid={candidate['uid_hex']} age={age:.2f}s"
                                 )
                                 self._scan_candidates.pop(lane, None)
-                elif self.fast_mode:
+                elif self.fast_mode or (
+                    filament_info is not None
+                    and filament_info.get("tag_format") == "bambu"
+                    and filament_info.get("material")
+                ):
                     # Fast mode: single valid read is enough — commit immediately.
+                    # Also applies when the tag is a fully-decoded Bambu tag:
+                    # MIFARE authentication + successful sector decryption is
+                    # stronger confirmation than a second UID sighting, so there
+                    # is no value in keeping the scan loop running.
+                    _commit_reason = "fast_mode_commit" if self.fast_mode else "bambu_full_read_commit"
                     blocked_uids.add(uid_hex)
                     self._pending[lane] = {
                         "lane": lane,
@@ -2477,10 +2503,10 @@ class Rfid:
                     }
                     self._commit_in_progress[lane] = True
                     self._scan_timers.pop(lane, None)
-                    self._clear_scan_state(lane, reason="fast_mode_commit")
+                    self._clear_scan_state(lane, reason=_commit_reason)
                     self._debug(
                         f"rfid[{self.name}]: DBG single_read_commit lane={lane}"
-                        f" uid={uid_hex} sid={spoolman_id}"
+                        f" uid={uid_hex} sid={spoolman_id} reason={_commit_reason}"
                     )
                     self._respond(
                         f"RFID: tag found on lane {lane}, spoolman_id={spoolman_id}"
@@ -2766,6 +2792,8 @@ class Rfid:
                         url,
                         api_key=self._spoolman_api_key,
                         timeout=self._spoolman_timeout,
+                        use_uid_index=self._spoolman_uid_index,
+                        uid_index_ttl=self._spoolman_uid_index_ttl,
                     )
                     self._debug(
                         f"rfid[{self.name}]: SpoolmanClient initialised from moonraker.conf url={url}"
