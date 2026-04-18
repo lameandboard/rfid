@@ -692,6 +692,131 @@ class TestFindSpoolByUid(unittest.TestCase):
         self.assertIsNone(sid)
 
     # ------------------------------------------------------------------
+    # False-positive threshold → fallback full-spool scan
+    # ------------------------------------------------------------------
+
+    def test_fp_threshold_triggers_fallback_finds_spool(self):
+        """When unique false-positive rejections reach the threshold, the code must
+        switch to a single fallback full-spool scan and return the correct spool."""
+        threshold = sc._FP_FALLBACK_THRESHOLD
+        # Build THRESHOLD unique false-positive spools (all with a different UID).
+        fp_uid = "DEADBEEF00000000"
+        fp_spools = [_spool_response(100 + i, {1: fp_uid}) for i in range(threshold)]
+        correct_uid = self._UID
+        correct_spool_id = 42
+        fallback_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                # Every slot query returns all threshold false-positive spools.
+                return list(fp_spools)
+            if method == "GET" and path == "/api/v1/spool":
+                # Fallback full-spool scan returns the correct spool.
+                fallback_calls.append(path)
+                return [_spool_response(correct_spool_id, {1: correct_uid})]
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(correct_uid, self._MAX_UIDS)
+        self.assertEqual(sid, correct_spool_id,
+                         "Correct spool must be found via fallback full-spool scan")
+        self.assertEqual(len(fallback_calls), 1,
+                         "Fallback GET /api/v1/spool must be called exactly once")
+        # No individual secondary fetches for false-positive spools.
+        for i in range(threshold):
+            self.assertEqual(self._count_secondary_fetches(client, 100 + i), 0,
+                             f"No secondary fetch expected for false-positive spool {100 + i}")
+
+    def test_fp_threshold_triggers_fallback_not_found(self):
+        """When the threshold is reached but the UID is absent from the fallback scan,
+        must return None after a single fallback full-spool GET."""
+        threshold = sc._FP_FALLBACK_THRESHOLD
+        fp_uid = "DEADBEEF00000000"
+        fp_spools = [_spool_response(200 + i, {1: fp_uid}) for i in range(threshold)]
+        fallback_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                return list(fp_spools)
+            if method == "GET" and path == "/api/v1/spool":
+                fallback_calls.append(path)
+                return []  # UID genuinely absent.
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid, "UID absent from fallback scan must return None")
+        self.assertEqual(len(fallback_calls), 1,
+                         "Fallback GET /api/v1/spool must be called exactly once")
+        # No individual secondary fetches for any false-positive spool.
+        for i in range(threshold):
+            self.assertEqual(self._count_secondary_fetches(client, 200 + i), 0,
+                             f"No secondary fetch expected for false-positive spool {200 + i}")
+
+    def test_fp_threshold_slot_queries_stop_after_threshold(self):
+        """Once the threshold is reached, remaining slot queries must not be issued."""
+        threshold = sc._FP_FALLBACK_THRESHOLD
+        fp_uid = "DEADBEEF00000000"
+        fp_spools = [_spool_response(300 + i, {1: fp_uid}) for i in range(threshold)]
+        slot_query_count = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                slot_query_count.append(path)
+                return list(fp_spools)
+            if method == "GET" and path == "/api/v1/spool":
+                return []
+            return []
+
+        client = self._client_with_fields(_req)
+        client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        # Threshold is met after the first slot query returns all fp_spools.
+        # Only 1 slot query should be issued (not MAX_UIDS=4).
+        self.assertEqual(len(slot_query_count), 1,
+                         "Slot queries must stop once the false-positive threshold is reached")
+
+    def test_fp_threshold_fallback_error_raises(self):
+        """If the fallback full-spool scan fails, must raise RuntimeError."""
+        threshold = sc._FP_FALLBACK_THRESHOLD
+        fp_uid = "DEADBEEF00000000"
+        fp_spools = [_spool_response(400 + i, {1: fp_uid}) for i in range(threshold)]
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                return list(fp_spools)
+            if method == "GET" and path == "/api/v1/spool":
+                raise OSError("network error during fallback")
+            return []
+
+        client = self._client_with_fields(_req)
+        with self.assertRaises(RuntimeError):
+            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+
+    def test_repeated_fp_across_slots_no_secondary_fetches(self):
+        """The same false-positive spool appearing in multiple slot queries must not
+        trigger secondary individual fetches even when repeated many times."""
+        fp_uid = "DEADBEEF"
+        repeated_spool_id = 99
+        secondary_calls = []
+
+        def _req(method, path, body=None):
+            if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
+                # Same spool returned for every slot query — only 1 unique rejection.
+                return [_spool_response(repeated_spool_id, {1: fp_uid})]
+            if method == "GET" and f"/api/v1/spool/{repeated_spool_id}" in path:
+                secondary_calls.append(path)
+                return _spool_response(repeated_spool_id, {1: fp_uid})
+            return []
+
+        client = self._client_with_fields(_req)
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        # Only 1 unique rejected ID → threshold not reached → no fallback, no error.
+        self.assertIsNone(sid)
+        self.assertEqual(len(secondary_calls), 0,
+                         "Repeated false-positive spool must not be individually fetched"
+                         " on subsequent slot queries")
+
+    # ------------------------------------------------------------------
     # _decode_extra_value helper
     # ------------------------------------------------------------------
 

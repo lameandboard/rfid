@@ -79,6 +79,13 @@ _TAG_FORMAT_BRANDS: dict = {
 # Default spool weight (grams) used when the tag does not supply one.
 _DEFAULT_SPOOL_WEIGHT_G: int = 1000
 
+# Maximum number of unique false-positive spools that may be rejected inline
+# before find_spool_by_uid abandons per-slot queries and switches to a single
+# fallback full-spool scan.  Spoolman's extra-field filter sometimes behaves
+# like a substring match, returning many unrelated spools per query; this
+# threshold bounds the wasted work and reduces the risk of incorrect behaviour.
+_FP_FALLBACK_THRESHOLD: int = 5
+
 
 def _to_int_safe(val) -> Optional[int]:
     """Convert *val* to int, returning None on failure.
@@ -466,12 +473,22 @@ class SpoolmanClient:
           secondary verification fetch is performed.  This keeps lookup fast even
           when Spoolman's search endpoint returns many unrelated candidates.
 
+        Pathological false-positive heuristic: if the number of unique false-positive
+        spools rejected inline reaches ``_FP_FALLBACK_THRESHOLD``, the per-slot
+        queries are abandoned and a single fallback full-spool scan is performed
+        (GET ``/api/v1/spool``), with exact UID matching done in Python.  This
+        bounds the wasted work when Spoolman's extra-field filter behaves like a
+        substring match and avoids the noise/latency of many rejected candidates.
+
         Returns ``None`` if not found.
 
-        Raises ``RuntimeError`` only when an HTTP/network failure makes the slot
-        query itself fail.  Callers must treat this as "unknown — do not
+        Raises ``RuntimeError`` when an HTTP/network failure makes a slot query or
+        the fallback scan fail.  Callers must treat this as "unknown — do not
         auto-create" to avoid duplicate spool creation on transient failures.
         """
+        # Normalise uid_hex to uppercase so comparisons are case-insensitive.
+        uid_hex = uid_hex.upper()
+
         # Short-circuit: if rfid_uid_N fields don't exist yet, no spool can have
         # this UID — create them now and skip the search entirely.
         if not self.fields_exist(max_uids):
@@ -486,6 +503,7 @@ class SpoolmanClient:
         # Track spool IDs that were definitively shown not to contain uid_hex so
         # the same false-positive candidate is not re-checked for every slot query.
         _rejected_ids = set()  # type: set[int]
+        _fallback_triggered = False
 
         for n in range(1, max_uids + 1):
             field_key = self.uid_field_name(n)
@@ -519,7 +537,8 @@ class SpoolmanClient:
                             raw_v = resp_extra.get(self.uid_field_name(_n))
                             if raw_v is None:
                                 continue
-                            if self._decode_extra_value(raw_v) == uid_hex:
+                            decoded = self._decode_extra_value(raw_v)
+                            if decoded and decoded.upper() == uid_hex:
                                 LOG.debug(
                                     "find_spool_by_uid: uid=%s confirmed in spool %d"
                                     " via inline response extra (slot %d)",
@@ -542,16 +561,63 @@ class SpoolmanClient:
                                 self._decode_extra_value(queried_raw),
                             )
                             _rejected_ids.add(candidate_id)
+                            # Heuristic: too many unique false-positives indicates
+                            # pathological substring-match behaviour — abandon
+                            # per-slot queries and fall back to a full scan.
+                            if len(_rejected_ids) >= _FP_FALLBACK_THRESHOLD:
+                                LOG.warning(
+                                    "find_spool_by_uid: uid=%s — %d unique"
+                                    " false-positive spools rejected (threshold=%d);"
+                                    " switching to fallback full-spool scan"
+                                    " to avoid excessive noise/latency",
+                                    uid_hex, len(_rejected_ids),
+                                    _FP_FALLBACK_THRESHOLD,
+                                )
+                                _fallback_triggered = True
+                                break
                             continue
 
-                    # The response either has no extra dict or did not include the
-                    # queried field — treat as not found inline; no secondary fetch.
-                    LOG.debug(
-                        "find_spool_by_uid: spool %d — response missing extra"
-                        " or queried field %s; treating as not found (uid=%s)",
-                        candidate_id, field_key, uid_hex,
-                    )
-                    _rejected_ids.add(candidate_id)
+                        # The response either has no extra dict or did not include
+                        # the queried field — treat as not found inline; no
+                        # secondary fetch.
+                        LOG.debug(
+                            "find_spool_by_uid: spool %d — response missing extra"
+                            " or queried field %s; treating as not found (uid=%s)",
+                            candidate_id, field_key, uid_hex,
+                        )
+                        _rejected_ids.add(candidate_id)
+                        if len(_rejected_ids) >= _FP_FALLBACK_THRESHOLD:
+                            LOG.warning(
+                                "find_spool_by_uid: uid=%s — %d unique"
+                                " false-positive spools rejected (threshold=%d);"
+                                " switching to fallback full-spool scan"
+                                " to avoid excessive noise/latency",
+                                uid_hex, len(_rejected_ids),
+                                _FP_FALLBACK_THRESHOLD,
+                            )
+                            _fallback_triggered = True
+                            break
+                    else:
+                        # No extra dict at all — treat as not found inline.
+                        LOG.debug(
+                            "find_spool_by_uid: spool %d — response missing extra"
+                            " or queried field %s; treating as not found (uid=%s)",
+                            candidate_id, field_key, uid_hex,
+                        )
+                        _rejected_ids.add(candidate_id)
+                        if len(_rejected_ids) >= _FP_FALLBACK_THRESHOLD:
+                            LOG.warning(
+                                "find_spool_by_uid: uid=%s — %d unique"
+                                " false-positive spools rejected (threshold=%d);"
+                                " switching to fallback full-spool scan"
+                                " to avoid excessive noise/latency",
+                                uid_hex, len(_rejected_ids),
+                                _FP_FALLBACK_THRESHOLD,
+                            )
+                            _fallback_triggered = True
+                            break
+                if _fallback_triggered:
+                    break
             except Exception as exc:
                 LOG.warning(
                     "find_spool_by_uid uid=%s field=%s: %s — lookup may be inconclusive",
@@ -565,6 +631,54 @@ class SpoolmanClient:
                 " (one or more slot queries failed) —"
                 " treating as error, not miss"
             )
+
+        if _fallback_triggered:
+            # Fallback: fetch every spool and scan rfid_uid_N values in Python.
+            # This is a single HTTP call that handles pathological substring-match
+            # behaviour from Spoolman's extra-field filter.
+            LOG.info(
+                "find_spool_by_uid: uid=%s — running fallback full-spool scan"
+                " (false-positives rejected so far: %d)",
+                uid_hex, len(_rejected_ids),
+            )
+            try:
+                all_spools = self._req("GET", "/api/v1/spool") or []
+                if isinstance(all_spools, list):
+                    for spool in all_spools:
+                        spool_id_val = spool.get("id")
+                        if spool_id_val is None:
+                            continue
+                        extra = spool.get("extra") or {}
+                        if not isinstance(extra, dict):
+                            continue
+                        for slot_n in range(1, max_uids + 1):
+                            raw_v = extra.get(self.uid_field_name(slot_n))
+                            if raw_v is None:
+                                continue
+                            decoded = self._decode_extra_value(raw_v)
+                            if decoded and decoded.upper() == uid_hex:
+                                found_id = int(spool_id_val)
+                                LOG.debug(
+                                    "find_spool_by_uid: uid=%s found in spool %d"
+                                    " via fallback full-spool scan (slot %d)",
+                                    uid_hex, found_id, slot_n,
+                                )
+                                return found_id
+            except Exception as exc:
+                LOG.warning(
+                    "find_spool_by_uid fallback scan failed: %s"
+                    " — lookup is inconclusive",
+                    exc,
+                )
+                raise RuntimeError(
+                    f"find_spool_by_uid: fallback full-spool scan for uid={uid_hex}"
+                    f" failed: {exc}"
+                ) from exc
+            LOG.info(
+                "find_spool_by_uid: uid=%s not found in fallback full-spool scan",
+                uid_hex,
+            )
+            return None
 
         LOG.info(
             "find_spool_by_uid: uid=%s not found in Spoolman"
