@@ -406,6 +406,8 @@ class Rfid:
         self.spoolman_url = config.get("spoolman_url", "").strip().rstrip("/")
         self._spoolman_api_key = config.get("spoolman_api_key", None)
         self._spoolman_timeout = config.getfloat("spoolman_timeout", 5.0, minval=1.0)
+        self._spoolman_uid_index = config.getboolean("spoolman_uid_index", False)
+        self._spoolman_uid_index_ttl = config.getfloat("spoolman_uid_index_ttl", 60.0, minval=1.0)
 
         lanes_cfg = config.get("lanes", None)
         if lanes_cfg is None:
@@ -490,6 +492,8 @@ class Rfid:
                 self.spoolman_url,
                 api_key=self._spoolman_api_key,
                 timeout=self._spoolman_timeout,
+                use_uid_index=self._spoolman_uid_index,
+                uid_index_ttl=self._spoolman_uid_index_ttl,
             )
             self._spoolman_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix="rfid_spoolman"
@@ -2766,6 +2770,8 @@ class Rfid:
                         url,
                         api_key=self._spoolman_api_key,
                         timeout=self._spoolman_timeout,
+                        use_uid_index=self._spoolman_uid_index,
+                        uid_index_ttl=self._spoolman_uid_index_ttl,
                     )
                     self._debug(
                         f"rfid[{self.name}]: SpoolmanClient initialised from moonraker.conf url={url}"

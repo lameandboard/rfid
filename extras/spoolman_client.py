@@ -198,7 +198,8 @@ def _fetch_spoolmandb_bambu() -> list:
 
 
 class SpoolmanClient:
-    def __init__(self, base_url, api_key=None, timeout=5.0):
+    def __init__(self, base_url, api_key=None, timeout=5.0,
+                 use_uid_index=False, uid_index_ttl=60.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.headers = {
@@ -207,6 +208,13 @@ class SpoolmanClient:
         }
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
+
+        # Local UID index (cache): maps uid_hex -> spool_id.
+        # Enabled via use_uid_index; rebuilt when stale (age > uid_index_ttl seconds).
+        self.use_uid_index: bool = bool(use_uid_index)
+        self.uid_index_ttl: float = float(uid_index_ttl)
+        self._uid_index: dict = {}        # uid_hex -> spool_id (int)
+        self._uid_index_built_at: float = 0.0  # time.monotonic() of last rebuild
 
     def _req(self, method, path, body=None):
         url = f"{self.base_url}{path}"
@@ -445,6 +453,97 @@ class SpoolmanClient:
             pass
         return decoded
 
+    # --- Local UID index helpers ---
+
+    def _rebuild_uid_index(self, max_uids):
+        """Rebuild the in-memory UID index from ``GET /api/v1/spool``.
+
+        Scans every spool's ``rfid_uid_1`` … ``rfid_uid_N`` extra fields and
+        builds a ``uid_hex -> spool_id`` mapping.  Atomic replacement ensures
+        concurrent readers always see a consistent snapshot.
+
+        Raises ``RuntimeError`` on any network/HTTP failure so callers treat the
+        result as inconclusive rather than silently missing spools.
+        """
+        try:
+            all_spools = self._req("GET", "/api/v1/spool")
+        except Exception as exc:
+            raise RuntimeError(
+                f"uid_index rebuild: GET /api/v1/spool failed: {exc}"
+            ) from exc
+        if not isinstance(all_spools, list):
+            all_spools = []
+        new_index: dict = {}
+        for spool in all_spools:
+            sid = spool.get("id")
+            if sid is None:
+                continue
+            extra = spool.get("extra") or {}
+            if not isinstance(extra, dict):
+                continue
+            for n in range(1, max_uids + 1):
+                raw_v = extra.get(self.uid_field_name(n))
+                if raw_v is None:
+                    continue
+                uid = self._decode_extra_value(str(raw_v)).strip()
+                if uid:
+                    try:
+                        new_index[uid] = int(sid)
+                    except (TypeError, ValueError):
+                        LOG.debug(
+                            "uid_index: spool id %r is not an integer — skipping",
+                            sid,
+                        )
+        # Atomic replacement.
+        self._uid_index = new_index
+        self._uid_index_built_at = time.monotonic()
+        LOG.debug("uid_index: rebuilt with %d entries", len(new_index))
+
+    def _verify_uid_in_spool(self, spool_id, uid_hex, max_uids):
+        """Verify that *uid_hex* is still present on *spool_id*.
+
+        Fetches ``GET /api/v1/spool/<spool_id>`` and checks every
+        ``rfid_uid_N`` slot for an exact (decoded/normalized) match.
+
+        Returns:
+            ``True``  — UID found in at least one slot.
+            ``False`` — spool returned 404 or UID is absent from all slots.
+
+        Raises ``RuntimeError`` for any HTTP error other than 404, or for
+        network/connection failures, so callers treat the result as
+        inconclusive rather than silently discarding a valid spool.
+        """
+        try:
+            spool = self._req("GET", f"/api/v1/spool/{spool_id}")
+        except url_error.HTTPError as exc:
+            if exc.code == 404:
+                LOG.debug(
+                    "uid_index: verify spool %d → 404 (deleted); evicting uid=%s",
+                    spool_id, uid_hex,
+                )
+                return False
+            raise RuntimeError(
+                f"uid_index: verify GET /api/v1/spool/{spool_id}"
+                f" failed (HTTP {exc.code}): {exc}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"uid_index: verify GET /api/v1/spool/{spool_id} failed: {exc}"
+            ) from exc
+        if not isinstance(spool, dict):
+            return False
+        extra = spool.get("extra") or {}
+        if not isinstance(extra, dict):
+            return False
+        for n in range(1, max_uids + 1):
+            raw_v = extra.get(self.uid_field_name(n))
+            if raw_v is None:
+                continue
+            decoded = self._decode_extra_value(str(raw_v)).strip()
+            if decoded == uid_hex:
+                return True
+        return False
+
     def find_spool_by_uid(self, uid_hex, max_uids):
         """Search Spoolman for a spool whose ``rfid_uid_N`` extra field equals ``uid_hex``.
 
@@ -452,25 +551,30 @@ class SpoolmanClient:
         no spool can possibly hold this UID — create the fields and return ``None``
         immediately to avoid false-positive matches.
 
-        Primary path: queries each numbered slot with the JSON-encoded value (since
-        Spoolman stores extra field values as JSON-encoded strings).  For each hit,
-        the search-response ``extra`` dict is checked inline:
+        When ``use_uid_index`` is enabled the lookup proceeds as follows:
+
+        1. If the in-memory index is fresh (age < ``uid_index_ttl``), look up
+           *uid_hex*.  On a hit, verify via ``GET /api/v1/spool/<id>`` that the UID
+           is still present (handles deleted spools / UID edits).  If verified,
+           return immediately.  If verification fails, evict the entry and continue.
+        2. If the index is stale (or the first lookup missed), rebuild from
+           ``GET /api/v1/spool`` and retry steps 1–2 once.
+        3. If still not found after a fresh rebuild, return ``None`` (the rebuild
+           already confirmed the UID is absent from every spool).
+
+        When ``use_uid_index`` is disabled (default), the primary path queries each
+        numbered slot with the JSON-encoded value.  For each hit the search-response
+        ``extra`` dict is checked inline:
 
         * If the **queried field** is present in the response with a non-matching
           value, Spoolman returned a partial/substring match — the spool is rejected
-          inline without any additional HTTP fetch and added to ``_rejected_ids`` so
-          the same false-positive spool is silently skipped in subsequent slot queries.
+          inline without any additional HTTP fetch.
 
         * If the response ``extra`` does not include the queried field (or ``extra``
-          is absent), the candidate is treated as **not found** immediately — no
-          secondary verification fetch is performed.  This keeps lookup fast even
-          when Spoolman's search endpoint returns many unrelated candidates.
+          is absent), the candidate is treated as **not found** immediately.
 
-        Returns ``None`` if not found.
-
-        Raises ``RuntimeError`` only when an HTTP/network failure makes the slot
-        query itself fail.  Callers must treat this as "unknown — do not
-        auto-create" to avoid duplicate spool creation on transient failures.
+        Raises ``RuntimeError`` on any HTTP/network failure that makes the result
+        inconclusive.  Callers must treat this as "unknown — do not auto-create".
         """
         # Short-circuit: if rfid_uid_N fields don't exist yet, no spool can have
         # this UID — create them now and skip the search entirely.
@@ -481,6 +585,73 @@ class SpoolmanClient:
             )
             self.ensure_rfid_uid_fields(max_uids)
             return None
+
+        # ------------------------------------------------------------------ #
+        # Index-first path (opt-in via use_uid_index flag)                    #
+        # ------------------------------------------------------------------ #
+        if self.use_uid_index:
+            now = time.monotonic()
+            index_fresh = (
+                self._uid_index_built_at > 0
+                and (now - self._uid_index_built_at) < self.uid_index_ttl
+            )
+
+            if index_fresh:
+                sid = self._uid_index.get(uid_hex)
+                if sid is not None:
+                    LOG.debug(
+                        "find_spool_by_uid: uid=%s → index hit spool %d; verifying",
+                        uid_hex, sid,
+                    )
+                    if self._verify_uid_in_spool(sid, uid_hex, max_uids):
+                        LOG.debug(
+                            "find_spool_by_uid: uid=%s verified in spool %d via index",
+                            uid_hex, sid,
+                        )
+                        return sid
+                    # Verification failed — spool deleted or UID changed.
+                    LOG.info(
+                        "find_spool_by_uid: uid=%s index hit spool %d"
+                        " failed verification — evicting and rebuilding index",
+                        uid_hex, sid,
+                    )
+                    self._uid_index.pop(uid_hex, None)
+                    index_fresh = False  # Force rebuild below.
+
+            if not index_fresh:
+                # Rebuild then retry once.
+                LOG.debug("find_spool_by_uid: uid=%s — rebuilding uid index", uid_hex)
+                self._rebuild_uid_index(max_uids)  # raises RuntimeError on failure
+                sid = self._uid_index.get(uid_hex)
+                if sid is not None:
+                    LOG.debug(
+                        "find_spool_by_uid: uid=%s → index hit spool %d"
+                        " after rebuild; verifying",
+                        uid_hex, sid,
+                    )
+                    if self._verify_uid_in_spool(sid, uid_hex, max_uids):
+                        LOG.debug(
+                            "find_spool_by_uid: uid=%s verified in spool %d"
+                            " (post-rebuild)",
+                            uid_hex, sid,
+                        )
+                        return sid
+                    LOG.info(
+                        "find_spool_by_uid: uid=%s post-rebuild index hit spool %d"
+                        " failed verification — evicting",
+                        uid_hex, sid,
+                    )
+                    self._uid_index.pop(uid_hex, None)
+
+            LOG.info(
+                "find_spool_by_uid: uid=%s not found in Spoolman (uid index path)",
+                uid_hex,
+            )
+            return None
+
+        # ------------------------------------------------------------------ #
+        # Slot-query path (default when use_uid_index is False)               #
+        # ------------------------------------------------------------------ #
 
         primary_had_error = False
         # Track spool IDs that were definitively shown not to contain uid_hex so
