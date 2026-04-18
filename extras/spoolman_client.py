@@ -769,7 +769,7 @@ class SpoolmanClient:
                 f"find_spool_by_lot_nr: GET /api/v1/spool?lot_nr={lot_nr} failed: {exc}"
             ) from exc
 
-        items = spools if isinstance(spools, list) else (spools or {}).get("items", [])
+        items = spools if isinstance(spools, list) else (spools.get("items", []) if isinstance(spools, dict) else [])
         for spool in items:
             spool_lot = str(spool.get("lot_nr") or "").strip().upper()
             if spool_lot == lot_nr.strip().upper():
