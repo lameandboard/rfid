@@ -535,9 +535,6 @@ class TestFindSpoolByUid(unittest.TestCase):
             if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
                 # Spoolman returns spool 16 for every slot query (partial match).
                 return [_spool_response(16, {1: different_uid})]
-            if method == "GET" and path == "/api/v1/spool":
-                # Fallback full scan: spool has different_uid, not our UID.
-                return [_spool_response(16, {1: different_uid})]
             return []
 
         client = self._client_with_fields(_req)
@@ -557,8 +554,6 @@ class TestFindSpoolByUid(unittest.TestCase):
             if method == "GET" and "/api/v1/spool/99" in path:
                 secondary_calls.append(path)
                 return _spool_response(99, {1: different_uid})
-            if method == "GET" and path == "/api/v1/spool":
-                return [_spool_response(99, {1: different_uid})]
             return []
 
         client = self._client_with_fields(_req)
@@ -567,11 +562,11 @@ class TestFindSpoolByUid(unittest.TestCase):
                          "Spool 99 must not be fetched at all — rejected inline on first hit")
 
     # ------------------------------------------------------------------
-    # Missing extra in search response → secondary fetch
+    # Missing extra in search response → treated as not found (no secondary fetch)
     # ------------------------------------------------------------------
 
-    def test_secondary_fetch_when_response_has_no_extra(self):
-        """When search response omits extra, a secondary fetch must be performed."""
+    def test_missing_extra_returns_none_without_secondary_fetch(self):
+        """When search response omits extra, return None immediately — no secondary fetch."""
         fetch_calls = []
 
         def _req(method, path, body=None):
@@ -580,63 +575,69 @@ class TestFindSpoolByUid(unittest.TestCase):
                 return [{"id": 5}]
             if method == "GET" and "/api/v1/spool/5" in path:
                 fetch_calls.append(path)
-                # The spool really does contain the UID.
                 return _spool_response(5, {1: self._UID})
             return []
 
         client = self._client_with_fields(_req)
         sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
-        self.assertEqual(sid, 5)
-        self.assertEqual(len(fetch_calls), 1, "One secondary fetch expected")
+        self.assertIsNone(sid, "Missing extra in response must return None, not the spool id")
+        self.assertEqual(len(fetch_calls), 0, "No secondary fetch expected when extra is absent")
 
-    def test_secondary_fetch_miss_returns_none(self):
-        """Secondary fetch that does not find the UID must result in None."""
+    def test_missing_extra_field_returns_none_without_secondary_fetch(self):
+        """When response extra exists but omits the queried field, return None — no secondary fetch."""
+        fetch_calls = []
 
         def _req(method, path, body=None):
             if method == "GET" and "extra[rfid_uid_1]" in path:
-                return [{"id": 5}]
+                # Response has extra dict but queried slot is absent.
+                return [{"id": 5, "extra": {}}]
             if method == "GET" and "/api/v1/spool/5" in path:
-                return _spool_response(5, {1: "DIFFERENTUID"})
-            if method == "GET" and path == "/api/v1/spool":
-                return []
+                fetch_calls.append(path)
+                return _spool_response(5, {1: self._UID})
             return []
 
         client = self._client_with_fields(_req)
         sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
         self.assertIsNone(sid)
+        self.assertEqual(len(fetch_calls), 0, "No secondary fetch expected when queried field absent")
 
     # ------------------------------------------------------------------
-    # Fallback full-spool scan
+    # No fallback scan — slot queries returning empty means not found
     # ------------------------------------------------------------------
 
-    def test_fallback_scan_finds_uid(self):
-        """When all slot queries return empty, fallback scan must find the spool."""
+    def test_no_fallback_scan_when_slot_queries_empty(self):
+        """When all slot queries return empty, return None — no fallback full-spool GET."""
+        fallback_calls = []
 
         def _req(method, path, body=None):
             if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
                 return []  # All per-slot queries return empty.
             if method == "GET" and path == "/api/v1/spool":
+                fallback_calls.append(path)
                 return [_spool_response(42, {1: self._UID})]
             return []
 
         client = self._client_with_fields(_req)
         sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
-        self.assertEqual(sid, 42)
+        self.assertIsNone(sid, "Empty slot queries must return None, not trigger fallback scan")
+        self.assertEqual(len(fallback_calls), 0, "No fallback GET /api/v1/spool expected")
 
-    def test_fallback_scan_with_raw_unencoded_value(self):
-        """Fallback scan must match UIDs stored without JSON encoding (legacy)."""
+    def test_no_fallback_scan_with_raw_unencoded_value(self):
+        """Fallback scan is not performed even for raw-stored UIDs — slot query empty → None."""
+        fallback_calls = []
 
         def _req(method, path, body=None):
             if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
                 return []
             if method == "GET" and path == "/api/v1/spool":
-                # Value stored as raw string without json.dumps (legacy).
+                fallback_calls.append(path)
                 return [{"id": 77, "extra": {"rfid_uid_1": self._UID}}]
             return []
 
         client = self._client_with_fields(_req)
         sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
-        self.assertEqual(sid, 77)
+        self.assertIsNone(sid)
+        self.assertEqual(len(fallback_calls), 0, "No fallback GET /api/v1/spool expected")
 
     def test_not_found_returns_none(self):
         """When the UID is genuinely absent from all spools, must return None."""
@@ -644,9 +645,6 @@ class TestFindSpoolByUid(unittest.TestCase):
         def _req(method, path, body=None):
             if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
                 return []
-            if method == "GET" and path == "/api/v1/spool":
-                return [_spool_response(1, {1: "AABBCCDD"}),
-                        _spool_response(2, {1: "11223344"})]
             return []
 
         client = self._client_with_fields(_req)
@@ -668,34 +666,30 @@ class TestFindSpoolByUid(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             client.find_spool_by_uid(self._UID, self._MAX_UIDS)
 
-    def test_secondary_fetch_error_raises(self):
-        """A network error on the secondary verification fetch must raise RuntimeError."""
+    def test_missing_extra_does_not_raise(self):
+        """When response omits extra, find_spool_by_uid must return None, not raise."""
         def _req(method, path, body=None):
             if method == "GET" and "extra[rfid_uid_1]" in path and "/spool?" in path:
-                # Response omits extra — secondary fetch will be needed.
+                # Response omits extra — previously triggered secondary fetch.
                 return [{"id": 5}]
-            if method == "GET" and "/api/v1/spool/5" in path:
-                raise OSError("timeout")
             return []
 
         client = self._client_with_fields(_req)
-        with self.assertRaises(RuntimeError):
-            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        # Must not raise; secondary fetch is no longer performed.
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid)
 
-    def test_fallback_scan_error_raises(self):
-        """A network error on the fallback full-spool scan must raise RuntimeError."""
-        call_count = [0]
-
+    def test_no_fallback_scan_no_error_on_empty_slot_queries(self):
+        """When all slot queries return empty, return None — no fallback, no RuntimeError."""
         def _req(method, path, body=None):
             if method == "GET" and "extra[rfid_uid_" in path and "/spool?" in path:
-                return []  # All slot queries empty — triggers fallback.
-            if method == "GET" and path == "/api/v1/spool":
-                raise OSError("server error")
+                return []  # All slot queries empty — previously triggered fallback.
             return []
 
         client = self._client_with_fields(_req)
-        with self.assertRaises(RuntimeError):
-            client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        # Must not raise; fallback scan is no longer performed.
+        sid = client.find_spool_by_uid(self._UID, self._MAX_UIDS)
+        self.assertIsNone(sid)
 
     # ------------------------------------------------------------------
     # _decode_extra_value helper

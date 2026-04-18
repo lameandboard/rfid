@@ -461,19 +461,15 @@ class SpoolmanClient:
           inline without any additional HTTP fetch and added to ``_rejected_ids`` so
           the same false-positive spool is silently skipped in subsequent slot queries.
 
-        * If the response ``extra`` does not include the queried field, a single
-          secondary GET fetch is performed to verify; this handles the (rare) case
-          where the search API omits extra-field values from its response.
-
-        Fallback path: if all per-slot queries return empty or only false-positives,
-        fetches all spools and scans their ``extra`` dicts in Python, decoding
-        JSON-encoded values with a fallback to the raw string.
+        * If the response ``extra`` does not include the queried field (or ``extra``
+          is absent), the candidate is treated as **not found** immediately — no
+          secondary verification fetch is performed.  This keeps lookup fast even
+          when Spoolman's search endpoint returns many unrelated candidates.
 
         Returns ``None`` if not found.
 
-        Raises ``RuntimeError`` when any HTTP/network failure makes the result
-        inconclusive (slot query error, secondary verification fetch error, or
-        fallback scan error).  Callers must treat this as "unknown — do not
+        Raises ``RuntimeError`` only when an HTTP/network failure makes the slot
+        query itself fail.  Callers must treat this as "unknown — do not
         auto-create" to avoid duplicate spool creation on transient failures.
         """
         # Short-circuit: if rfid_uid_N fields don't exist yet, no spool can have
@@ -549,33 +545,11 @@ class SpoolmanClient:
                             continue
 
                     # The response either has no extra dict or did not include the
-                    # queried field.  Fall back to one secondary fetch to verify.
+                    # queried field — treat as not found inline; no secondary fetch.
                     LOG.debug(
-                        "find_spool_by_uid: spool %d — response missing %s;"
-                        " secondary fetch needed to verify uid=%s",
+                        "find_spool_by_uid: spool %d — response missing extra"
+                        " or queried field %s; treating as not found (uid=%s)",
                         candidate_id, field_key, uid_hex,
-                    )
-                    try:
-                        slots = self.get_uid_slots(candidate_id, max_uids)
-                    except Exception as verify_exc:
-                        LOG.warning(
-                            "find_spool_by_uid: secondary fetch for spool %d"
-                            " failed: %s — lookup is inconclusive",
-                            candidate_id, verify_exc,
-                        )
-                        raise
-                    if slots and uid_hex in slots.values():
-                        LOG.debug(
-                            "find_spool_by_uid: uid=%s confirmed in spool %d"
-                            " via secondary fetch",
-                            uid_hex, candidate_id,
-                        )
-                        return candidate_id
-                    LOG.info(
-                        "find_spool_by_uid: spool %d secondary fetch slots=%r —"
-                        " uid=%s not present; spool rejected",
-                        candidate_id, list(slots.values()) if slots else [],
-                        uid_hex,
                     )
                     _rejected_ids.add(candidate_id)
             except Exception as exc:
@@ -588,51 +562,13 @@ class SpoolmanClient:
         if primary_had_error:
             raise RuntimeError(
                 f"find_spool_by_uid: Spoolman lookup for uid={uid_hex} was inconclusive"
-                " (one or more slot queries or secondary fetches failed) —"
+                " (one or more slot queries failed) —"
                 " treating as error, not miss"
             )
 
-        # Fallback: fetch all spools and scan rfid_uid_N values in Python.
-        # This handles legacy entries where the search index may not have been
-        # updated, and covers Spoolman versions that do not index extra fields.
-        LOG.debug(
-            "find_spool_by_uid: no match in %d slot queries for uid=%s"
-            " — running fallback full-spool scan",
-            max_uids, uid_hex,
-        )
-        try:
-            all_spools = self._req("GET", "/api/v1/spool") or []
-            if isinstance(all_spools, list):
-                for spool in all_spools:
-                    extra = spool.get("extra") or {}
-                    if not isinstance(extra, dict):
-                        continue
-                    for n in range(1, max_uids + 1):
-                        raw_v = extra.get(self.uid_field_name(n))
-                        if raw_v is None:
-                            continue
-                        if self._decode_extra_value(raw_v) == uid_hex:
-                            spool_id_val = spool.get("id")
-                            if spool_id_val is not None:
-                                LOG.debug(
-                                    "find_spool_by_uid: uid=%s found in spool %d"
-                                    " via fallback full-spool scan",
-                                    uid_hex, spool_id_val,
-                                )
-                                return int(spool_id_val)
-        except Exception as exc:
-            LOG.warning(
-                "find_spool_by_uid fallback scan failed: %s — lookup is inconclusive",
-                exc,
-            )
-            raise RuntimeError(
-                f"find_spool_by_uid: fallback full-spool scan for uid={uid_hex} failed:"
-                f" {exc}"
-            ) from exc
         LOG.info(
             "find_spool_by_uid: uid=%s not found in Spoolman"
-            " (checked %d slot queries + fallback scan;"
-            " false-positives rejected: %d)",
+            " (checked %d slot queries; false-positives rejected: %d)",
             uid_hex, max_uids, len(_rejected_ids),
         )
         return None
