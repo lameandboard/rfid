@@ -12,7 +12,7 @@ Run with:
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
 # Path and module stubs: must happen before importing extras.rfid
