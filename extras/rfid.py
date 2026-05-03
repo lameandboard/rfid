@@ -2240,22 +2240,26 @@ class Rfid:
     def _prepare_lane_for_explicit_write(self, lane: str, reason: str = "explicit_write") -> None:
         """Prepare a lane for a user-initiated write command.
 
-        Clears any commit-freeze (``_commit_in_progress``) and stops any
-        active scan timer for the lane.  This prevents ``_scan_once`` from
-        being skipped by the commit-freeze guard when the user runs
+        Clears any commit-freeze (``_commit_in_progress``), drops any stale
+        pending scan result for the lane (``_pending``), and stops any active
+        scan timer for the lane.  This prevents ``_scan_once`` from being
+        skipped by the commit-freeze guard when the user runs
         ``RFID_WRITE`` or ``RFID_BAMBU_WRITE`` on a lane that was left frozen
-        by a previous scan/commit cycle.
+        by a previous scan/commit cycle, and also prevents an older scan
+        result from being committed after the explicit write completes.
 
         Must be called from the reactor thread (same as all other scan-path
         helpers).
         """
         had_freeze = self._commit_in_progress.pop(lane, None) is not None
+        had_pending = self._pending.pop(lane, None) is not None
         had_timer = lane in self._scan_timers
         if had_timer:
             self._end_scan_session(lane, reason=reason)
-        if had_freeze or had_timer:
+        if had_freeze or had_pending or had_timer:
             cleared = " ".join(filter(None, [
                 "commit_freeze" if had_freeze else None,
+                "pending_commit" if had_pending else None,
                 "scan_timer" if had_timer else None,
             ]))
             self._debug(
