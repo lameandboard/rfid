@@ -2160,6 +2160,31 @@ class Rfid:
             self.reactor.unregister_timer(existing)
         self._clear_scan_state(lane, reason)
 
+    def _prepare_lane_for_explicit_write(self, lane: str, reason: str = "explicit_write") -> None:
+        """Prepare a lane for a user-initiated write command.
+
+        Clears any commit-freeze (``_commit_in_progress``) and stops any
+        active scan timer for the lane.  This prevents ``_scan_once`` from
+        being skipped by the commit-freeze guard when the user runs
+        ``RFID_WRITE`` or ``RFID_BAMBU_WRITE`` on a lane that was left frozen
+        by a previous scan/commit cycle.
+
+        Must be called from the reactor thread (same as all other scan-path
+        helpers).
+        """
+        had_freeze = self._commit_in_progress.pop(lane, None) is not None
+        had_timer = lane in self._scan_timers
+        if had_timer:
+            self._end_scan_session(lane, reason=reason)
+        if had_freeze or had_timer:
+            cleared = " ".join(filter(None, [
+                "commit_freeze" if had_freeze else None,
+                "scan_timer" if had_timer else None,
+            ]))
+            self._debug(
+                f"rfid[{self.name}]: {reason} cleared lane={lane} cleared={cleared}"
+            )
+
     def _freeze_lane_async(self, lane: str, reason: str = "") -> None:
         """Thread-safe: freeze a lane from a background thread via reactor callback.
 
@@ -3708,6 +3733,11 @@ class Rfid:
 
         reader._debug(f"rfid[{reader.name}]: RFID_WRITE port={port} spool_id={spool_id}")
 
+        # Clear any commit-freeze and stop any active scan timer before scanning.
+        # A previous scan/commit cycle may have left _commit_in_progress=True for
+        # this lane, which would cause _scan_once to return immediately with no UID.
+        reader._prepare_lane_for_explicit_write(port, reason="RFID_WRITE")
+
         # 1. Scan the lane once to detect the tag and get its UID.
         # Use _scan_once directly — we only need the UID, not a full spoolman_id
         # parse, and we want to avoid the timer-based scan window (and its latency)
@@ -3847,6 +3877,11 @@ class Rfid:
         reader._debug(
             f"rfid[{reader.name}]: RFID_BAMBU_WRITE port={port} tray_uid={tray_uid}"
         )
+
+        # Clear any commit-freeze and stop any active scan timer before scanning.
+        # A previous scan/commit cycle may have left _commit_in_progress=True for
+        # this lane, which would cause _scan_once to return immediately with no UID.
+        reader._prepare_lane_for_explicit_write(port, reason="RFID_BAMBU_WRITE")
 
         # Scan to detect the tag and get its hardware UID.
         # Use _scan_once with minimal pages — we only need the UID, not NDEF data.
