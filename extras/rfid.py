@@ -2254,10 +2254,12 @@ class Rfid:
         if had_timer:
             self._end_scan_session(lane, reason=reason)
         if had_freeze or had_timer:
+            cleared = " ".join(filter(None, [
+                "commit_freeze" if had_freeze else None,
+                "scan_timer" if had_timer else None,
+            ]))
             self._debug(
-                f"rfid[{self.name}]: {reason} cleared lane={lane}"
-                + (" commit_freeze" if had_freeze else "")
-                + (" scan_timer" if had_timer else "")
+                f"rfid[{self.name}]: {reason} cleared lane={lane} cleared={cleared}"
             )
 
     def _freeze_lane_async(self, lane: str, reason: str = "") -> None:
