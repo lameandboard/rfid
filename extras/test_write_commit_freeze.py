@@ -135,6 +135,20 @@ class TestPrepareLaneForExplicitWrite(unittest.TestCase):
         # Should not raise
         self.rfid._prepare_lane_for_explicit_write(self.lane, reason="test")
 
+    def test_clears_stale_pending(self):
+        """_prepare_lane_for_explicit_write must clear any stale _pending entry for the lane."""
+        self.rfid._pending[self.lane] = {
+            "lane": self.lane,
+            "spoolman_id": 99,
+            "uid_hex": "CAFEBABE",
+        }
+        self.rfid._prepare_lane_for_explicit_write(self.lane, reason="test")
+        self.assertNotIn(
+            self.lane,
+            self.rfid._pending,
+            "_pending must be cleared by _prepare_lane_for_explicit_write",
+        )
+
     def test_clears_freeze_and_timer_together(self):
         """_prepare_lane_for_explicit_write must handle both freeze and timer at once."""
         self.rfid._commit_in_progress[self.lane] = True
@@ -297,6 +311,24 @@ class TestRfidBambuWriteClearsCommitFreeze(unittest.TestCase):
         gcmd = _make_gcmd(lane="2")
         self.rfid.cmd_RFID_BAMBU_WRITE(gcmd)
 
+        self.rfid._scan_once.assert_called_once_with(self.port, max_pages=4)
+
+    def test_stale_pending_cleared_by_explicit_bambu_write(self):
+        """cmd_RFID_BAMBU_WRITE must discard any stale pending assignment from a prior scan."""
+        self.rfid._pending[self.port] = {
+            "lane": self.port,
+            "spoolman_id": 7,
+            "uid_hex": "DEADBEEF",
+        }
+
+        gcmd = _make_gcmd(lane="2")
+        self.rfid.cmd_RFID_BAMBU_WRITE(gcmd)
+
+        self.assertNotIn(
+            self.port,
+            self.rfid._pending,
+            "RFID_BAMBU_WRITE must clear stale _pending state so an old scan cannot commit later",
+        )
         self.rfid._scan_once.assert_called_once_with(self.port, max_pages=4)
 
     def test_active_scan_timer_stopped_before_scan(self):
