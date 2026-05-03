@@ -200,6 +200,24 @@ class TestRfidWriteClearsCommitFreeze(unittest.TestCase):
 
         self.rfid._scan_once.assert_called_once_with(self.port, max_pages=4)
 
+    def test_stale_pending_scan_cleared_by_explicit_write(self):
+        """cmd_RFID_WRITE must discard any stale pending assignment from a prior scan."""
+        self.rfid._pending[self.port] = {
+            "lane": self.port,
+            "spoolman_id": 7,
+            "uid_hex": "DEADBEEF",
+        }
+
+        gcmd = _make_gcmd(lane="2", spool_id=42)
+        self.rfid.cmd_RFID_WRITE(gcmd)
+
+        self.assertNotIn(
+            self.port,
+            self.rfid._pending,
+            "RFID_WRITE must clear stale _pending state so an old scan cannot commit later",
+        )
+        self.rfid._scan_once.assert_called_once_with(self.port, max_pages=4)
+
     def test_scan_once_called_without_prior_freeze(self):
         """cmd_RFID_WRITE must also call _scan_once when no freeze was active."""
         # Ensure no freeze is set
