@@ -111,6 +111,20 @@ from typing import Optional
 
 _log = logging.getLogger("rfid.tag_parser")
 
+
+def _make_trace(trace):
+    if trace is None:
+        return lambda level, msg, *args: None
+
+    def _emit(level, msg, *args):
+        try:
+            trace(level, msg, *args)
+        except Exception:
+            pass
+
+    return _emit
+
+
 # ---------------------------------------------------------------------------
 # pycryptodome – optional; required for Bambu Lab key derivation
 # ---------------------------------------------------------------------------
@@ -1111,14 +1125,51 @@ def _try_opentag3d(mime_type: str, payload: bytes) -> Optional[dict]:
 
 # ---- OpenSpool -------------------------------------------------------------
 
-def _try_openspool(text: str) -> Optional[dict]:
+_SMART_JSON_QUOTES = {
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u201f": '"',
+}
+
+
+def _loads_json_text(text: str, trace=None) -> tuple[Optional[dict], bool]:
+    """Load JSON text, accepting common copy/paste punctuation from UIs."""
+    trace = _make_trace(trace)
+    raw = text.strip()
+    try:
+        data = json.loads(raw)
+        return (data, False) if isinstance(data, dict) else (None, False)
+    except Exception:
+        pass
+
+    has_smart_quotes = any(ch in raw for ch in _SMART_JSON_QUOTES)
+    has_field_semicolon = re.search(r';\s*"\w+"\s*:', raw) is not None
+    if not has_smart_quotes and not has_field_semicolon:
+        return None, False
+
+    normalized = raw
+    for bad, good in _SMART_JSON_QUOTES.items():
+        normalized = normalized.replace(bad, good)
+    normalized = re.sub(r';\s*("\w+"\s*:)', r',\1', normalized)
+    try:
+        data = json.loads(normalized)
+        if isinstance(data, dict):
+            trace("info", "normalized nonstandard JSON punctuation")
+            return data, True
+    except Exception as exc:
+        _log.debug("rfid: JSON parse failed after quote normalization: %s", exc)
+    return None, True
+
+
+def _try_openspool(text: str, trace=None) -> Optional[dict]:
     """Parse an OpenSpool JSON payload.
 
     Detection: JSON dict with "protocol": "openspool".
     """
-    try:
-        data = json.loads(text)
-    except Exception:
+    trace = _make_trace(trace)
+    data, normalized_quotes = _loads_json_text(text, trace)
+    if data is None:
         return None
     if not isinstance(data, dict):
         return None
@@ -1134,6 +1185,8 @@ def _try_openspool(text: str) -> Optional[dict]:
         "brand": str(data.get("brand", "Generic")).strip(),
         "tag_format": "openspool",
     }
+    if normalized_quotes:
+        info["parse_warning"] = "normalized nonstandard JSON punctuation"
     ch = str(data.get("color_hex", "")).strip().lstrip("#")
     if ch:
         info["color_hex"] = ch.upper()
@@ -1319,11 +1372,11 @@ _GENERIC_JSON_FIELDS = {
 }
 
 
-def _try_generic_ndef_json(text: str) -> Optional[dict]:
+def _try_generic_ndef_json(text: str, trace=None) -> Optional[dict]:
     """Parse a generic NDEF text record that contains JSON filament data."""
-    try:
-        data = json.loads(text.strip())
-    except Exception:
+    trace = _make_trace(trace)
+    data, normalized_quotes = _loads_json_text(text, trace)
+    if data is None:
         return None
     if not isinstance(data, dict):
         return None
@@ -1344,6 +1397,8 @@ def _try_generic_ndef_json(text: str) -> Optional[dict]:
         return None
 
     info: dict = {"material": material, "tag_format": "generic_ndef_json"}
+    if normalized_quotes:
+        info["parse_warning"] = "normalized nonstandard JSON punctuation"
 
     brand = str(data.get("brand", "") or "").strip()
     if brand:
@@ -1380,7 +1435,7 @@ def _try_generic_ndef_json(text: str) -> Optional[dict]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
+def parse_tag(raw, uid_hex: Optional[str] = None, trace=None) -> Optional[dict]:
     """Detect tag format and return a normalized filament_info dict, or None.
 
     Parameters
@@ -1414,23 +1469,29 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
         writable: bool         False for Bambu (RSA-signed, read-only)
     or None if the format is unrecognised or the tag cannot be parsed.
     """
+    trace = _make_trace(trace)
     # --- Authenticated MIFARE Classic block dict (from read_authenticated_blocks) ---
     if isinstance(raw, dict):
         blocks = raw.get("blocks") or {}
         uid_bytes = raw.get("uid_bytes")
+        trace("debug", "parse_tag: authenticated block input uid=%s block_count=%d",
+              uid_hex or "unknown", len(blocks))
         if blocks:
             # Try Bambu block layout — _parse_bambu_blocks() is pure Python and
             # does not require pycryptodome (only key derivation does).
             try:
+                trace("debug", "parse_tag: trying Bambu block layout")
                 result = _parse_bambu_blocks(blocks)
                 if result is not None:
                     _log.debug(
                         "rfid: parsed Bambu Lab blocks uid=%s",
                         uid_hex or "unknown",
                     )
+                    trace("info", "parse_tag: matched Bambu Lab blocks")
                     return result
             except Exception as exc:
                 _log.debug("rfid: Bambu block parse error: %s", exc)
+                trace("debug", "parse_tag: Bambu block parse error: %s", exc)
             # Build a flat byte string for Creality/QIDI parsers.
             # Use a fixed-size buffer indexed by absolute block number so that
             # block N always starts at offset N * 16, even if some blocks were
@@ -1453,81 +1514,109 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
             else:
                 flat_blocks = b""
             # Try Creality CFS (block-based)
+            trace("debug", "parse_tag: trying Creality CFS blocks")
             result = _try_creality_cfs(flat_blocks)
             if result is not None:
                 _log.debug("rfid: parsed Creality CFS blocks uid=%s", uid_hex or "unknown")
+                trace("info", "parse_tag: matched Creality CFS blocks")
                 return result
             # Try QIDI Box (block-based)
+            trace("debug", "parse_tag: trying QIDI Box blocks")
             result = _try_qidi_box(flat_blocks)
             if result is not None:
                 _log.debug("rfid: parsed QIDI Box blocks uid=%s", uid_hex or "unknown")
+                trace("info", "parse_tag: matched QIDI Box blocks")
                 return result
+        trace("info", "parse_tag: no authenticated block parser matched")
         return None
 
     # --- Raw bytes path ---
     # Each format is tried exactly once in priority order; the first successful
     # parse is returned immediately.  No format is re-attempted or double-decoded.
     if not raw:
+        trace("info", "parse_tag: no raw data")
         return None
 
     uid_info = f" uid={uid_hex}" if uid_hex else ""
+    trace("debug", "parse_tag: raw byte input uid=%s raw_len=%d",
+          uid_hex or "unknown", len(raw))
 
     # 1 — ELEGOO binary
+    trace("debug", "parse_tag: trying ELEGOO binary")
     result = _try_elegoo(raw)
     if result is not None:
         _log.debug("rfid: parsed ELEGOO tag%s", uid_info)
+        trace("info", "parse_tag: matched ELEGOO")
         return result
 
     # 2 — Anycubic ACE binary
+    trace("debug", "parse_tag: trying Anycubic ACE binary")
     result = _try_anycubic_ace(raw)
     if result is not None:
         _log.debug("rfid: parsed Anycubic ACE tag%s", uid_info)
+        trace("info", "parse_tag: matched Anycubic ACE")
         return result
 
     # 3 — NDEF-based formats (OpenTag3D, OpenSpool, OpenPrintTag, URL, JSON)
     ndef_bytes = _find_ndef_tlv(raw)
     if ndef_bytes is not None:
         records = _parse_ndef_records(ndef_bytes)
+        trace("debug", "parse_tag: found NDEF TLV length=%d records=%d",
+              len(ndef_bytes), len(records))
 
         # 3a — MIME type records (OpenTag3D, OpenPrintTag)
         for mime_type, payload in _get_ndef_mime_records(records):
+            trace("debug", "parse_tag: trying NDEF MIME %s payload_len=%d",
+                  mime_type, len(payload))
             result = _try_opentag3d(mime_type, payload)
             if result is not None:
                 _log.debug("rfid: parsed OpenTag3D tag%s", uid_info)
+                trace("info", "parse_tag: matched OpenTag3D")
                 return result
             result = _try_openprinttag(mime_type, payload)
             if result is not None:
                 _log.debug("rfid: parsed OpenPrintTag tag%s", uid_info)
+                trace("info", "parse_tag: matched OpenPrintTag")
                 return result
 
         # 3b — Text/URI records
         for text in _extract_text_from_records(records):
             # OpenSpool JSON
-            result = _try_openspool(text)
+            trace("debug", "parse_tag: trying NDEF text/URI length=%d", len(text))
+            result = _try_openspool(text, trace=trace)
             if result is not None:
                 _log.debug("rfid: parsed OpenSpool tag%s", uid_info)
+                trace("info", "parse_tag: matched OpenSpool")
                 return result
             # SimplyPrint / QIDI URL
             result = _try_simplyprint_url(text)
             if result is not None:
                 _log.debug("rfid: parsed SimplyPrint URL tag%s", uid_info)
+                trace("info", "parse_tag: matched SimplyPrint URL")
                 return result
             # Generic NDEF JSON
-            result = _try_generic_ndef_json(text)
+            result = _try_generic_ndef_json(text, trace=trace)
             if result is not None:
                 _log.debug("rfid: parsed generic NDEF JSON tag%s", uid_info)
+                trace("info", "parse_tag: matched generic NDEF JSON")
                 return result
+    else:
+        trace("debug", "parse_tag: no NDEF TLV found")
 
     # 4 — Creality CFS (MIFARE Classic hex-encoded ASCII)
+    trace("debug", "parse_tag: trying Creality CFS raw bytes")
     result = _try_creality_cfs(raw)
     if result is not None:
         _log.debug("rfid: parsed Creality CFS tag%s", uid_info)
+        trace("info", "parse_tag: matched Creality CFS")
         return result
 
     # 5 — QIDI Box (MIFARE Classic binary codes)
+    trace("debug", "parse_tag: trying QIDI Box raw bytes")
     result = _try_qidi_box(raw)
     if result is not None:
         _log.debug("rfid: parsed QIDI Box tag%s", uid_info)
+        trace("info", "parse_tag: matched QIDI Box")
         return result
 
     # 6 — Bambu Lab (encrypted raw dump — only detectable, cannot decrypt without auth)
@@ -1540,6 +1629,7 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
             "rfid: Bambu Lab tag detected in raw dump%s — "
             "use authenticated read for full data", uid_info
         )
+        trace("info", "parse_tag: detected Bambu raw dump without authenticated data")
         return {
             "error": (
                 "Detected Bambu Lab tag but decryption/authentication not available; "
@@ -1553,22 +1643,27 @@ def parse_tag(raw, uid_hex: Optional[str] = None) -> Optional[dict]:
     try:
         text = raw.decode("utf-8", errors="ignore").strip("\x00").strip()
         if text:
-            result = _try_openspool(text)
+            trace("debug", "parse_tag: trying raw UTF-8 fallback length=%d", len(text))
+            result = _try_openspool(text, trace=trace)
             if result is not None:
                 _log.debug("rfid: parsed OpenSpool (raw UTF-8) tag%s", uid_info)
+                trace("info", "parse_tag: matched OpenSpool raw UTF-8")
                 return result
             result = _try_simplyprint_url(text)
             if result is not None:
                 _log.debug("rfid: parsed SimplyPrint URL (raw UTF-8) tag%s", uid_info)
+                trace("info", "parse_tag: matched SimplyPrint URL raw UTF-8")
                 return result
-            result = _try_generic_ndef_json(text)
+            result = _try_generic_ndef_json(text, trace=trace)
             if result is not None:
                 _log.debug("rfid: parsed generic JSON (raw UTF-8) tag%s", uid_info)
+                trace("info", "parse_tag: matched generic JSON raw UTF-8")
                 return result
     except Exception:
         pass
 
     _log.debug("rfid: unrecognised tag format%s raw_len=%d", uid_info, len(raw))
+    trace("info", "parse_tag: unrecognised tag format raw_len=%d", len(raw))
     return None
 
 
@@ -1711,4 +1806,3 @@ def is_parse_error(info: Optional[dict]) -> bool:
     from a successful parse that contains actionable filament data.
     """
     return isinstance(info, dict) and bool(info.get("error"))
-
