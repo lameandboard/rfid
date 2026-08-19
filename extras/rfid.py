@@ -163,6 +163,7 @@ except ImportError:
 
 _LOGGERS = {}
 _GLOBAL_CMDS_ATTR = "_rfid_global_registered"
+_TOOLCHANGE_GUARD_ATTR = "_rfid_toolchange_guard"
 _LOG_PATH = os.path.expanduser("~/printer_data/logs/rfid.log")
 _CACHE_PATH = os.path.expanduser("~/RFID/cache/rfid_uid_cache.json")
 
@@ -173,6 +174,10 @@ _ASYNC_MIN_DELAY = 0.010  # 10 ms
 
 # How long to wait before retrying a failed Spoolman fallback lookup in _handle_lane_loaded.
 _SPOOLMAN_RETRY_DELAY_S = 3.0
+
+# Extra safety margin for the AFC/RFID busy guard so deferred toolchanges are
+# eventually released even if a lane_loaded/commit callback never arrives.
+_RFID_BUSY_TIMEOUT_PAD_S = 5.0
 
 # How long (seconds) a deferred UID saved at scan-window expiry remains valid for use
 # by a subsequent lane_loaded event.  Prevents stale UIDs from being applied to a later
@@ -471,6 +476,8 @@ class Rfid:
         # when the scan window timer expired before the lane_loaded event arrived.
         # Format: lane -> {"last_uid": str|None, "seen_uids": set, "ts": float}
         self._deferred_uid: dict[str, dict] = {}
+        self._toolchange_guard = self._get_toolchange_guard_state()
+        self._rfid_busy: dict[str, dict] = self._toolchange_guard["busy_lanes"]
         # Per-window failure cache for Classic authenticated reads.
         # Prevents repeated attempts for the same UID when auth/read already
         # failed earlier in the same scan window.
@@ -650,6 +657,175 @@ class Rfid:
         """Verbose trace: always written to log file; NEVER printed to console.
         Use for high-frequency per-tick/per-tag hardware trace messages."""
         self._log.info(msg)
+
+    def _get_toolchange_guard_state(self) -> dict:
+        guard = getattr(self.printer, _TOOLCHANGE_GUARD_ATTR, None)
+        if not isinstance(guard, dict):
+            guard = {
+                "busy_lanes": {},
+                "busy_timers": {},
+                "busy_tokens": {},
+                "deferred_toolchanges": [],
+                "toolchange_handlers": {},
+                "installed": False,
+            }
+            setattr(self.printer, _TOOLCHANGE_GUARD_ATTR, guard)
+        return guard
+
+    def _rfid_busy_timeout_s(self) -> float:
+        return (
+            max(self.event_timeout, self.scan_window)
+            + self.scan_window
+            + self._spoolman_timeout
+            + _SPOOLMAN_RETRY_DELAY_S
+            + _RFID_BUSY_TIMEOUT_PAD_S
+        )
+
+    def _install_toolchange_guards(self) -> None:
+        guard = self._toolchange_guard
+        if guard.get("installed"):
+            return
+        handlers = getattr(self.gcode, "ready_gcode_handlers", None)
+        if not isinstance(handlers, dict):
+            self._debug(
+                f"rfid[{self.name}]: toolchange guard install skipped"
+                " (gcode.ready_gcode_handlers unavailable)"
+            )
+            return
+        help_map = getattr(self.gcode, "gcode_help", None)
+        wrapped = 0
+        for cmd in sorted(list(handlers)):
+            if not re.fullmatch(r"T\d+", str(cmd)):
+                continue
+            try:
+                desc = help_map.get(cmd) if isinstance(help_map, dict) else None
+                original = self.gcode.register_command(cmd, None)
+                if original is None:
+                    continue
+                guard["toolchange_handlers"][cmd] = original
+                self.gcode.register_command(
+                    cmd,
+                    self._make_toolchange_guard(cmd, original),
+                    desc=desc,
+                )
+                wrapped += 1
+            except Exception as exc:
+                self._log.warning(
+                    "rfid[%s]: failed to install toolchange guard for %s: %s",
+                    self.name, cmd, exc,
+                )
+        if wrapped:
+            guard["installed"] = True
+            self._respond(
+                f"rfid[{self.name}]: AFC/RFID toolchange guard installed"
+                f" for {wrapped} toolchange command(s)"
+            )
+
+    def _make_toolchange_guard(self, cmd: str, original):
+        def _guarded(gcmd, _cmd=cmd, _original=original):
+            if self._rfid_busy:
+                script = self._extract_toolchange_script(gcmd, _cmd)
+                self._toolchange_guard["deferred_toolchanges"].append(script)
+                busy_lanes = ", ".join(sorted(self._rfid_busy))
+                self._respond(
+                    f"RFID: AFC/RFID busy on {busy_lanes}; deferring toolchange"
+                    f" '{script}' until scan/commit completes"
+                )
+                return
+            return _original(gcmd)
+        return _guarded
+
+    def _extract_toolchange_script(self, gcmd, cmd: str) -> str:
+        getter = getattr(gcmd, "get_commandline", None)
+        if callable(getter):
+            try:
+                line = str(getter() or "").strip()
+                if line:
+                    return line
+            except Exception:
+                pass
+        getter = getattr(gcmd, "get_raw_command_parameters", None)
+        if callable(getter):
+            try:
+                params = str(getter() or "").strip()
+                if params:
+                    return f"{cmd} {params}".strip()
+            except Exception:
+                pass
+        return cmd
+
+    def _mark_rfid_busy(self, lane: str, reason: str) -> None:
+        self._install_toolchange_guards()
+        guard = self._toolchange_guard
+        token = int(guard["busy_tokens"].get(lane, 0)) + 1
+        guard["busy_tokens"][lane] = token
+        existing = guard["busy_timers"].pop(lane, None)
+        if existing is not None:
+            self.reactor.unregister_timer(existing)
+        timeout_s = self._rfid_busy_timeout_s()
+        deadline = self.reactor.monotonic() + timeout_s
+        self._rfid_busy[lane] = {
+            "reason": reason,
+            "since": time.time(),
+            "deadline": deadline,
+        }
+        handle = self.reactor.register_timer(
+            lambda event_time, _lane=lane, _token=token:
+                self._rfid_busy_timeout_callback(_lane, event_time, _token),
+            deadline,
+        )
+        guard["busy_timers"][lane] = handle
+        self._respond(
+            f"RFID: AFC/RFID scan started for {lane}"
+            f" ({reason}); toolchanges deferred"
+        )
+
+    def _clear_rfid_busy(self, lane: str, reason: str) -> None:
+        guard = self._toolchange_guard
+        token = int(guard["busy_tokens"].get(lane, 0)) + 1
+        guard["busy_tokens"][lane] = token
+        handle = guard["busy_timers"].pop(lane, None)
+        if handle is not None:
+            self.reactor.unregister_timer(handle)
+        state = self._rfid_busy.pop(lane, None)
+        if state is None:
+            return
+        self._respond(
+            f"RFID: AFC/RFID flow finished for {lane}"
+            f" ({state.get('reason')} -> {reason})"
+        )
+        if not self._rfid_busy:
+            self._flush_deferred_toolchanges()
+
+    def _flush_deferred_toolchanges(self) -> None:
+        guard = self._toolchange_guard
+        if self._rfid_busy:
+            return
+        queued = list(guard["deferred_toolchanges"])
+        if not queued:
+            return
+        guard["deferred_toolchanges"].clear()
+
+        def _run_deferred(event_time):
+            for script in queued:
+                self._respond(
+                    f"RFID: AFC/RFID idle; executing deferred toolchange '{script}'"
+                )
+                self.gcode.run_script_from_command(script)
+
+        self.reactor.register_async_callback(_run_deferred)
+
+    def _rfid_busy_timeout_callback(self, lane: str, event_time: float, token: int) -> float:
+        if token != int(self._toolchange_guard["busy_tokens"].get(lane, -1)):
+            return self.reactor.NEVER
+        if lane not in self._rfid_busy:
+            return self.reactor.NEVER
+        self._respond(
+            f"RFID: AFC/RFID busy timeout expired for {lane};"
+            " clearing toolchange guard"
+        )
+        self._clear_rfid_busy(lane, reason="busy_timeout")
+        return self.reactor.NEVER
 
     # ---------- driver init ----------
     def _wire_reader(self, reader) -> None:
@@ -2257,6 +2433,8 @@ class Rfid:
         if had_timer:
             self._end_scan_session(lane, reason=reason)
         if had_freeze or had_pending or had_timer:
+            self._clear_rfid_busy(lane, reason=reason)
+        if had_freeze or had_pending or had_timer:
             cleared = " ".join(filter(None, [
                 "commit_freeze" if had_freeze else None,
                 "pending_commit" if had_pending else None,
@@ -2279,6 +2457,7 @@ class Rfid:
         def _do_freeze(event_time):
             self._commit_in_progress[_lane] = True
             self._end_scan_session(_lane, reason=_reason)
+            self._clear_rfid_busy(_lane, reason=_reason or "freeze")
         self.reactor.register_async_callback(_do_freeze)
 
     # ---------- timer engine ----------
@@ -2303,6 +2482,7 @@ class Rfid:
         # Discard any deferred UID from a previous scan window so it is never
         # applied to the newly-starting window's lane_loaded event.
         self._deferred_uid.pop(lane, None)
+        self._mark_rfid_busy(lane, reason="scan_window_open")
         self._scan_deadlines[lane] = self.reactor.monotonic() + self.scan_window
         # Initialise fresh per-window state.
         self._scan_blocked_uids[lane] = set()
@@ -2835,6 +3015,8 @@ class Rfid:
                     f"RFID: scan window expired for lane {lane}"
                     f" reader={self.name} ticks={ticks} no_tag_streak={streak} — no tag found"
                 )
+                if lane not in self._pending:
+                    self._clear_rfid_busy(lane, reason="scan_window_expired")
                 return self.reactor.NEVER
 
             next_delay = max(_ASYNC_MIN_DELAY, self.scan_delay)
@@ -2845,6 +3027,7 @@ class Rfid:
             )
             self._scan_timers.pop(lane, None)
             self._clear_scan_state(lane, reason="callback_exception")
+            self._clear_rfid_busy(lane, reason="scan_callback_exception")
             return self.reactor.NEVER
 
     def _handle_klippy_flush(self) -> None:
@@ -2904,6 +3087,7 @@ class Rfid:
                     self._spoolman_executor = concurrent.futures.ThreadPoolExecutor(
                         max_workers=2, thread_name_prefix="rfid_spoolman"
                     )
+        self._install_toolchange_guards()
 
     def _handle_lane_prep_start(self, lane_obj) -> None:
         self._debug_verbose(
@@ -3176,6 +3360,7 @@ class Rfid:
                     self._spoolman_run_async(_fallback_work)
                     return  # commit (or abort) will happen asynchronously from _on_spoolman_result
                 self._debug(f"rfid[{self.name}]: lane_loaded but no pending scan for {lane}, skipping commit")
+                self._clear_rfid_busy(lane, reason="lane_loaded_no_pending")
                 return
             # Flush any new UID→spoolman_id mappings learned during this scan window.
             _flush_uid_cache_if_dirty()
@@ -3423,6 +3608,7 @@ class Rfid:
         if result is None:
             self._pending.pop(port, None)
             self._respond(f"RFID: no tag found for {port}")
+            self._clear_rfid_busy(port, reason="scan_begin_no_tag")
             return False
         if result.get("spoolman_id") is None:
             uid = result.get("uid_hex", "unknown")
@@ -3509,6 +3695,7 @@ class Rfid:
             self._respond(
                 f"RFID: tag found (uid={uid}) but no spoolman_id for {port}"
             )
+            self._clear_rfid_busy(port, reason="scan_begin_no_spoolman_id")
             return False
         # spoolman_id resolved from tag NDEF payload — register UID in Spoolman.
         uid = result.get("uid_hex", "unknown")
@@ -3524,10 +3711,12 @@ class Rfid:
         # Single-shot guard: prevent double-commit within the same scan session.
         if self._lane_committed.get(port):
             self._debug(f"rfid[{self.name}]: commit guard: {port} already committed this session")
+            self._clear_rfid_busy(port, reason="commit_already_done")
             return False
         pending = self._pending.get(port)
         if not pending:
             self._debug(f"rfid[{self.name}]: no pending scan to commit for {port}")
+            self._clear_rfid_busy(port, reason="commit_missing_pending")
             return False
 
         age = time.time() - float(pending.get("ts", 0.0))
@@ -3535,12 +3724,14 @@ class Rfid:
         if age > timeout:
             self._pending.pop(port, None)
             self._respond(f"RFID: pending scan expired for {port}")
+            self._clear_rfid_busy(port, reason="commit_pending_expired")
             return False
 
         spoolman_id = pending.get("spoolman_id")
         if spoolman_id is None:
             self._pending.pop(port, None)
             self._respond(f"RFID: pending scan missing spoolman_id for {port}")
+            self._clear_rfid_busy(port, reason="commit_missing_spoolman_id")
             return False
 
         self._lane_committed[port] = True
@@ -3568,6 +3759,7 @@ class Rfid:
         self._pending.pop(port, None)
         _flush_uid_cache_if_dirty()
         self._debug(f"rfid[{self.name}]: commit complete for {port}")
+        self._clear_rfid_busy(port, reason="commit_complete")
         return True
 
     # ---------- gcode commands ----------
