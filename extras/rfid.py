@@ -696,6 +696,8 @@ class Rfid:
         help_map = getattr(self.gcode, "gcode_help", None)
         wrapped = 0
         for cmd in sorted(handlers):
+            original = None
+            desc = None
             if not re.fullmatch(r"T\d+", str(cmd)):
                 continue
             try:
@@ -703,14 +705,22 @@ class Rfid:
                 original = self.gcode.register_command(cmd, None)
                 if original is None:
                     continue
-                guard["toolchange_handlers"][cmd] = original
                 self.gcode.register_command(
                     cmd,
                     self._make_toolchange_guard(cmd, original),
                     desc=desc,
                 )
+                guard["toolchange_handlers"][cmd] = original
                 wrapped += 1
             except Exception as exc:
+                if original is not None:
+                    try:
+                        self.gcode.register_command(cmd, original, desc=desc)
+                    except Exception as restore_exc:
+                        self._log.warning(
+                            "rfid[%s]: failed to restore toolchange handler for %s: %s",
+                            self.name, cmd, restore_exc,
+                        )
                 self._log.warning(
                     "rfid[%s]: failed to install toolchange guard for %s: %s",
                     self.name, cmd, exc,

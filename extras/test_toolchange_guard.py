@@ -262,6 +262,33 @@ class TestToolchangeGuard(unittest.TestCase):
             any("skipping failed deferred toolchange 'T0'" in msg for msg in self.gcode.messages)
         )
 
+    def test_install_guard_restores_original_handler_on_failure(self):
+        rfid, gcode, _reactor = _make_rfid()
+        original_calls = []
+
+        def _original_t0(gcmd):
+            original_calls.append(gcmd.get_commandline())
+
+        gcode.register_command("T0", _original_t0, desc="toolchange T0")
+        real_register = gcode.register_command
+        failed = [False]
+
+        def _failing_register(cmd, func, when_not_ready=False, desc=None):
+            if cmd == "T0" and func is not None and not failed[0]:
+                failed[0] = True
+                raise RuntimeError("boom")
+            return real_register(cmd, func, when_not_ready=when_not_ready, desc=desc)
+
+        gcode.register_command = _failing_register
+
+        rfid._install_toolchange_guards()
+
+        self.assertFalse(rfid._toolchange_guard["installed"])
+        self.assertIs(gcode.ready_gcode_handlers["T0"], _original_t0)
+        self.assertNotIn("T0", rfid._toolchange_guard["toolchange_handlers"])
+        gcode.ready_gcode_handlers["T0"](_FakeGCmd("T0"))
+        self.assertEqual(original_calls, ["T0"])
+
 
 if __name__ == "__main__":
     unittest.main()
