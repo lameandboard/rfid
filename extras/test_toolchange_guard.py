@@ -241,6 +241,26 @@ class TestToolchangeGuard(unittest.TestCase):
         self.assertEqual(self.original_calls, ["T0", "T0"])
         self.assertFalse(self.rfid._rfid_busy)
 
+    def test_replay_requeues_remaining_toolchanges_on_exception(self):
+        lane = "lane1"
+
+        def _raising_t0(_gcmd):
+            raise RuntimeError("boom")
+
+        self.gcode.register_command("T0", _raising_t0, desc="toolchange T0")
+        self.rfid._toolchange_guard["installed"] = False
+        self.rfid._handle_klippy_connect()
+        self.rfid._start_scan_timer(lane)
+        self.gcode.ready_gcode_handlers["T0"](_FakeGCmd("T0"))
+        self.gcode.ready_gcode_handlers["T0"](_FakeGCmd("T0"))
+
+        self.rfid._clear_rfid_busy(lane, reason="commit_complete")
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            self.reactor.run_async_callbacks()
+
+        self.assertEqual(self.rfid._toolchange_guard["deferred_toolchanges"], ["T0"])
+
 
 if __name__ == "__main__":
     unittest.main()

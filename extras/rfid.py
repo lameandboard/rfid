@@ -815,7 +815,14 @@ class Rfid:
                 self._respond(
                     f"RFID: AFC/RFID idle; executing deferred toolchange '{script}'"
                 )
-                self.gcode.run_script_from_command(script)
+                try:
+                    self.gcode.run_script_from_command(script)
+                except Exception:
+                    # Only re-queue scripts that were not attempted yet; the
+                    # failing toolchange is surfaced via the exception instead
+                    # of being retried implicitly.
+                    guard["deferred_toolchanges"][:0] = queued[idx + 1:]
+                    raise
 
         self.reactor.register_async_callback(_run_deferred)
 
