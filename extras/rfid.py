@@ -808,7 +808,10 @@ class Rfid:
         guard["deferred_toolchanges"].clear()
 
         def _run_deferred(event_time):
-            for script in queued:
+            for idx, script in enumerate(queued):
+                if self._rfid_busy:
+                    guard["deferred_toolchanges"][:0] = queued[idx:]
+                    return
                 self._respond(
                     f"RFID: AFC/RFID idle; executing deferred toolchange '{script}'"
                 )

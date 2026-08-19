@@ -213,6 +213,34 @@ class TestToolchangeGuard(unittest.TestCase):
         self.assertEqual(self.original_calls, ["T0"])
         self.assertFalse(self.rfid._rfid_busy)
 
+    def test_replay_requeues_remaining_toolchanges_if_busy_restarts(self):
+        lane = "lane1"
+
+        def _restart_busy_on_first_call(gcmd):
+            self.original_calls.append(gcmd.get_commandline())
+            if len(self.original_calls) == 1:
+                self.rfid._start_scan_timer(lane)
+
+        self.gcode.register_command("T0", _restart_busy_on_first_call, desc="toolchange T0")
+        self.rfid._toolchange_guard["installed"] = False
+        self.rfid._handle_klippy_connect()
+        self.rfid._start_scan_timer(lane)
+        self.gcode.ready_gcode_handlers["T0"](_FakeGCmd("T0"))
+        self.gcode.ready_gcode_handlers["T0"](_FakeGCmd("T0"))
+
+        self.rfid._clear_rfid_busy(lane, reason="commit_complete")
+        self.reactor.run_async_callbacks()
+
+        self.assertEqual(self.original_calls, ["T0"])
+        self.assertEqual(self.rfid._toolchange_guard["deferred_toolchanges"], ["T0"])
+        self.assertTrue(self.rfid._rfid_busy)
+
+        self.rfid._clear_rfid_busy(lane, reason="commit_complete")
+        self.reactor.run_async_callbacks()
+
+        self.assertEqual(self.original_calls, ["T0", "T0"])
+        self.assertFalse(self.rfid._rfid_busy)
+
 
 if __name__ == "__main__":
     unittest.main()
