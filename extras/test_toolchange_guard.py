@@ -255,11 +255,12 @@ class TestToolchangeGuard(unittest.TestCase):
         self.gcode.ready_gcode_handlers["T0"](_FakeGCmd("T0"))
 
         self.rfid._clear_rfid_busy(lane, reason="commit_complete")
-
-        with self.assertRaisesRegex(RuntimeError, "boom"):
-            self.reactor.run_async_callbacks()
+        self.reactor.run_async_callbacks()
 
         self.assertEqual(self.rfid._toolchange_guard["deferred_toolchanges"], ["T0"])
+        self.assertTrue(
+            any("skipping failed deferred toolchange 'T0'" in msg for msg in self.gcode.messages)
+        )
 
 
 if __name__ == "__main__":

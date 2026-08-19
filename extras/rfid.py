@@ -817,12 +817,17 @@ class Rfid:
                 )
                 try:
                     self.gcode.run_script_from_command(script)
-                except Exception:
-                    # Only re-queue scripts that were not attempted yet; the
-                    # failing toolchange is surfaced via the exception instead
-                    # of being retried implicitly.
+                except Exception as exc:
                     guard["deferred_toolchanges"][:0] = queued[idx + 1:]
-                    raise
+                    self._log.warning(
+                        "rfid[%s]: deferred toolchange replay failed for %s: %s",
+                        self.name, script, exc,
+                    )
+                    self._respond(
+                        f"RFID: skipping failed deferred toolchange '{script}';"
+                        " keeping later deferred toolchanges queued"
+                    )
+                    return
 
         self.reactor.register_async_callback(_run_deferred)
 
