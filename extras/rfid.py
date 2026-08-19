@@ -477,6 +477,7 @@ class Rfid:
         # Format: lane -> {"last_uid": str|None, "seen_uids": set, "ts": float}
         self._deferred_uid: dict[str, dict] = {}
         self._toolchange_guard = self._get_toolchange_guard_state()
+        # Shared printer-level AFC/RFID busy map so any reader can defer global T* commands.
         self._rfid_busy: dict[str, dict] = self._toolchange_guard["busy_lanes"]
         # Per-window failure cache for Classic authenticated reads.
         # Prevents repeated attempts for the same UID when auth/read already
@@ -694,7 +695,7 @@ class Rfid:
             return
         help_map = getattr(self.gcode, "gcode_help", None)
         wrapped = 0
-        for cmd in sorted(list(handlers)):
+        for cmd in sorted(handlers):
             if not re.fullmatch(r"T\d+", str(cmd)):
                 continue
             try:
@@ -2434,7 +2435,6 @@ class Rfid:
             self._end_scan_session(lane, reason=reason)
         if had_freeze or had_pending or had_timer:
             self._clear_rfid_busy(lane, reason=reason)
-        if had_freeze or had_pending or had_timer:
             cleared = " ".join(filter(None, [
                 "commit_freeze" if had_freeze else None,
                 "pending_commit" if had_pending else None,
